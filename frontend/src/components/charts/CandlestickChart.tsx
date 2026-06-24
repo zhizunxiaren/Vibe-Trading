@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { cn } from "@/lib/utils";
 import { ChevronDown } from "lucide-react";
-import type { PriceBar, TradeMarker, IndicatorPoint } from "@/lib/api";
+import type { PriceBar, TradeMarker } from "@/lib/api";
 import { calcMA, calcBOLL, calcMACD, calcRSI, calcKDJ, calcEMA } from "@/lib/indicators";
 import { getChartTheme } from "@/lib/chart-theme";
 import { abbreviateNum } from "@/lib/formatters";
 import { echarts, CHART_GROUP, connectCharts } from "@/lib/echarts";
 import { useDarkMode } from "@/hooks/useDarkMode";
+import type { ChartIndicatorInput } from "@/lib/chart-indicators";
+import { resolveChartIndicators } from "@/lib/chart-indicators";
 
 type Sub = "vol" | "macd" | "rsi" | "kdj";
 type Range = "1M" | "3M" | "6M" | "1Y" | "ALL";
@@ -28,7 +30,7 @@ const OVERLAY_COLORS = ["#f59e0b", "#8b5cf6", "#3b82f6", "#ec4899", "#10b981", "
 interface Props {
   data: PriceBar[];
   markers?: TradeMarker[];
-  indicators?: Record<string, IndicatorPoint[]>;
+  indicators?: ChartIndicatorInput;
   height?: number;
 }
 
@@ -74,13 +76,9 @@ export function CandlestickChart({ data, markers, indicators, height = 500 }: Pr
     kdj: calcKDJ(baseData.highs, baseData.lows, baseData.closes),
   }), [baseData]);
 
-  // Memoize backend indicator series with Map lookup (O(1) instead of O(n) find)
+  // Memoize backend/formula indicator series with Map lookup (O(1) instead of O(n) find)
   const extraIndicators = useMemo(() => {
-    if (!indicators) return [];
-    return Object.entries(indicators).map(([name, points]) => {
-      const lookup = new Map(points.map(p => [p.time, p.value]));
-      return { name: name.toUpperCase(), values: baseData.dates.map(d => lookup.get(d) ?? null) };
-    });
+    return resolveChartIndicators(indicators, baseData.dates);
   }, [indicators, baseData.dates]);
 
   // Init chart instance — only on mount/unmount and dark mode change
@@ -184,10 +182,30 @@ export function CandlestickChart({ data, markers, indicators, height = 500 }: Pr
       legendNames.push("%K", "%D", "%J");
     }
 
-    // Backend custom indicators (Map-based O(1) lookup)
+    // Backend/formula custom indicators
     const extraSeries = extraIndicators.map((ind, i) => {
       legendNames.push(ind.name);
-      return { name: ind.name, type: "line" as const, data: ind.values, xAxisIndex: 0, yAxisIndex: 0, symbol: "none", lineStyle: { width: 1, color: OVERLAY_COLORS[(colorIdx + i) % OVERLAY_COLORS.length], type: "dashed" as const } };
+      const color = ind.color ?? OVERLAY_COLORS[(colorIdx + i) % OVERLAY_COLORS.length];
+      const axisIndex = ind.pane === "sub" ? 1 : 0;
+      if (ind.type === "bar") {
+        return {
+          name: ind.name,
+          type: "bar" as const,
+          data: ind.values,
+          xAxisIndex: axisIndex,
+          yAxisIndex: axisIndex,
+          itemStyle: { color },
+        };
+      }
+      return {
+        name: ind.name,
+        type: "line" as const,
+        data: ind.values,
+        xAxisIndex: axisIndex,
+        yAxisIndex: axisIndex,
+        symbol: "none",
+        lineStyle: { width: 1, color, type: ind.lineStyle ?? "dashed" },
+      };
     });
 
     const maxBars = RANGE_BARS[range];
