@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Iterable
 from typing import Any, Dict, List, Optional
 
 
@@ -87,7 +88,37 @@ def _load_skill_dir(dir_path: Path) -> Optional[Skill]:
     )
 
 
-USER_SKILLS_DIR = Path.home() / ".vibe-trading" / "skills" / "user"
+PROJECT_USER_SKILLS_DIR = (
+    Path(__file__).resolve().parents[3]
+    / ".codex"
+    / "skills"
+    / "user"
+)
+LEGACY_USER_SKILLS_DIR = Path.home() / ".vibe-trading" / "skills" / "user"
+USER_SKILLS_DIR = PROJECT_USER_SKILLS_DIR
+
+
+def _coerce_user_skill_dirs(user_skills_dir: Optional[Path | str | Iterable[Path | str]]) -> list[Path]:
+    """Normalize configured user-skill directories.
+
+    The project-local ``.codex/skills/user`` directory is the default write/read location.
+    The legacy home directory remains readable for existing installs.
+    """
+    if user_skills_dir is None:
+        candidates = [PROJECT_USER_SKILLS_DIR, LEGACY_USER_SKILLS_DIR]
+    elif isinstance(user_skills_dir, (str, Path)):
+        candidates = [Path(user_skills_dir)]
+    else:
+        candidates = [Path(path) for path in user_skills_dir]
+
+    result: list[Path] = []
+    seen: set[Path] = set()
+    for path in candidates:
+        resolved = path.expanduser()
+        if resolved not in seen:
+            result.append(resolved)
+            seen.add(resolved)
+    return result
 
 
 class SkillsLoader:
@@ -97,16 +128,21 @@ class SkillsLoader:
         skills: Loaded skill list (bundled + user-created).
     """
 
-    def __init__(self, skills_dir: Optional[Path] = None,
-                 user_skills_dir: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        skills_dir: Optional[Path] = None,
+        user_skills_dir: Optional[Path | str | Iterable[Path | str]] = None,
+    ) -> None:
         """Initialize SkillsLoader.
 
         Args:
             skills_dir: Bundled skills directory path; defaults to agent/skills/.
-            user_skills_dir: User-created skills directory; defaults to ~/.vibe-trading/skills/user/.
+            user_skills_dir: User-created skills directory or directories. Defaults to
+                project-local .codex/skills/user first, then the legacy ~/.vibe-trading path.
         """
         self.skills_dir = skills_dir or Path(__file__).resolve().parents[1] / "skills"
-        self._user_skills_dir = user_skills_dir or USER_SKILLS_DIR
+        self._user_skills_dirs = _coerce_user_skill_dirs(user_skills_dir)
+        self._user_skills_dir = self._user_skills_dirs[0] if self._user_skills_dirs else None
         self.skills: List[Skill] = []
         self._load()
 
@@ -117,7 +153,7 @@ class SkillsLoader:
         (e.g. after patch_skill copies and modifies a bundled skill).
         """
         seen_names: set[str] = set()
-        for directory in (self._user_skills_dir, self.skills_dir):
+        for directory in (*self._user_skills_dirs, self.skills_dir):
             if not directory or not directory.exists():
                 continue
             for path in sorted(directory.iterdir()):
@@ -171,9 +207,9 @@ class SkillsLoader:
             if skill.name == name:
                 return f'<skill name="{name}">\n{skill.body}\n</skill>'
 
-        # Fallback: check user skills directory on disk (mid-session created skills)
-        if self._user_skills_dir:
-            skill = _load_skill_dir(self._user_skills_dir / name)
+        # Fallback: check user skills directories on disk (mid-session created skills)
+        for user_skills_dir in self._user_skills_dirs:
+            skill = _load_skill_dir(user_skills_dir / name)
             if skill:
                 self.skills.append(skill)
                 return f'<skill name="{name}">\n{skill.body}\n</skill>'

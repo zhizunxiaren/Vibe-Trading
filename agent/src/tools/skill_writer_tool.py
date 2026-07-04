@@ -1,7 +1,7 @@
 """Skill management tools: full CRUD + auxiliary file support.
 
 User-created skills are stored separately from bundled skills:
-    ~/.vibe-trading/skills/user/<skill-name>/
+    <project>/.codex/skills/user/<skill-name>/
         SKILL.md            # Main skill document
         references/         # Reference materials
         templates/          # Code/config templates
@@ -11,9 +11,9 @@ User-created skills are stored separately from bundled skills:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +25,178 @@ _ALLOWED_SUBDIRS = {"references", "templates", "examples", "assets"}
 
 def _sanitize_skill_name(name: str) -> str:
     """Sanitize skill name to a safe directory slug."""
-    return re.sub(r"[^a-z0-9-]", "-", name.lower().strip())[:60]
+    slug = re.sub(r"[^a-z0-9-]", "-", name.lower().strip())
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    return slug[:60].strip("-")
+
+
+def _skill_name_from_request(request: str) -> str:
+    """Generate a deterministic skill slug from a natural-language request."""
+    words = re.findall(r"[a-z0-9]+", request.lower())
+    stop_words = {
+        "a", "an", "and", "for", "from", "i", "me", "my", "of", "skill",
+        "the", "to", "use", "with",
+    }
+    selected = [word for word in words if word not in stop_words][:6]
+    if selected:
+        return _sanitize_skill_name("-".join(selected))
+    digest = hashlib.sha1(request.encode("utf-8")).hexdigest()[:8]
+    return f"skill-{digest}"
+
+
+def _yaml_line(value: str) -> str:
+    """Return a single-line frontmatter-safe value."""
+    return value.replace("\r", " ").replace("\n", " ").replace("---", "").strip()
+
+
+def _description_from_request(request: str) -> str:
+    """Build a concise trigger description from the user request."""
+    compact = re.sub(r"\s+", " ", request).strip()
+    if len(compact) > 180:
+        compact = compact[:177].rstrip() + "..."
+    return f"Use when the user asks to run this workflow: {compact}"
+
+
+def _json_block(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=2)
+
+
+class CreateSkillTool(BaseTool):
+    """Create a reusable skill from a natural-language description."""
+
+    name = "create_skill"
+    description = (
+        "Create and save a reusable skill from the user's natural-language "
+        "description. Use this when the user says they want to create, generate, "
+        "or save a new skill but has not provided a full SKILL.md file."
+    )
+    is_readonly = False
+    repeatable = True
+    parameters = {
+        "type": "object",
+        "properties": {
+            "request": {
+                "type": "string",
+                "description": "The user's natural-language description of what the skill should do.",
+            },
+            "name": {
+                "type": "string",
+                "description": "Optional lowercase skill name. If omitted, one is generated from the request.",
+            },
+            "description": {
+                "type": "string",
+                "description": "Optional trigger description for the skill frontmatter.",
+            },
+            "category": {
+                "type": "string",
+                "description": "Skill category such as analysis, strategy, data-source, or user. Default: user.",
+                "default": "user",
+            },
+            "tools": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional tool names the skill should use, e.g. ['run_analysis'].",
+                "default": [],
+            },
+            "defaults": {
+                "type": "object",
+                "description": "Optional default parameters or settings to embed in the skill.",
+                "additionalProperties": True,
+                "default": {},
+            },
+            "workflow": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional ordered workflow steps. If omitted, a generic workflow is generated.",
+                "default": [],
+            },
+        },
+        "required": ["request"],
+    }
+
+    def execute(self, **kwargs: Any) -> str:
+        request = str(kwargs.get("request", "")).strip()
+        if not request:
+            return json.dumps({"status": "error", "error": "request required"}, ensure_ascii=False)
+
+        slug = _sanitize_skill_name(str(kwargs.get("name", ""))) or _skill_name_from_request(request)
+        category = _sanitize_skill_name(str(kwargs.get("category", "user"))) or "user"
+        description = _yaml_line(str(kwargs.get("description", "")).strip() or _description_from_request(request))
+        tools = [str(tool).strip() for tool in (kwargs.get("tools") or []) if str(tool).strip()]
+        defaults = kwargs.get("defaults") or {}
+        workflow = [str(step).strip() for step in (kwargs.get("workflow") or []) if str(step).strip()]
+        if not workflow:
+            workflow = self._default_workflow(tools)
+
+        skill_dir = USER_SKILLS_DIR / slug
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_path = skill_dir / "SKILL.md"
+        content = self._render_skill(
+            slug=slug,
+            description=description,
+            category=category,
+            request=request,
+            tools=tools,
+            defaults=defaults,
+            workflow=workflow,
+        )
+        skill_path.write_text(content, encoding="utf-8")
+        return json.dumps(
+            {
+                "status": "ok",
+                "skill": slug,
+                "message": f"Skill '{slug}' created. Available via load_skill(\"{slug}\").",
+                "path": str(skill_path),
+            },
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def _default_workflow(tools: list[str]) -> list[str]:
+        steps = [
+            "Load this skill when the user request matches the purpose below.",
+            "Translate the user's request into concrete parameters before calling tools.",
+        ]
+        if tools:
+            steps.append(f"Use these tools when relevant: {', '.join(tools)}.")
+        else:
+            steps.append("Choose the smallest existing tool or analysis recipe that satisfies the request.")
+        steps.append("Return concise Chinese output unless the user asks for another language.")
+        return steps
+
+    @staticmethod
+    def _render_skill(
+        *,
+        slug: str,
+        description: str,
+        category: str,
+        request: str,
+        tools: list[str],
+        defaults: Any,
+        workflow: list[str],
+    ) -> str:
+        title = " ".join(part.capitalize() for part in slug.split("-"))
+        tool_lines = "\n".join(f"- `{tool}`" for tool in tools) if tools else "- Use existing tools only when needed."
+        workflow_lines = "\n".join(f"{index}. {step}" for index, step in enumerate(workflow, start=1))
+        defaults_block = _json_block(defaults)
+        return (
+            f"---\n"
+            f"name: {slug}\n"
+            f"description: {description}\n"
+            f"category: {category}\n"
+            f"---\n\n"
+            f"# {title}\n\n"
+            f"## Purpose\n\n"
+            f"{request}\n\n"
+            f"## Workflow\n\n"
+            f"{workflow_lines}\n\n"
+            f"## Tools\n\n"
+            f"{tool_lines}\n\n"
+            f"## Defaults\n\n"
+            f"```json\n{defaults_block}\n```\n\n"
+            f"## Output\n\n"
+            f"State what data or assumptions were used. For ranking or screening results, prefer a markdown table and include the parameter values used.\n"
+        )
 
 
 class SaveSkillTool(BaseTool):
@@ -170,13 +341,13 @@ class PatchSkillTool(BaseTool):
 
 
 class DeleteSkillTool(BaseTool):
-    """Delete a user-created skill entirely."""
+    """Delete a user-created skill when it only contains SKILL.md."""
 
     name = "delete_skill"
     description = (
-        "Delete a user-created skill and all its files. "
-        "Only works on skills in ~/.vibe-trading/skills/user/. "
-        "Cannot delete bundled skills."
+        "Delete a user-created skill only when it contains SKILL.md and no auxiliary files. "
+        "Only works on skills in the project-local .codex/skills/user directory. "
+        "Cannot delete bundled skills or recursively delete directories."
     )
     is_readonly = False
     parameters = {
@@ -208,10 +379,33 @@ class DeleteSkillTool(BaseTool):
         if not skill_dir.exists():
             return json.dumps({"status": "error", "error": f"User skill '{slug}' not found"})
 
-        shutil.rmtree(skill_dir)
+        skill_path = skill_dir / "SKILL.md"
+        if not skill_path.exists():
+            return json.dumps({"status": "error", "error": f"User skill '{slug}' has no SKILL.md"})
+
+        extra_files = [
+            path.relative_to(skill_dir).as_posix()
+            for path in skill_dir.rglob("*")
+            if path.is_file() and path.name != "SKILL.md"
+        ]
+        if extra_files:
+            return json.dumps({
+                "status": "error",
+                "error": (
+                    "Refusing to delete skill because it has auxiliary files and "
+                    "the single-file deletion policy forbids recursive deletion. "
+                    f"Remove these files explicitly first: {extra_files}"
+                ),
+            }, ensure_ascii=False)
+
+        skill_path.unlink()
+        try:
+            skill_dir.rmdir()
+        except OSError:
+            pass
         return json.dumps({
             "status": "ok",
-            "message": f"Deleted skill '{name}' and all its files.",
+            "message": f"Deleted skill '{name}'.",
         })
 
 

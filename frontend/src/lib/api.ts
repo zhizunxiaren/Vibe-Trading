@@ -221,6 +221,22 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ broker }),
     }),
+
+  getTopVolume: (params: { days?: number; limit?: number }) => {
+    const q = new URLSearchParams();
+    if (params.days) q.set("days", String(params.days));
+    if (params.limit) q.set("limit", String(params.limit));
+    return request<RankingItem[]>(`/ranking/top-volume?${q.toString()}`);
+  },
+  listAnalyticsRecipes: () => request<AnalyticsRecipe[]>("/analytics/recipes"),
+  runAnalysis: (recipeId: string, params: Record<string, string | number | boolean | undefined> = {}) => {
+    const q = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined) q.set(key, String(value));
+    });
+    const qs = q.toString();
+    return request<AnalyticsResult>(`/analytics/${encodeURIComponent(recipeId)}${qs ? `?${qs}` : ""}`);
+  },
 };
 
 // --- Swarm types ---
@@ -961,6 +977,42 @@ export interface LiveRunnerResponse {
   already_running?: boolean;
   stopped?: boolean;
   was_running?: boolean;
+}
+
+export interface RankingItem {
+  rank: number;
+  code: string;
+  name: string;
+  total_volume: number;
+  total_amount: number;
+  float_market_cap: number;
+}
+
+export interface AnalyticsColumn {
+  key: string;
+  label: string;
+  type: string;
+  align: "left" | "right" | string;
+}
+
+export interface AnalyticsRecipe {
+  id: string;
+  title: string;
+  description: string;
+  default_params: Record<string, unknown>;
+  columns: AnalyticsColumn[];
+}
+
+export type AnalyticsRow = Record<string, string | number | null>;
+
+export interface AnalyticsResult {
+  id: string;
+  title: string;
+  description: string;
+  params: Record<string, string | number | boolean>;
+  columns: AnalyticsColumn[];
+  rows: AnalyticsRow[];
+  meta: Record<string, unknown>;
 }
 
 export interface MessageItem {

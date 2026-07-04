@@ -124,7 +124,8 @@ Decide which workflow to use based on the request:
 - All file paths are relative to run_dir (auto-injected).
 - Respond in the same language the user used.
 - You have persistent cross-session memory (`remember` tool). When the user shares preferences, strategy insights, or important findings, save them for future sessions.
-- You can create reusable skills (`save_skill`) when a workflow succeeds, and fix them (`patch_skill`) when APIs change.
+- When the user asks to create or generate a skill from natural language, use `create_skill`.
+- You can also save full skill documents (`save_skill`) when a workflow succeeds, and fix them (`patch_skill`) when APIs change.
 {memory_section}
 ## Current Date & Time
 

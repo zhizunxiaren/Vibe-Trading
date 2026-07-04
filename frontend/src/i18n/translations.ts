@@ -1,0 +1,291 @@
+export type Language = "zh-CN" | "en-US";
+
+export const DEFAULT_LANGUAGE = "zh-CN" satisfies Language;
+export const LANGUAGE_STORAGE_KEY = "vibe-trading-language";
+
+const exactZh: Record<string, string> = {
+  "Home": "首页",
+  "Agent": "智能体",
+  "Alpha Zoo": "Alpha 因子库",
+  "Settings": "设置",
+  "Correlation Matrix": "相关性矩阵",
+  Sessions: "会话",
+  "New Chat": "新建聊天",
+  "No sessions yet": "暂无会话",
+  Confirm: "确认",
+  Cancel: "取消",
+  Rename: "重命名",
+  "Delete?": "删除？",
+  Light: "浅色",
+  Dark: "深色",
+  Expand: "展开",
+  Collapse: "收起",
+  Language: "语言",
+  Chinese: "中文",
+  English: "英文",
+  Loading: "加载中",
+  "Loading...": "加载中...",
+  "Loading…": "加载中...",
+  Copy: "复制",
+  Copied: "已复制",
+  Running: "运行中",
+  running: "运行中",
+  connected: "已连接",
+  disconnected: "已断开",
+  reconnecting: "重连中",
+  "Connection lost": "连接已断开",
+  "Connection restored": "连接已恢复",
+  "Connection lost, reconnecting…": "连接已断开，正在重连...",
+
+  "AI-Powered Quant Strategy Research": "AI 驱动的量化策略研究",
+  "Describe a trading strategy in natural language. The agent generates code, runs backtests, and optimizes — all in real time.":
+    "用自然语言描述交易策略。智能体会实时生成代码、运行回测并优化策略。",
+  "Start Research": "开始研究",
+  "AI Agent": "AI 智能体",
+  "Natural language strategy generation with ReAct reasoning": "通过 ReAct 推理生成自然语言策略",
+  "Built-in Backtest": "内置回测",
+  "7 data sources across A-shares, US/HK & Crypto": "覆盖 A 股、美股/港股和加密货币的 7 类数据源",
+  "Real-time Streaming": "实时流式输出",
+  "Watch the agent think, call tools, and iterate": "观察智能体思考、调用工具并迭代",
+  "Strategy Replay": "策略复盘",
+  "Trade journal analyzer + Shadow Account — extract your rules, backtest them, attribute PnL delta":
+    "交易日志分析 + 影子账户：提取你的规则、回测规则并归因收益差异",
+
+  "vibe trading with your professional financial agent team": "和你的专业金融智能体团队一起做交易研究",
+  "Describe a trading strategy to get started.": "描述一个交易策略即可开始。",
+  "Try an example:": "试试示例：",
+  "Multi-Market Backtest": "多市场回测",
+  "Research & Analysis": "研究与分析",
+  "Swarm Teams": "多智能体团队",
+  "Document & Web Research": "文档与网页研究",
+  "Trade Journal": "交易日志",
+  "Trading Connectors": "交易连接器",
+  "Shadow Account": "影子账户",
+  "Finance Skills Library": "金融技能库",
+  "Swarm Agent Teams": "多智能体团队",
+  "Auto-Discovered Tools": "自动发现工具",
+  "3 Markets: A-Share · Crypto · HK/US": "三类市场：A 股 · 加密货币 · 港股/美股",
+  "Trading Connector Profiles": "交易连接器档案",
+  "Minute to Daily Timeframes": "分钟到日线周期",
+  "4 Portfolio Optimizers": "4 类组合优化器",
+  "15+ Risk Metrics": "15+ 风险指标",
+  "Options & Derivatives": "期权与衍生品",
+  "PDF & Web Research": "PDF 与网页研究",
+  "Factor Analysis & ML": "因子分析与机器学习",
+  "Trade Journal Analyzer": "交易日志分析器",
+  "Shadow Account Backtest": "影子账户回测",
+  "Persistent Memory": "持久记忆",
+  "Session Search": "会话搜索",
+  "Cross-Market Portfolio": "跨市场组合",
+  "BTC 5-Min MACD Strategy": "BTC 5 分钟 MACD 策略",
+  "US Tech Max Diversification": "美股科技股最大分散化",
+  "Multi-Factor Alpha Model": "多因子 Alpha 模型",
+  "Options Greeks Analysis": "期权 Greeks 分析",
+  "Investment Committee Review": "投资委员会评审",
+  "Quant Strategy Desk": "量化策略团队",
+  "Analyze an Earnings Report PDF": "分析财报 PDF",
+  "Web Research: Macro Outlook": "网页研究：宏观展望",
+  "Analyze My Broker Export": "分析我的券商导出",
+  "Diagnose My Behavior Biases": "诊断我的交易行为偏差",
+  "Check Selected Connector": "检查已选连接器",
+  "Analyze Connector Portfolio": "分析连接器组合",
+  "Quote & Trend": "报价与趋势",
+  "Train My Shadow from Journal": "从交易日志训练我的影子账户",
+  "How Much Am I Leaving on the Table?": "我错失了多少收益？",
+  "Generate Shadow Report": "生成影子报告",
+
+  "Agent is working…": "智能体正在工作...",
+  "Active research goal": "当前研究目标",
+  Goal: "目标",
+  "Evidence collected toward this research goal": "已为该研究目标收集的证据",
+  "Start working on this research goal now.": "现在开始处理这个研究目标。",
+  "Continue the active research goal.": "继续当前研究目标。",
+  "Research goal attached": "已绑定研究目标",
+  "Research goal cancelled": "研究目标已取消",
+  "Research goal updated": "研究目标已更新",
+  "Failed to load goal.": "加载目标失败。",
+  "Failed to start goal.": "启动目标失败。",
+  "Failed to cancel goal.": "取消目标失败。",
+  "Failed to update goal.": "更新目标失败。",
+  "Failed to continue goal, please retry.": "继续目标失败，请重试。",
+  "Failed to send message, please retry.": "发送消息失败，请重试。",
+  "Cancel request sent": "已发送取消请求",
+  "Cancel failed": "取消失败",
+  "Stop generation": "停止生成",
+  "Export chat": "导出聊天",
+  "More options": "更多选项",
+  "Instantly halt connector runtime activity": "立即停止连接器运行时活动",
+  "Connector runtime": "连接器运行时",
+  "Connector runtime halted": "连接器运行时已停止",
+  "Connector runtime resumed": "连接器运行时已恢复",
+  "Connector runtime status": "连接器运行时状态",
+  "Connector runtime halted — runner stopped, resting orders cancelled":
+    "连接器运行时已停止：运行器已停止，挂单已取消",
+  "Failed to halt connector runtime.": "停止连接器运行时失败。",
+  "Strategy execution completed.": "策略执行已完成。",
+  "Execution timed out, automatically stopped": "执行超时，已自动停止",
+  "Executables and archives are not allowed": "不允许上传可执行文件和压缩包",
+  "File size exceeds 50 MB limit": "文件大小超过 50 MB 限制",
+  "Unknown error": "未知错误",
+  "Execution timed out. Try simplifying the strategy or reducing the number of assets.":
+    "执行超时。请尝试简化策略或减少资产数量。",
+  "API call failed. Please retry later.": "API 调用失败。请稍后重试。",
+  "Execution failed. Click to retry.": "执行失败。点击重试。",
+
+  "Local API access": "本地 API 访问",
+  "For remote or private Web UI deployments, enter the server API key once in this browser. Localhost use can stay blank.":
+    "如果是远程或私有 Web UI 部署，请在此浏览器中输入一次服务端 API key。本机 localhost 使用可以留空。",
+  "Server API key": "服务端 API key",
+  "Stored only in this browser. Leave blank to clear it.": "仅保存在当前浏览器中。留空可清除。",
+  "Save local key": "保存本地 key",
+  "Settings are unavailable": "设置暂不可用",
+  "Configure model credentials and market data source tokens for this local project.":
+    "配置此本地项目使用的模型凭据和市场数据源 token。",
+  "LLM Settings": "LLM 设置",
+  "Choose the model used by the agent and save it to the project-local agent/.env file.":
+    "选择智能体使用的模型，并保存到项目本地的 agent/.env 文件。",
+  Connection: "连接",
+  Provider: "供应商",
+  "Changing providers updates the recommended model and endpoint.": "切换供应商会更新推荐模型和端点。",
+  Model: "模型",
+  "Use provider defaults": "使用供应商默认值",
+  "Use the exact model id required by your provider.": "请使用供应商要求的精确模型 ID。",
+  "Base URL": "Base URL",
+  OAuth: "OAuth",
+  "API key": "API key",
+  "Clear saved API key": "清除已保存的 API key",
+  Generation: "生成",
+  Temperature: "温度",
+  "Timeout seconds": "超时秒数",
+  "Max retries": "最大重试次数",
+  "Reasoning effort": "推理强度",
+  Off: "关闭",
+  low: "低",
+  medium: "中",
+  high: "高",
+  max: "最高",
+  "How hard the model thinks before answering. Higher is more thorough but slower; leave Off for fastest replies.":
+    "模型回答前的思考强度。越高越充分但更慢；关闭可获得最快回复。",
+  "Saved to": "保存到",
+  "Saving...": "保存中...",
+  "Save settings": "保存设置",
+  "Data Source Settings": "数据源设置",
+  "Configure optional market data credentials used by backtests and research agents.":
+    "配置回测和研究智能体可选使用的市场数据凭据。",
+  "Tushare token": "Tushare token",
+  "Used for China A-share, futures, fund, and macro data. If unset, the project falls back to AKShare where available.":
+    "用于中国 A 股、期货、基金和宏观数据。未设置时，项目会在可用处回退到 AKShare。",
+  "Clear saved Tushare token": "清除已保存的 Tushare token",
+  "Save data source settings": "保存数据源设置",
+  "Loader available": "加载器可用",
+  "No project loader": "项目未提供加载器",
+  "Python package installed": "Python 包已安装",
+  "Python package not installed": "Python 包未安装",
+  Configured: "已配置",
+  "Leave blank to keep the current key": "留空以保留当前 key",
+  "Leave blank to keep the current token": "留空以保留当前 token",
+  "This provider does not require an API key.": "该供应商不需要 API key。",
+  "Local API key saved": "本地 API key 已保存",
+  "LLM settings saved": "LLM 设置已保存",
+  "Data source settings saved": "数据源设置已保存",
+
+  Baseline: "基准",
+  Compare: "对比",
+  "-- Select --": "-- 请选择 --",
+  "Equity & Drawdown": "权益与回撤",
+  Metric: "指标",
+  Delta: "差值",
+  "Select two runs to compare their metrics.": "请选择两个运行结果进行指标对比。",
+  "Run not found": "未找到运行记录",
+  "Go back": "返回",
+  "Download Trades CSV": "下载交易 CSV",
+  "Download Metrics CSV": "下载指标 CSV",
+  "Backtest Summary": "回测摘要",
+  Reproducibility: "可复现性",
+  Metrics: "指标",
+  Validation: "验证",
+  "No validation payload recorded.": "没有记录验证数据。",
+  "Artifact Checksums": "产物校验和",
+  Path: "路径",
+  Size: "大小",
+  "No artifact checksums recorded.": "没有记录产物校验和。",
+  "No chart data available": "暂无图表数据",
+  "The backtest engine may not have generated price data. Check the artifacts/ directory.":
+    "回测引擎可能没有生成价格数据。请检查 artifacts/ 目录。",
+  "No trades recorded.": "没有交易记录。",
+  Time: "时间",
+  Code: "代码",
+  Side: "方向",
+  Price: "价格",
+  Qty: "数量",
+  Reason: "原因",
+  "No code files.": "没有代码文件。",
+
+  "Asset codes": "资产代码",
+  "Window (days)": "窗口（天）",
+  Method: "方法",
+  "No correlation data": "暂无相关性数据",
+  "No price data": "暂无价格数据",
+  "No equity data": "暂无权益数据",
+  "No validation data available.": "暂无验证数据。",
+  "Monte Carlo Permutation Test": "蒙特卡洛置换检验",
+  "Bootstrap Sharpe CI": "Bootstrap 夏普置信区间",
+  "Walk-Forward Analysis": "滚动样本外分析",
+  Period: "周期",
+  Return: "收益",
+  Sharpe: "夏普",
+  "Max DD": "最大回撤",
+  Trades: "交易数",
+  "Win Rate": "胜率",
+
+  "Filter by id or nickname…": "按 ID 或昵称筛选...",
+  Zoo: "因子库",
+  "All zoos": "全部因子库",
+  "All themes": "全部主题",
+  "All universes": "全部股票池",
+  "Alpha catalogue": "Alpha 目录",
+  Formula: "公式",
+  Metadata: "元数据",
+  "Source code": "源码",
+  Universe: "股票池",
+  Top: "数量",
+  "Top 5 by IR": "IR 前 5",
+  "Most reversed": "反转最明显",
+  ID: "ID",
+  "Mean IC": "平均 IC",
+  IR: "IR",
+  Theme: "主题",
+  Category: "分类",
+};
+
+export function normalizeLanguage(value: string | null | undefined): Language {
+  return value === "en-US" ? "en-US" : "zh-CN";
+}
+
+export function translateText(text: string, language: Language): string {
+  if (language === "en-US") return text;
+
+  const translated = exactZh[text];
+  if (translated) return translated;
+
+  const reconnect = text.match(/^Connection lost, reconnecting \(attempt (\d+)\)…$/);
+  if (reconnect) return `连接已断开，正在重连（第 ${reconnect[1]} 次）...`;
+
+  const step = text.match(/^Step (\d+) · (.+)$/);
+  if (step) return `步骤 ${step[1]} · ${translateText(step[2], language)}`;
+
+  const toolsRunning = text.match(/^(\d+) tools running$/);
+  if (toolsRunning) return `${toolsRunning[1]} 个工具正在运行`;
+
+  const more = text.match(/^… \+(\d+) more$/);
+  if (more) return `... 还有 ${more[1]} 个`;
+
+  const eta = text.match(/^~(\d+)s left$/);
+  if (eta) return `约 ${eta[1]} 秒`;
+
+  return text;
+}
+
+export function isKnownChineseTranslation(text: string): boolean {
+  return Object.values(exactZh).includes(text);
+}

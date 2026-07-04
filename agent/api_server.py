@@ -596,7 +596,7 @@ async def _reject_untrusted_loopback_host(request: Request, call_next):
 # text/html`` (e.g. a user pasting the URL into the address bar).
 
 _FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
-_SPA_HTML_EXACT_PATHS: frozenset[str] = frozenset({"/correlation"})
+_SPA_HTML_EXACT_PATHS: frozenset[str] = frozenset({"/correlation", "/ranking"})
 # Each regex matches a complete request path. Trailing slash optional.
 _SPA_HTML_PATH_REGEX: tuple[re.Pattern[str], ...] = (
     # ``/runs/{run_id}`` — RunDetail page. Excludes ``/runs/{id}/code``,
@@ -3216,6 +3216,103 @@ async def stop_runner_endpoint(payload: LiveRunnerControlRequest):
         {"kind": "runner_stopped", "broker": broker},
     )
     return {"broker": broker, "stopped": True, "was_running": True}
+
+
+# ============================================================================
+# Ranking routes — top stocks by 20-day volume / amount
+# ============================================================================
+
+from pydantic import BaseModel as PydanticBaseModel2
+
+
+class RankingItem(PydanticBaseModel2):
+    rank: int
+    code: str
+    name: str
+    total_volume: float
+    total_amount: float
+    float_market_cap: float = 0.0
+
+
+def _connect_ranking_db():
+    """Open the market database read-only for ranking views."""
+    from src.analytics.connection import connect_market_db
+
+    return connect_market_db()
+
+
+@app.get(
+    "/analytics/recipes",
+    dependencies=[Depends(require_auth)],
+)
+async def analytics_recipes():
+    """List registered local analytics recipes."""
+    from src.analytics import list_recipes
+
+    return list_recipes()
+
+
+@app.get(
+    "/analytics/{recipe_id}",
+    dependencies=[Depends(require_auth)],
+)
+async def analytics_run(recipe_id: str, request: Request):
+    """Run a registered local analytics recipe."""
+    from src.analytics import AnalyticsError, run_analysis
+
+    try:
+        return run_analysis(recipe_id, dict(request.query_params))
+    except AnalyticsError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("analytics_run failed for recipe %s", recipe_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Analytics data unavailable: {exc}",
+        ) from exc
+
+
+@app.get(
+    "/ranking/top-volume",
+    response_model=list[RankingItem],
+    dependencies=[Depends(require_auth)],
+)
+async def ranking_top_volume(
+    days: int = Query(20, ge=1, le=120, description="Number of trading days to aggregate"),
+    limit: int = Query(100, ge=1, le=200, description="Max results"),
+):
+    """Top stocks by total volume over the last N trading days.
+
+    Reads from the DuckDB database populated by ``python -m src.data download``.
+    Returns an empty list when no data is available.
+    """
+    limit = min(max(1, limit), 200)
+    try:
+        conn = _connect_ranking_db()
+        try:
+            from src.analytics import run_analysis
+
+            analysis = run_analysis("top-volume", {"days": days, "limit": limit}, conn=conn)
+        finally:
+            conn.close()
+
+        results: list[RankingItem] = []
+        for row in analysis["rows"]:
+            results.append(RankingItem(
+                rank=int(row["rank"]),
+                code=str(row["code"]),
+                name=str(row["name"]),
+                total_volume=float(row["total_volume"] or 0),
+                total_amount=float(row["total_amount"] or 0),
+                float_market_cap=float(row["float_market_cap"] or 0),
+            ))
+        return results
+    except Exception as exc:
+        logger.exception("ranking_top_volume failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Ranking data unavailable: {exc}",
+        ) from exc
 
 
 # ============================================================================

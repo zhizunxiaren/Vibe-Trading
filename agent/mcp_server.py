@@ -6,7 +6,7 @@ Zero API key required for HK/US/crypto research markets (yfinance, OKX,
 AKShare are free). Trading connector tools are profile-scoped and require the
 selected connector's own local app or OAuth setup.
 
-Surfaces 54 tools: skills, research goals, backtest/factor/options/pattern
+Surfaces 56 tools: skills, research goals, analytics recipes, backtest/factor/options/pattern
 analysis, market data, fundamentals & capital-flow & news & discovery
 (get_fund_flow / get_dragon_tiger / get_northbound_flow / get_margin_trading /
 get_block_trades / get_shareholder_count / get_lockup_expiry / get_sector_info /
@@ -209,6 +209,30 @@ def load_skill(name: str) -> str:
     if content.startswith("Error:"):
         return json.dumps({"status": "error", "error": content}, ensure_ascii=False)
     return json.dumps({"status": "ok", "skill": name, "content": content}, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Local analytics tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+def list_analytics_recipes() -> str:
+    """List local read-only analytics recipes backed by the market DuckDB database."""
+    registry = _get_registry()
+    return registry.execute("list_analytics_recipes", {})
+
+
+@mcp.tool
+def run_analysis(recipe_id: str, params: dict[str, Any] | None = None) -> str:
+    """Run a local read-only analytics recipe.
+
+    Args:
+        recipe_id: Registered recipe id, e.g. ``top-volume``.
+        params: Recipe parameters. For ``top-volume``, use ``days`` and ``limit``.
+    """
+    registry = _get_registry()
+    return registry.execute("run_analysis", {"recipe_id": recipe_id, "params": params or {}})
 
 
 # ---------------------------------------------------------------------------

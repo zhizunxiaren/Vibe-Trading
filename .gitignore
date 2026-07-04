@@ -43,6 +43,9 @@ wiki/.cache/
 .cache/
 .remotion/
 
+# Data config (per-machine path, not tracked)
+data-config.json
+
 # DuckDB data cache
 data/*.duckdb
 data/*.duckdb.wal

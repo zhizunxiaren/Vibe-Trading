@@ -315,6 +315,21 @@ _PRESET_KEYWORDS: list[tuple[str, list[str], float]] = [
         ],
         0.9,
     ),
+    (
+        "industry_research_team",
+        [
+            r"industry\s+chain",
+            r"supply\s+chain",
+            "产业链",
+            "产业研究",
+            "产业分析",
+            "行业图谱",
+            "产业图谱",
+            "链图谱",
+            "上游.*中游.*下游",
+        ],
+        0.9,
+    ),
 ]
 
 # Market labels used in YAML templates (English, compatible with {market} placeholders).
