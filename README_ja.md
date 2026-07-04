@@ -50,12 +50,27 @@
 
 ## 📰 ニュース
 
-- **2026-06-23** 🛡️ **ローカル API の CSRF 対策強化**：悪意あるウェブページがループバック API に対して安全でないクロスサイトリクエスト（POST/PUT/DELETE）を発行できなくなりました——CORS はレスポンスの読み取りは防げても副作用は防げないため、ループバックの dev-mode 信頼を認める**前**に、安全でないメソッドへ既存のクロスサイトガードを適用します。安全なメソッドとローカル CLI / 非ブラウザのアップロードには影響しません（[#293](https://github.com/HKUDS/Vibe-Trading/pull/293)、@Hinotoi-agent さんに感謝）。
-- **2026-06-22** 🔧 **ライブ認可の OAuth 修正 + Alpha Zoo 見出しの修正**：`connector authorize` が数分かかるブローカーのサインインの間も OAuth ハンドシェイクを維持し（`VIBE_LIVE_AUTHORIZE_TIMEOUT_SECONDS` で調整可能）、リトライ時に競合するコールバックサーバーを起動しなくなったため、トークンが確実に保存されます（[#281](https://github.com/HKUDS/Vibe-Trading/pull/281)、[#259](https://github.com/HKUDS/Vibe-Trading/issues/259) をクローズ、@Robin1987China さんに感謝）。Alpha Zoo ページが alpha 数を二重に表示しなくなりました（[#287](https://github.com/HKUDS/Vibe-Trading/pull/287)、[#286](https://github.com/HKUDS/Vibe-Trading/issues/286) をクローズ、@digger-yu さんに感謝）。定期リサーチにも端から端までの使い方ドキュメントが追加されました（[#288](https://github.com/HKUDS/Vibe-Trading/pull/288)）。
-- **2026-06-21** ⏰ **定期リサーチ実行エンジン + レポートライブラリ + バックテスト後アトリビューション**：定期リサーチが**エンドツーエンド**で動作するようになりました——デフォルト無効のバックグラウンド実行エンジン（`VIBE_TRADING_ENABLE_SCHEDULER`）が interval/cron で期限到来ジョブをセッションランタイム経由で実行します（[#278](https://github.com/HKUDS/Vibe-Trading/pull/278)、@mvanhorn さんに感謝、[#254](https://github.com/HKUDS/Vibe-Trading/issues/254) をクローズ）。新しい **`/reports` 実行ライブラリ**ページでは、レポートを生成した実行を一覧・検索・フィルタでき、Run Detail + Compare へのリンクも備えます（[#224](https://github.com/HKUDS/Vibe-Trading/pull/224)、@LemonCANDY42 さんに感謝）。さらにバックテストのたびにエージェントが**階層型アトリビューション**——取引レベルの勝ち/負けトップ、ベータ回帰、市場レジーム分析、モンテカルロ並べ替え検定——をデータの有無とルーティング条件に応じて自動実行します（[#280](https://github.com/HKUDS/Vibe-Trading/pull/280)、@shadowinlife さんに感謝）。
+- **2026-07-03** 🛡️ **Robinhood MCP refresh + API modularization + SSRF guard**：Robinhood Agentic Trading は generic reads、live-runner plumbing、default read-only seeds、mandate-gate tests のすべてで現在の MCP tool names を使うようになり、interactive startup も provider loader と同じ `.env` 探索順（`~/.vibe-trading/.env` → `agent/.env` → `$CWD/.env`）を尊重します（[#391](https://github.com/HKUDS/Vibe-Trading/pull/391)、[#381](https://github.com/HKUDS/Vibe-Trading/issues/381) と [#380](https://github.com/HKUDS/Vibe-Trading/issues/380) をクローズ）。System routes（`/health`、`/correlation`、`/system/shutdown`、`/skills`、`/api`）は次の狭い API modularization slice として `src/api/system_routes.py` に移りました（[#378](https://github.com/HKUDS/Vibe-Trading/pull/378)、@shadowinlife さんに感謝）。Channel media SSRF defenses は fetch 前に CGNAT/mesh/non-global targets と QQ media redirect-to-internal を拒否するようになりました（[#389](https://github.com/HKUDS/Vibe-Trading/pull/389)、@hobostay さんに感謝）。
+
+- **2026-07-02** ⚡ **Factor acceleration + safer runtime boundaries**：rolling factor のホットパスは `bottleneck`/NumPy fast path を使うようになり、alpha bench の process parallelism は巨大 panel payload を worker ごとに繰り返し渡さず、base equity 計算にも regression coverage が入りました（[#376](https://github.com/HKUDS/Vibe-Trading/pull/376)、[#339](https://github.com/HKUDS/Vibe-Trading/issues/339) をクローズ、元の実装は @shadowinlife さんの [#342](https://github.com/HKUDS/Vibe-Trading/pull/342)）。Upload と Shadow report routes は巨大な `api_server.py` から切り出され、API modularization の最初の狭い slice になりました。[#331](https://github.com/HKUDS/Vibe-Trading/issues/331) は引き続き open です（[#375](https://github.com/HKUDS/Vibe-Trading/pull/375)、[#358](https://github.com/HKUDS/Vibe-Trading/pull/358) ベース、@shadowinlife さんに感謝）。Generated backtest subprocess は parent secrets surface 全体ではなく allowlist された環境だけを継承するようになり（[#374](https://github.com/HKUDS/Vibe-Trading/pull/374)、[#332](https://github.com/HKUDS/Vibe-Trading/issues/332) をクローズ）、IM channels には `/new` session reset と case-insensitive pairing commands も入りました（[#372](https://github.com/HKUDS/Vibe-Trading/pull/372)、[#371](https://github.com/HKUDS/Vibe-Trading/issues/371) をクローズ、@shadowinlife さんに感謝）。
+
+- **2026-07-01** 🧹 **Security polish + tracker cleanup**：API/Docker/frontend dev defaults を締め、Settings channel と `zh-CN` edges を安定化し、frontend dependency/CSP alerts を解消、古い WhatsApp + paper-trading tracker items も整理しました（[#338](https://github.com/HKUDS/Vibe-Trading/pull/338)、[#351](https://github.com/HKUDS/Vibe-Trading/pull/351)、[#349](https://github.com/HKUDS/Vibe-Trading/pull/349)、[#365](https://github.com/HKUDS/Vibe-Trading/pull/365)、[#367](https://github.com/HKUDS/Vibe-Trading/pull/367)、[#350](https://github.com/HKUDS/Vibe-Trading/pull/350)、[#335](https://github.com/HKUDS/Vibe-Trading/pull/335)、[#283](https://github.com/HKUDS/Vibe-Trading/issues/283)）。
+
 <details>
 <summary>過去のニュース</summary>
 
+- **2026-06-30** 💬 **研究配信用の IM チャンネルランタイム**：Vibe-Trading は同じ agent session runtime を 16 の組み込み message adapter に接続できるようになりました——WebSocket、Telegram、Slack、Discord、Matrix、WhatsApp、Signal、QQ/NapCat、WeChat/WeCom、Feishu/Lark、DingTalk、Teams、email、Mochat。CLI（`vibe-trading channels status/start/stop/login/pairing`）、REST（`/channels/status`、`/channels/start`、`/channels/stop`、`/channels/pairing/command`）、Web UI Settings panel が status、recovery hints、start/stop、sender pairing を扱い、SDK-backed adapters は `vibe-trading-ai[telegram]` や `vibe-trading-ai[channels]` などの extras の背後に残ります（[#341](https://github.com/HKUDS/Vibe-Trading/pull/341)）。
+
+- **2026-06-29** 🛡️ **Live advisory safety + Trading 212 read-only connector + Windows/Gemini fixes**: live order guards now have an opt-in, broker-agnostic `PreTradeAdvisoryInterface` that records advisory reviews without bypassing the mandate gate, kill switch, or audit trail ([#328](https://github.com/HKUDS/Vibe-Trading/pull/328), closes [#317](https://github.com/HKUDS/Vibe-Trading/issues/317), thanks @shadowinlife). Trading 212 joins the connector layer with read-only account, positions, orders, history, and instrument-metadata support; `place_order` / `cancel_order` still hard-refuse until a structural paper/live boundary exists ([#321](https://github.com/HKUDS/Vibe-Trading/pull/321), closes [#309](https://github.com/HKUDS/Vibe-Trading/issues/309), thanks @mvanhorn). Windows startup avoids the pandas 3.0 `Timestamp` crash via the `<3.0.0` constraint ([#329](https://github.com/HKUDS/Vibe-Trading/pull/329), closes [#324](https://github.com/HKUDS/Vibe-Trading/issues/324), thanks @hannibal-lee); Gemini `thought_signature` dict-history replay was verified/fixed on `main` ([#318](https://github.com/HKUDS/Vibe-Trading/issues/318)); `.US` financial statements now route to SEC EDGAR instead of Eastmoney ([#325](https://github.com/HKUDS/Vibe-Trading/issues/325)); and the Alpha Library landing page got cache/date/selector/noscript/DNS-prefetch hardening while heavier CSP and social-card follow-ups stay tracked ([#323](https://github.com/HKUDS/Vibe-Trading/issues/323)).
+
+- **2026-06-28** 🧰 **クロスプラットフォーム setup/dev + runtime と file tool の強化**：`vibe-trading setup` と `vibe-trading dev` は、Windows の TypeScript build、正しい cwd からの backend 起動、Vite の 5899 port、終了時の子プロセス cleanup を正しく扱うようになりました（[#292](https://github.com/HKUDS/Vibe-Trading/pull/292)、@digger-yu さんに感謝）。Runtime status polling はクラッシュせず graceful に degrade し（[#322](https://github.com/HKUDS/Vibe-Trading/issues/322)）、MCP OAuth cache key は sanitize され（[#313](https://github.com/HKUDS/Vibe-Trading/issues/313)）、OpenAI default と Robinhood `agent.json` validation も強化されました（[#319](https://github.com/HKUDS/Vibe-Trading/pull/319)、[#320](https://github.com/HKUDS/Vibe-Trading/pull/320)、@mvanhorn さんに感謝）。File tools には独立した read/write roots と sandbox tests の拡充も入りました（[#299](https://github.com/HKUDS/Vibe-Trading/pull/299)、@skloxo さんに感謝）。
+- **2026-06-27** 🧯 **Content-filter resilience + Shadow Account feature contract cleanup**：event-driven / swarm run は、個別の LLM content-moderation hit をスキップし、filter rate が高い場合は run card で警告し、Gemini safety finish reason を認識して analysis 全体を abort しないようになりました（[#308](https://github.com/HKUDS/Vibe-Trading/pull/308)、[#307](https://github.com/HKUDS/Vibe-Trading/issues/307) をクローズ、@shadowinlife さんに感謝）。Shadow Account の extraction/codegen は同じ `PRICE_FEATURES` contract を共有し、4 桁小数の return bounds を保つことで、rule/codegen drift と `prior_5d_return` の精度落ちを防ぎます（[#316](https://github.com/HKUDS/Vibe-Trading/pull/316)、@Robin1987China さんに感謝）。
+- **2026-06-26** 🎯 **Shadow Account の条件付きエントリー + tushare ETF/指数/HK ルーティング**：抽出された Shadow Account ルールが RSI / prior-return のレンジを持つようになり、生成される SignalEngine は保有サイクルを盲目的に再生せず、実際の条件（RSI がレンジ内、prior-return がレンジ内）でエントリーします（[#314](https://github.com/HKUDS/Vibe-Trading/pull/314)、[#302](https://github.com/HKUDS/Vibe-Trading/pull/302) の follow-up、@Robin1987China さんに感謝）。tushare loader も ETF/LOF を `fund_daily()`、指数を `index_daily()`、香港株を `hk_daily()` にルーティングし、非株式に対して静かに空を返す `daily()` を常に呼ぶのをやめ、銘柄ごとの空結果 + 部分取得の警告を追加しました（[#315](https://github.com/HKUDS/Vibe-Trading/pull/315)、[#310](https://github.com/HKUDS/Vibe-Trading/issues/310) をクローズ、@shadowinlife さんに感謝）。
+- **2026-06-25** 🧪 **strict validation JSON + 落ち着いた agent context**：単独のバックテスト validation は、`artifacts/validation.json` や CLI stdout に書き出す前に入れ子の `NaN` / `Infinity` を正規化するようになり、strict JSON parser が validation payload で詰まらなくなりました（[#306](https://github.com/HKUDS/Vibe-Trading/pull/306)、@gyx09212214-prog さんに感謝）。Agent prompt も loader registry から現在の data-source 数を動的に導出し、`_microcompact()` は本当に token pressure がある時だけ動くため、短い実行で古い tool result が早すぎるタイミングで消されません（[#296](https://github.com/HKUDS/Vibe-Trading/pull/296)、[#282](https://github.com/HKUDS/Vibe-Trading/issues/282) をクローズ、@MarkfuGod さんに感謝）。
+- **2026-06-24** 🎯 **Shadow Account の価格コンテキスト + reactive Chinese UI + LAN auth 修正**：Shadow Account のルール抽出は、`buy_dt` 時点の point-in-time-safe な entry context（`entry_rsi14` と `prior_5d_return`）を loader registry 経由で読めるようになり、offline / no-data では従来どおり graceful に落ちます（[#302](https://github.com/HKUDS/Vibe-Trading/pull/302)、[#295](https://github.com/HKUDS/Vibe-Trading/issues/295) の follow-up、@Robin1987China さんに感謝）。Web UI の主要パネルは charts、chat、Alpha Library、Correlation、Run Detail まで reactive English / zh-CN translation に寄せました（[#301](https://github.com/HKUDS/Vibe-Trading/pull/301)、@skloxo さんに感謝）。CSRF hardening 後も、`API_AUTH_KEY` を設定した remote same-origin Web UI deployment は POST / upload が通る一方、mismatch した cross-site origin は引き続き拒否されます（[#304](https://github.com/HKUDS/Vibe-Trading/pull/304)、@Hinotoi-agent さんに感謝）。
+- **2026-06-23** 🛡️ **ローカル API の CSRF 対策強化**：悪意あるウェブページがループバック API に対して安全でないクロスサイトリクエスト（POST/PUT/DELETE）を発行できなくなりました——CORS はレスポンスの読み取りは防げても副作用は防げないため、ループバックの dev-mode 信頼を認める**前**に、安全でないメソッドへ既存のクロスサイトガードを適用します。安全なメソッドとローカル CLI / 非ブラウザのアップロードには影響しません（[#293](https://github.com/HKUDS/Vibe-Trading/pull/293)、@Hinotoi-agent さんに感謝）。
+- **2026-06-22** 🔧 **ライブ認可の OAuth 修正 + Alpha Zoo 見出しの修正**：`connector authorize` が数分かかるブローカーのサインインの間も OAuth ハンドシェイクを維持し（`VIBE_LIVE_AUTHORIZE_TIMEOUT_SECONDS` で調整可能）、リトライ時に競合するコールバックサーバーを起動しなくなったため、トークンが確実に保存されます（[#281](https://github.com/HKUDS/Vibe-Trading/pull/281)、[#259](https://github.com/HKUDS/Vibe-Trading/issues/259) をクローズ、@Robin1987China さんに感謝）。Alpha Zoo ページが alpha 数を二重に表示しなくなりました（[#287](https://github.com/HKUDS/Vibe-Trading/pull/287)、[#286](https://github.com/HKUDS/Vibe-Trading/issues/286) をクローズ、@digger-yu さんに感謝）。定期リサーチにも端から端までの使い方ドキュメントが追加されました（[#288](https://github.com/HKUDS/Vibe-Trading/pull/288)）。
+- **2026-06-21** ⏰ **定期リサーチ実行エンジン + レポートライブラリ + バックテスト後アトリビューション**：定期リサーチが**エンドツーエンド**で動作するようになりました——デフォルト無効のバックグラウンド実行エンジン（`VIBE_TRADING_ENABLE_SCHEDULER`）が interval/cron で期限到来ジョブをセッションランタイム経由で実行します（[#278](https://github.com/HKUDS/Vibe-Trading/pull/278)、@mvanhorn さんに感謝、[#254](https://github.com/HKUDS/Vibe-Trading/issues/254) をクローズ）。新しい **`/reports` 実行ライブラリ**ページでは、レポートを生成した実行を一覧・検索・フィルタでき、Run Detail + Compare へのリンクも備えます（[#224](https://github.com/HKUDS/Vibe-Trading/pull/224)、@LemonCANDY42 さんに感謝）。さらにバックテストのたびにエージェントが**階層型アトリビューション**——取引レベルの勝ち/負けトップ、ベータ回帰、市場レジーム分析、モンテカルロ並べ替え検定——をデータの有無とルーティング条件に応じて自動実行します（[#280](https://github.com/HKUDS/Vibe-Trading/pull/280)、@shadowinlife さんに感謝）。
 - **2026-06-20** 🔬 **Research Autopilot のループが完結（フェーズ3）+ ローダー OHLC 整合性ガード + 学術アルファ4本**：**Research Autopilot** が **仮説 → シグナルエンジン → バックテスト** をエンドツーエンドで実行します——`scaffold_signal_engine` が runner 契約に準拠したエンジンを生成し、`link_autopilot_backtest` がバックテスト指標を仮説へ自動で書き戻します（**68 ツール**）（[#267](https://github.com/HKUDS/Vibe-Trading/pull/267)）。構造的な **OHLC 健全性チェック**がローダー境界で不正な bar（`high < low`、非正の価格、high/low が open/close を包含しない）を一括除去し、すべてのデータソースを保護します（[#274](https://github.com/HKUDS/Vibe-Trading/pull/274)、@Shizoqua さんに感謝）。さらに **academic アルファファミリーが 6 → 10 に拡大**——Jegadeesh リバーサル、George-Hwang 52週高値、Amihud 非流動性、Harvey-Siddique 歪度（**456 ファクター**）（[#277](https://github.com/HKUDS/Vibe-Trading/pull/277)、@Robin1987China さんに感謝）。
 - **2026-06-19** 🚀 **v0.1.10 — グローバルデータレイヤー**：市場データソースが 10 → 18 に拡大（無料の **Eastmoney / Sina / Stooq / Yahoo** + キー必須の **Finnhub / Alpha Vantage / Tiingo / FMP**、IP-ban リスク順の fallback）。さらに **18 個の読み取り専用データツール**（資金フロー、龍虎榜、北向き、信用取引、大口取引、SEC EDGAR + XBRL、財務、オプションチェーン、全市場スクリーニング…）を A 株 / 米国 / 香港にまたがり、すべて MCP 経由で公開。本リリースは 0.1.9 以降の全更新も同梱——10 のブローカーコネクタ、`alpha compare`、プロバイダ信頼性の大規模改修、任意のデータキャッシュ。`pip install -U vibe-trading-ai`
 - **2026-06-18** 🔬 **Research Autopilot 第1フェーズ + ローカル Data Bridge ローダー、加えて Discord セキュリティ通知**：新しい `run_research_autopilot` + `generate_backtest_config` が **Hypothesis → Research Goal → backtest** を端から端までつなぎ（現在 **50 ツール**）、新しい **`local`** ローダーは自分の **CSV / Parquet / DuckDB** ファイルから直接 OHLCV を読み込みます（[#260](https://github.com/HKUDS/Vibe-Trading/pull/260)、[#252](https://github.com/HKUDS/Vibe-Trading/pull/252)、@Robin1987China さんに感謝）。さらに DeepSeek `DSML` ツール呼び出しの解析と識別子封じ込め強化も入りました。⚠️ **セキュリティ通知**：以前のコミュニティ Discord 招待は、現在管理していないサーバー（偽の Collab.Land ウォレット「認証」フィッシング）に解決されます——すべて削除済みで、**唯一**の公式 Discord は HKUDS サーバー（[discord.gg/6TdQnT5xcF](https://discord.gg/6TdQnT5xcF)）です。ウォレット接続を求めることは決してありません。
@@ -199,6 +214,7 @@ Vibe-Trading は、金融に関する問いを実行可能な分析へ変換す�
 | **自分の取引をレビューする** | ブローカー取引日誌の解析、行動診断、ルール抽出、Shadow Account 比較。 |
 | **反復リサーチを改善する** | 永続メモリと編集可能な skills により、有用な手順を再利用可能なワークフローへ変換。 |
 | **アナリストチームを走らせる** | 投資、クオンツ、暗号資産、マクロ、リスクのワークフロー向けマルチエージェント・リサーチレビュー。 |
+| **リサーチを IM チャンネルへ接続する** | WebSocket、Telegram、Slack、Discord、Matrix、WhatsApp、Signal、QQ/NapCat、WeChat/WeCom、Feishu/Lark、DingTalk、Teams、email、Mochat から同じ session runtime を CLI、REST、Web UI で管理。 |
 | **使える artifacts を出力する** | レポート、TradingView Pine Script、TDX、MetaTrader 5、MCP tools、後続リサーチセッション。 |
 | **事前構築 alpha zoo をベンチ** | 456 個の alpha 因子（Qlib 158 + Kakushadze 101 + GTJA 191 + FF5 + Carhart）に対し、1 行 CLI で IC + IR + alive/reversed/dead 分類を実行 |
 
@@ -586,6 +602,7 @@ vibe-trading               # interactive TUI
 vibe-trading run -p "..."  # single run
 vibe-trading serve         # API server
 vibe-trading alpha list    # 456 個の事前構築 alpha を閲覧；show / bench / compare / export-manifest サブコマンド利用可
+vibe-trading channels status --local  # IM チャンネル設定と install hints を確認
 ```
 
 <details>
@@ -639,6 +656,35 @@ vibe-trading alpha list --zoo gtja191 --limit 10
 vibe-trading alpha show gtja191_171
 vibe-trading alpha bench --zoo gtja191 --universe csi300 --period 2018-2025 --top 20
 ```
+
+</details>
+
+<details>
+<summary><b>IM チャンネル</b></summary>
+
+IM channel adapters は外部チャットアプリを Web UI / CLI と同じ session runtime へ接続します。有効化する adapter は `~/.vibe-trading/agent.json` の `channels` 配下に設定します。SDK-backed adapters は optional extras で、SDK が足りない場合も runtime を落とさず recovery hints を返します。
+
+```bash
+vibe-trading channels status --local   # API なしで config と missing SDK hints を確認
+vibe-trading channels status           # 稼働中の API runtime を問い合わせ
+vibe-trading channels start            # API 経由で enabled adapters を開始
+vibe-trading channels stop             # API 経由で enabled adapters を停止
+vibe-trading channels login weixin     # 必要な adapter login hook を実行
+vibe-trading channels pairing --channel telegram list
+```
+
+Built-in adapters は `websocket`、`telegram`、`slack`、`discord`、`matrix`、`whatsapp`、`signal`、`qq`、`napcat`、`weixin`、`wecom`、`feishu`、`dingtalk`、`msteams`、`email`、`mochat` です。個別に `pip install "vibe-trading-ai[telegram]"` を使うか、全チャンネル分を `pip install "vibe-trading-ai[channels]"` で入れられます。
+
+**チャット内スラッシュコマンド**（チャンネル非依存、全 16 adapter で共通）：
+
+| コマンド | 説明 |
+|---------|------|
+| `/new` | 現在のセッションをリセット——次のメッセージで新しい会話を開始 |
+| `/reset` | `/new` のエイリアス |
+| `/newsession` | `/new` のエイリアス |
+| `/pairing list` | 保留中の sender pairing リクエストを表示 |
+
+コマンドは大文字小文字を区別せず、メッセージ全体として送信する必要があります（例：`hello /new` はリセットではなく通常メッセージとして処理されます）。
 
 </details>
 
@@ -759,6 +805,10 @@ vibe-trading serve --port 8899
 | `PUT` | `/settings/llm` | local LLM settings を更新 |
 | `GET` | `/settings/data-sources` | local data source settings を読み取り |
 | `PUT` | `/settings/data-sources` | local data source settings を更新 |
+| `GET` | `/channels/status` | IM channel runtime と adapter status を読み取り |
+| `POST` | `/channels/start` | 設定済み IM channel adapters を開始 |
+| `POST` | `/channels/stop` | 設定済み IM channel adapters を停止 |
+| `POST` | `/channels/pairing/command` | shared store に対して sender-pairing command を実行 |
 | `POST` | `/scheduled-runs` | 定期リサーチジョブを作成（interval-ms または cron） |
 | `GET` | `/scheduled-runs` | スケジュール済みジョブを一覧 |
 | `DELETE` | `/scheduled-runs/{job_id}` | スケジュール済みジョブをキャンセル |
@@ -776,6 +826,8 @@ Shell-capable tools は local CLI と trusted localhost workflows で利用で�
 Web UI Settings page では、local users が LLM provider/model、base URL、generation parameters、reasoning effort、Tushare token など任意の market data credentials を更新できます。Settings は `agent/.env` に永続化され、provider defaults は `agent/src/providers/llm_providers.json` から読み込まれます。
 
 Settings reads は side-effect free です。`GET /settings/llm` と `GET /settings/data-sources` は `agent/.env` を作成せず、project-relative paths だけを返します。Settings の読み書きは credential state の公開や credentials/runtime environment の更新を伴うため、設定済みの場合は `API_AUTH_KEY` が必要です。dev mode で `API_AUTH_KEY` が未設定の場合、settings access は loopback clients からのみ受け付けます。
+
+同じ Settings page には local operator 向けの **IM チャンネル**パネルもあります。`/channels/status` を polling し、configured/enabled/available/loaded/running 状態、adapter recovery hints、runtime の start/stop 操作を terminal に戻らず扱えます。
 
 ### Scheduled research（定期リサーチ）
 
@@ -1012,7 +1064,7 @@ Vibe-Trading は **[HKUDS](https://github.com/HKUDS)** agent ecosystem の一部
 | **Options Lab** | Vol surface, Greeks dashboard, payoff/scenario explorer | Planned |
 | **Portfolio Studio** | Risk x-ray, constraints, turnover-aware optimizer, rebalance notes | Planned |
 | **Alpha Zoo** | 452 個の事前構築 alpha 因子（Qlib 158 + Kakushadze 101 + GTJA 191 + FF5 + Carhart）、1 行 CLI でベンチ、agent 統合、Web UI | **0.1.8 でリリース済み** |
-| **Research Delivery** | Scheduled briefs to Slack / Telegram / email-style channels | スケジューラ出荷済み |
+| **Research Delivery** | Slack / Telegram / email-style IM channels 経由の scheduled briefs と live research sessions | スケジューラ + IM Runtime 出荷済み |
 | **Community** | Shareable skills, presets, and strategy cards | Exploring |
 
 ---

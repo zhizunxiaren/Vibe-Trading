@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from datetime import datetime
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 # Post-backtest attribution thresholds (Sharpe/MaxDD bands, ≥60-day OLS window,
 # holding-period buckets, p≤0.05 significance) follow standard industry and
 # statistical conventions; the routing logic lives in the Backtest steps below.
-_SYSTEM_PROMPT = """You are a finance research agent with {skill_count} specialist skills, {tool_count} tools, 7 data sources (with auto-fallback), and 29 multi-agent swarm teams.
+_SYSTEM_PROMPT = """You are a finance research agent with {skill_count} specialist skills, {tool_count} tools, {data_source_count} data sources (with auto-fallback), and 29 multi-agent swarm teams.
 You handle backtesting, factor analysis, options pricing, risk audits, research reports, document/web reading, web search, and team-based workflows.
 
 ## Tools
@@ -187,12 +188,29 @@ class ContextBuilder:
         return _SYSTEM_PROMPT.format(
             tool_count=len(self.registry._tools),
             skill_count=len(self.skills_loader.skills),
+            data_source_count=self._count_data_sources(),
             tool_descriptions=self._format_tool_descriptions(),
             skill_descriptions=self.skills_loader.get_descriptions(),
             memory_summary=self.memory.to_summary(),
             memory_section=memory_section,
             current_datetime=now.strftime("%A, %B %d, %Y %H:%M (local)"),
         )
+
+    @staticmethod
+    def _count_data_sources() -> int:
+        """Count registered backtest data sources for the system prompt.
+
+        Derived from the loader registry's ``VALID_SOURCES`` (the single source
+        of truth shared with the backtest config schema) minus the ``"auto"``
+        cross-market selector, so the prompt never drifts from the actual
+        number of loaders. Falls back to a static count if the import fails.
+        """
+        try:
+            from backtest.loaders.registry import VALID_SOURCES
+
+            return len(VALID_SOURCES - {"auto"})
+        except Exception:  # noqa: BLE001 - prompt count must never break startup
+            return 18
 
     def build_messages(self, user_message: str, history: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         """Build full message list.
@@ -275,21 +293,32 @@ class ContextBuilder:
         Returns:
             OpenAI-format assistant message.
         """
+        formatted_tool_calls = []
+        has_extra_content = False
+        for tc in tool_calls:
+            tool_call = {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.name,
+                    "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                },
+            }
+            extra_content = getattr(tc, "extra_content", None)
+            if extra_content:
+                tool_call["extra_content"] = dict(extra_content)
+                has_extra_content = True
+            formatted_tool_calls.append(tool_call)
+
         message = {
             "role": "assistant",
             "content": content,
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.name,
-                        "arguments": json.dumps(tc.arguments, ensure_ascii=False),
-                    },
-                }
-                for tc in tool_calls
-            ],
+            "tool_calls": formatted_tool_calls,
         }
+        if has_extra_content:
+            message["additional_kwargs"] = {
+                "tool_calls": copy.deepcopy(formatted_tool_calls),
+            }
         if reasoning_content is not None:
             message["reasoning_content"] = reasoning_content
         return message

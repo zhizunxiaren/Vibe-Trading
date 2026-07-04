@@ -20,6 +20,8 @@ import json
 import os
 import re
 import shutil
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -2784,6 +2786,12 @@ def _live_api_base() -> str:
     return os.environ.get("VIBE_TRADING_API_URL", "http://127.0.0.1:8000").rstrip("/")
 
 
+def _api_auth_headers() -> Dict[str, str]:
+    """Return Bearer auth headers for CLI-to-API control calls."""
+    key = (os.environ.get("VIBE_TRADING_API_KEY") or os.environ.get("API_AUTH_KEY") or "").strip()
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
 def _live_api_call(method: str, path: str, *, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Call an R6 live-runner endpoint and decode the JSON response.
 
@@ -2812,6 +2820,173 @@ def _live_api_call(method: str, path: str, *, body: Optional[Dict[str, Any]] = N
         return {"status": "error", "error": str(exc)}
 
 
+def _channels_api_call(method: str, path: str, *, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Call an IM channel runtime endpoint on the local API server."""
+    import httpx
+
+    url = f"{_live_api_base()}{path}"
+    headers = _api_auth_headers()
+    try:
+        if method.upper() == "GET":
+            response = httpx.get(url, headers=headers, timeout=10.0)
+        else:
+            response = httpx.post(url, json=body or {}, headers=headers, timeout=10.0)
+        response.raise_for_status()
+        return response.json()
+    except Exception as exc:  # noqa: BLE001 - CLI should explain offline API cleanly
+        return {"status": "error", "error": str(exc)}
+
+
+def _channels_local_status() -> Dict[str, Any]:
+    """Build local channel config/import status without starting adapters."""
+    from src.channels.config import load_channels_config
+    from src.channels.registry import inspect_channels
+
+    config = load_channels_config()
+    return {
+        "running": False,
+        "source": "local_config",
+        "channels": inspect_channels(config),
+    }
+
+
+def _print_channels_status(payload: Dict[str, Any]) -> None:
+    """Render IM channel status."""
+    table = Table(title="IM Channels", box=box.SIMPLE)
+    table.add_column("Channel")
+    table.add_column("Configured")
+    table.add_column("Enabled")
+    table.add_column("Available")
+    table.add_column("Loaded")
+    table.add_column("Running")
+    table.add_column("Recovery")
+    channels = payload.get("channels") if isinstance(payload, dict) else {}
+    if not isinstance(channels, dict):
+        channels = {}
+    for name, item in sorted(channels.items()):
+        if not isinstance(item, dict):
+            continue
+        recovery = item.get("install_hint") or item.get("error") or ""
+        table.add_row(
+            str(name),
+            "yes" if item.get("configured") else "no",
+            "yes" if item.get("enabled") else "no",
+            "yes" if item.get("available") else "no",
+            "yes" if item.get("loaded") else "no",
+            "yes" if item.get("running") else "no",
+            str(recovery),
+        )
+    console.print(table)
+    if payload.get("status") == "error":
+        console.print(f"[yellow]API unavailable:[/yellow] {payload.get('error')}")
+        console.print("[dim]Start the backend with `vibe-trading serve --port 8000`, or inspect local config with this status output.[/dim]")
+
+
+def cmd_channels_status(*, json_mode: bool = False, local: bool = False) -> int:
+    """Show IM channel status."""
+    payload = _channels_local_status() if local else _channels_api_call("GET", "/channels/status")
+    if payload.get("status") == "error":
+        local_payload = _channels_local_status()
+        local_payload["status"] = "error"
+        local_payload["error"] = payload.get("error", "")
+        payload = local_payload
+    if json_mode:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        _print_channels_status(payload)
+    return EXIT_SUCCESS
+
+
+def cmd_channels_start(*, json_mode: bool = False) -> int:
+    """Start configured IM channels through the API runtime."""
+    payload = _channels_api_call("POST", "/channels/start")
+    if json_mode:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    elif payload.get("status") == "error":
+        console.print(f"[red]Failed to start IM channels:[/red] {payload.get('error')}")
+        console.print("[dim]Run `vibe-trading serve --port 8000` first, or set VIBE_TRADING_API_URL.[/dim]")
+        return EXIT_RUN_FAILED
+    else:
+        console.print("[green]IM channels started.[/green]")
+        _print_channels_status(payload)
+    return EXIT_SUCCESS
+
+
+def cmd_channels_stop(*, json_mode: bool = False) -> int:
+    """Stop configured IM channels through the API runtime."""
+    payload = _channels_api_call("POST", "/channels/stop")
+    if json_mode:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    elif payload.get("status") == "error":
+        console.print(f"[red]Failed to stop IM channels:[/red] {payload.get('error')}")
+        console.print("[dim]Run `vibe-trading serve --port 8000` first, or set VIBE_TRADING_API_URL.[/dim]")
+        return EXIT_RUN_FAILED
+    else:
+        console.print("[green]IM channels stopped.[/green]")
+        _print_channels_status(payload)
+    return EXIT_SUCCESS
+
+
+def cmd_channels_pairing(channel: str, command: str) -> int:
+    """Run a pairing command against the shared local pairing store."""
+    from src.channels.pairing import handle_pairing_command
+
+    console.print(handle_pairing_command(channel, command))
+    return EXIT_SUCCESS
+
+
+def cmd_channels_login(channel_name: str, *, force: bool = False) -> int:
+    """Run a channel adapter's interactive login hook when available."""
+    import asyncio
+
+    from src.channels.config import load_channels_config
+    from src.channels.manager import ChannelManager
+    from src.channels.bus.queue import MessageBus
+
+    config = load_channels_config()
+    section = dict(config.get(channel_name, {})) if isinstance(config.get(channel_name), dict) else {}
+    if channel_name == "websocket":
+        console.print("[green]WebSocket channel does not require interactive login.[/green]")
+        console.print("[dim]Configure channels.websocket in ~/.vibe-trading/agent.json, then run `vibe-trading channels start`.[/dim]")
+        return EXIT_SUCCESS
+    if not section:
+        console.print(f"[red]No config found for channel '{channel_name}'.[/red]")
+        console.print("[dim]Add it under channels.<name> in ~/.vibe-trading/agent.json, then retry.[/dim]")
+        return EXIT_USAGE_ERROR
+    section["enabled"] = True
+    manager = ChannelManager({channel_name: section}, MessageBus())
+    adapter = manager.get_channel(channel_name)
+    if adapter is None:
+        status = manager.get_status().get(channel_name, {})
+        recovery = status.get("install_hint") or status.get("error") or "adapter unavailable"
+        console.print(f"[red]Channel '{channel_name}' is unavailable.[/red] {recovery}")
+        return EXIT_RUN_FAILED
+    ok = asyncio.run(adapter.login(force=force))
+    if ok:
+        console.print(f"[green]Channel '{channel_name}' login completed.[/green]")
+        return EXIT_SUCCESS
+    console.print(f"[red]Channel '{channel_name}' login failed.[/red]")
+    return EXIT_RUN_FAILED
+
+
+def _dispatch_channels(args: argparse.Namespace) -> int:
+    """Dispatch IM channel subcommands."""
+    command = args.channels_command
+    if command == "status":
+        return cmd_channels_status(json_mode=args.channels_json, local=args.local)
+    if command == "start":
+        return cmd_channels_start(json_mode=args.channels_json)
+    if command == "stop":
+        return cmd_channels_stop(json_mode=args.channels_json)
+    if command == "pairing":
+        text = " ".join([args.pairing_command, *args.pairing_args]).strip()
+        return cmd_channels_pairing(args.channel, text or "list")
+    if command == "login":
+        return cmd_channels_login(args.channel_name, force=args.force)
+    console.print("[red]channels requires a subcommand.[/red] Try: vibe-trading channels status")
+    return EXIT_USAGE_ERROR
+
+
 def _live_server_config(broker: str):
     """Resolve the protected MCP server config for ``broker``.
 
@@ -2833,6 +3008,66 @@ def _live_server_config(broker: str):
     return servers.get(broker.strip().lower())
 
 
+def _raw_live_server_config_entry(broker: str) -> dict[str, Any] | None:
+    """Best-effort raw lookup used only to explain invalid live config."""
+    from src.config.loader import _read_config_file
+    from src.config.paths import get_config_path
+    from src.config.schema import live_broker_key_for_url
+
+    try:
+        path = get_config_path()
+        if not path.exists():
+            return None
+        raw = _read_config_file(path)
+    except Exception:  # noqa: BLE001 — diagnostics must not mask the real CLI error
+        return None
+
+    servers = raw.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = raw.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return None
+
+    key = broker.strip().lower()
+    for server_key, server in servers.items():
+        if isinstance(server, dict) and str(server_key).strip().lower() == key:
+            return server
+
+    if key != "robinhood":
+        return None
+
+    for server in servers.values():
+        if isinstance(server, dict) and live_broker_key_for_url(str(server.get("url") or "")) == key:
+            return server
+    return None
+
+
+def _raw_server_entry_uses_wildcard(entry: dict[str, Any] | None) -> bool:
+    """Return whether a raw MCP server entry uses a wildcard enabledTools list."""
+    if entry is None:
+        return False
+    enabled_tools = entry.get("enabledTools", entry.get("enabled_tools"))
+    if not isinstance(enabled_tools, list):
+        return False
+    return "*" in {str(tool).strip() for tool in enabled_tools}
+
+
+def _print_missing_live_channel_config(key: str) -> None:
+    """Print actionable guidance when a live broker config cannot be loaded."""
+    if key == "robinhood":
+        from src.config.schema import format_robinhood_mcp_config_guidance
+
+        reason = "wildcard" if _raw_server_entry_uses_wildcard(_raw_live_server_config_entry(key)) else "missing"
+        console.print("[red]Robinhood live channel is not configured safely.[/red]")
+        console.print(format_robinhood_mcp_config_guidance(reason=reason), markup=False, soft_wrap=True)
+        return
+
+    console.print(
+        f"[red]No live channel configured for '{key}'.[/red] "
+        "Add the broker's mcpServers entry to ~/.vibe-trading/agent.json first."
+    )
+
+
 def cmd_live_authorize(broker: str) -> int:
     """Bootstrap the OAuth handshake for a live broker channel (desktop only).
 
@@ -2850,10 +3085,7 @@ def cmd_live_authorize(broker: str) -> int:
     key = broker.strip().lower()
     server_config = _live_server_config(key)
     if server_config is None:
-        console.print(
-            f"[red]No live channel configured for '{key}'.[/red] "
-            "Add the broker's mcpServers entry to ~/.vibe-trading/agent.json first."
-        )
+        _print_missing_live_channel_config(key)
         return EXIT_USAGE_ERROR
     if getattr(server_config, "auth", None) is None:
         console.print(
@@ -4021,6 +4253,29 @@ def _build_parser() -> argparse.ArgumentParser:
     login_parser.add_argument("provider", help="OAuth provider name, e.g. openai-codex")
     provider_subparsers.add_parser("doctor", help="Print redacted provider diagnostics")
 
+    channels_parser = subparsers.add_parser("channels", help="Manage IM channel adapters")
+    channels_subparsers = channels_parser.add_subparsers(dest="channels_command")
+    channels_status = channels_subparsers.add_parser("status", help="Show IM channel status")
+    channels_status.add_argument("--json", dest="channels_json", action="store_true", help="Print JSON")
+    channels_status.add_argument("--local", action="store_true", help="Inspect local config without contacting the API")
+    channels_start = channels_subparsers.add_parser("start", help="Start configured IM channels through the API")
+    channels_start.add_argument("--json", dest="channels_json", action="store_true", help="Print JSON")
+    channels_stop = channels_subparsers.add_parser("stop", help="Stop configured IM channels through the API")
+    channels_stop.add_argument("--json", dest="channels_json", action="store_true", help="Print JSON")
+    channels_login = channels_subparsers.add_parser("login", help="Run a channel adapter login hook")
+    channels_login.add_argument("channel_name", help="Channel name, e.g. weixin, feishu, whatsapp")
+    channels_login.add_argument("--force", action="store_true", help="Ignore existing credentials where supported")
+    channels_pairing = channels_subparsers.add_parser("pairing", help="Manage IM sender pairing")
+    channels_pairing.add_argument("--channel", default="telegram", help="Channel context for list/revoke commands")
+    channels_pairing.add_argument(
+        "pairing_command",
+        nargs="?",
+        default="list",
+        choices=["list", "approve", "deny", "revoke"],
+        help="Pairing command",
+    )
+    channels_pairing.add_argument("pairing_args", nargs="*", help="Pairing command arguments")
+
     list_parser = subparsers.add_parser("list", help="List runs")
     list_parser.add_argument("--limit", dest="list_limit", type=int, default=20, help="Maximum number of runs")
 
@@ -4031,6 +4286,40 @@ def _build_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument("--max-iter", dest="chat_max_iter", type=int, default=50, help="Maximum agent iterations")
 
     subparsers.add_parser("init", help="Interactive setup: create ~/.vibe-trading/.env")
+
+    # Cross-platform frontend setup. See cmd_setup() for details.
+    setup_parser = subparsers.add_parser(
+        "setup",
+        help="Install frontend dependencies and build the production bundle",
+    )
+    setup_parser.add_argument(
+        "--frontend-dir",
+        default=str(AGENT_DIR.parent / "frontend"),
+        help="Path to the frontend directory (default: <repo>/frontend)",
+    )
+
+    # Cross-platform dev mode. See cmd_dev() for details.
+    dev_parser = subparsers.add_parser(
+        "dev",
+        help="Start backend + frontend dev servers in one process",
+    )
+    dev_parser.add_argument(
+        "--port",
+        type=int,
+        default=8899,
+        help="Backend port (default: 8899)",
+    )
+    dev_parser.add_argument(
+        "--frontend-port",
+        type=int,
+        default=5899,
+        help="Vite dev server port, must match vite.config.ts (default: 5899)",
+    )
+    dev_parser.add_argument(
+        "--frontend-dir",
+        default=str(AGENT_DIR.parent / "frontend"),
+        help="Path to the frontend directory (default: <repo>/frontend)",
+    )
 
     memory_parser = subparsers.add_parser("memory", help="Inspect persistent memory")
     memory_subparsers = memory_parser.add_subparsers(dest="memory_command")
@@ -4206,7 +4495,7 @@ _PROVIDER_CHOICES: list[dict[str, str | None]] = [
         "key_env": "OPENAI_API_KEY",
         "base_env": "OPENAI_BASE_URL",
         "base_url": "https://api.openai.com/v1",
-        "model": "gpt-5.5-instant",
+        "model": "gpt-5.5",
         "key_prefix": "sk-",
         "key_placeholder": "sk-...",
     },
@@ -4601,6 +4890,296 @@ def cmd_init() -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Cross-platform frontend setup / dev commands.
+#
+# These exist to bridge a real Windows footgun: the package's frontend uses
+# TypeScript, but `npx tsc` on Windows does NOT resolve the locally-installed
+# TypeScript binary. Instead, npx hits the npm registry and downloads an
+# abandoned 10-year-old package called `tsc@2.0.4` that prints
+# "This is not the tsc command you are looking for". The fix is to always
+# invoke TypeScript via `npm exec --package=typescript tsc ...` (or
+# `npx --package=typescript tsc ...`) on Windows; on POSIX, `npm run build`
+# already works because npm prepends ./node_modules/.bin to PATH for local
+# scripts.
+# ---------------------------------------------------------------------------
+
+
+def _is_windows() -> bool:
+    """True when running on a Windows-like platform (win32, including Cygwin/MSYS)."""
+    return sys.platform == "win32"
+
+
+def _resolve_node_and_npm() -> tuple[Optional[str], Optional[str]]:
+    """Return ``(node_path, npm_path)`` if both are on PATH, else ``(None, None)``.
+
+    Used by ``cmd_setup`` to fail fast with a clear message instead of
+    surfacing a cryptic ENOENT from npm itself.
+    """
+    node = shutil.which("node")
+    npm = shutil.which("npm")
+    return node, npm
+
+
+def _build_frontend_cmd(frontend_dir: Path) -> list[list[str]]:
+    """Return the ordered list of subprocess invocations needed to build the frontend.
+
+    On Windows we explicitly pin ``--package=typescript`` / ``--package=vite``
+    so npm cannot accidentally fetch the abandoned ``tsc`` package from the
+    registry. On POSIX systems, ``npm run build`` is sufficient because npm
+    prepends ``./node_modules/.bin`` to ``PATH`` for local scripts.
+
+    Each inner list is a single ``subprocess.run`` invocation. Returned as a
+    list of steps so the caller can stream progress.
+    """
+    is_win = _is_windows()
+    if is_win:
+        # `npm exec --package=typescript tsc -b` is the safe form on Windows;
+        # plain `npx tsc` will fetch the abandoned `tsc@2.0.4` package.
+        return [
+            ["npm", "install", "--no-audit", "--no-fund"],
+            ["npm", "exec", "--package=typescript", "--", "tsc", "-b"],
+            ["npm", "exec", "--package=vite", "--", "vite", "build"],
+        ]
+    return [
+        ["npm", "install", "--no-audit", "--no-fund"],
+        ["npm", "run", "build"],
+    ]
+
+
+def _run_step(
+    description: str,
+    cmd: list[str],
+    cwd: Path,
+) -> bool:
+    """Run one subprocess step, returning True on success.
+
+    Decodes subprocess output as UTF-8 with ``errors="replace"`` so that
+    non-ASCII bytes emitted by tools like Vite do not raise
+    ``UnicodeDecodeError`` on platforms whose default codec is GBK/CP936
+    (notably Windows). The captured text is only used to surface a
+    friendly error message; lossy decoding is acceptable here.
+    """
+    console.print(f"[dim]  {description} …[/dim]")
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        console.print(f"[red]  failed:[/red] {exc}")
+        return False
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip()
+        # Show the last 20 lines to keep noise manageable.
+        tail = "\n".join(err.splitlines()[-20:]) if err else "(no output)"
+        console.print(f"[red]  {description} failed:[/red]\n{tail}")
+        return False
+    return True
+
+
+def cmd_setup(frontend_dir: Path) -> int:
+    """Install frontend dependencies and build the production bundle.
+
+    Cross-platform wrapper that hides the ``npx tsc`` / ``npm exec tsc``
+    Windows footgun. Equivalent to running ``cd frontend && npm install
+    && npm run build`` from a POSIX shell, but works on Windows without
+    the user having to know about the abandoned ``tsc`` package on the
+    npm registry.
+    """
+    console.print(
+        Panel(
+            f"[bold cyan]Vibe-Trading frontend setup[/bold cyan]\n"
+            f"[dim]{frontend_dir}[/dim]",
+            border_style="cyan",
+            padding=(0, 1),
+        )
+    )
+
+    if not frontend_dir.exists():
+        console.print(
+            f"[red]Frontend directory not found:[/red] {frontend_dir}\n"
+            "[dim]Pass --frontend-dir to point at a different location.[/dim]"
+        )
+        return EXIT_USAGE_ERROR
+
+    node, npm = _resolve_node_and_npm()
+    if not node or not npm:
+        missing = [name for name, path_ in (("node", node), ("npm", npm)) if not path_]
+        console.print(
+            f"[red]Required tool not on PATH:[/red] {', '.join(missing)}\n"
+            "[dim]Install Node.js (>= 18) from https://nodejs.org and retry.[/dim]"
+        )
+        return EXIT_USAGE_ERROR
+
+    # On Windows, ``npm`` is shipped as ``npm.cmd``; ``subprocess.run`` does
+    # not consult ``PATHEXT`` for bare command names, so it would raise
+    # ``FileNotFoundError`` even though ``shutil.which("npm")`` returned a
+    # valid path. Resolve to the full path before invoking.
+    npm_path = npm
+    if _is_windows():
+        steps = [
+            [npm_path, *step[1:]] if step and step[0] == "npm" else step
+            for step in _build_frontend_cmd(frontend_dir)
+        ]
+    else:
+        steps = _build_frontend_cmd(frontend_dir)
+    for step in steps:
+        description = " ".join(step[:3])  # e.g. "npm install --no-audit"
+        if not _run_step(description, step, frontend_dir):
+            return EXIT_RUN_FAILED
+
+    console.print(
+        Panel(
+            "[green]Frontend built.[/green]\n"
+            f"  Artifacts: [cyan]{frontend_dir / 'dist'}[/cyan]\n"
+            "[dim]Run [bold]vibe-trading serve[/bold] to serve everything on one port.[/dim]",
+            border_style="green",
+            padding=(0, 1),
+        )
+    )
+    return EXIT_SUCCESS
+
+
+def cmd_dev(
+    backend_port: int = 8899,
+    frontend_port: int = 5899,
+    frontend_dir: Optional[Path] = None,
+) -> int:
+    """Start backend + Vite dev server in one foreground process.
+
+    Spawns two child processes:
+
+    * The FastAPI backend, launched from ``AGENT_DIR`` so that
+      ``python -m cli._legacy serve`` resolves the in-repo ``cli`` package
+      (launching it from the repo root would fail with
+      ``ModuleNotFoundError: No module named 'cli'``).
+    * The Vite dev server, launched from ``frontend_dir`` with the port
+      from ``vite.config.ts`` (currently 5899). We do NOT hardcode
+      ``5173`` — that would be wrong for this project.
+
+    Both children inherit stdout/stderr so their logs are interleaved
+    with the dev banner. ``Ctrl+C`` (SIGINT) and ``SIGTERM`` cleanly
+    terminate both children.
+    """
+    frontend_dir = frontend_dir or (AGENT_DIR.parent / "frontend")
+    if not frontend_dir.exists():
+        console.print(
+            f"[red]Frontend directory not found:[/red] {frontend_dir}\n"
+            "[dim]Pass --frontend-dir to point at a different location.[/dim]"
+        )
+        return EXIT_USAGE_ERROR
+
+    # `npm run dev` invokes the local Vite binary at
+    # ``frontend/node_modules/.bin/vite``. If ``node_modules`` does not
+    # exist (or is missing the Vite package), npm's bare-script
+    # resolution will print a confusing "vite is not a command" error
+    # and exit. Detect this case up front and point the user at
+    # ``vibe-trading setup`` instead.
+    vite_bin = frontend_dir / "node_modules" / ".bin" / ("vite.cmd" if _is_windows() else "vite")
+    if not vite_bin.exists():
+        console.print(
+            Panel(
+                f"[red]Frontend dependencies not installed.[/red]\n"
+                f"  Missing: [dim]{frontend_dir / 'node_modules'}[/dim]\n\n"
+                "Run this first:\n"
+                "  [cyan]vibe-trading setup[/cyan]\n\n"
+                "[dim]Or, to start the dev mode anyway and install on the fly,\n"
+                "run [bold]vibe-trading setup[/bold] in another terminal.[/dim]",
+                title="vibe-trading dev",
+                border_style="red",
+                padding=(0, 1),
+            )
+        )
+        return EXIT_USAGE_ERROR
+
+    node, npm = _resolve_node_and_npm()
+    if not node or not npm:
+        missing = [name for name, path_ in (("node", node), ("npm", npm)) if not path_]
+        console.print(
+            f"[red]Required tool not on PATH:[/red] {', '.join(missing)}\n"
+            "[dim]Install Node.js (>= 18) from https://nodejs.org and retry.[/dim]"
+        )
+        return EXIT_USAGE_ERROR
+
+    backend_cmd = [sys.executable, "-m", "cli._legacy", "serve", "--port", str(backend_port)]
+    # On Windows, ``npm`` is typically ``npm.cmd``. ``subprocess.Popen`` does
+    # not consult ``PATHEXT`` for bare command names, so the call would fail
+    # with ``FileNotFoundError`` even though ``shutil.which("npm")`` returned
+    # a path. Use the resolved executable path directly.
+    npm_executable = npm if _is_windows() else "npm"
+    frontend_cmd = [npm_executable, "run", "dev", "--", "--port", str(frontend_port)]
+
+    console.print(
+        Panel(
+            f"[bold cyan]Vibe-Trading dev[/bold cyan]\n"
+            f"  Backend  → [cyan]http://127.0.0.1:{backend_port}[/cyan]  "
+            f"(cwd: {AGENT_DIR})\n"
+            f"  Frontend → [cyan]http://localhost:{frontend_port}[/cyan]  "
+            f"(cwd: {frontend_dir})",
+            border_style="cyan",
+            padding=(0, 1),
+        )
+    )
+    console.print("[dim]Press Ctrl+C to stop both servers.[/dim]\n")
+
+    backend = subprocess.Popen(backend_cmd, cwd=str(AGENT_DIR))
+    frontend = subprocess.Popen(frontend_cmd, cwd=str(frontend_dir))
+    children = [backend, frontend]
+
+    def _terminate_all() -> None:
+        for child in children:
+            if child.poll() is None:
+                try:
+                    child.terminate()
+                except OSError:
+                    pass
+
+    # Wire signal handlers. On Windows, SIGTERM does not exist and signal
+    # handlers must be installed from the main thread; KeyboardInterrupt is
+    # the cross-platform path for Ctrl+C.
+    if threading.current_thread() is threading.main_thread():
+        try:
+            signal.signal(signal.SIGINT, lambda *_: _terminate_all())
+        except (ValueError, OSError):
+            pass
+        try:
+            signal.signal(signal.SIGTERM, lambda *_: _terminate_all())
+        except (AttributeError, ValueError, OSError):
+            pass
+
+    try:
+        # Wait for whichever process exits first; if it's the backend we
+        # bring the frontend down too, and vice versa.
+        while True:
+            time.sleep(0.5)
+            if backend.poll() is not None or frontend.poll() is not None:
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _terminate_all()
+        # Give the children a brief grace period, then force-kill.
+        deadline = time.time() + 5
+        for child in children:
+            remaining = max(0.0, deadline - time.time())
+            try:
+                child.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                try:
+                    child.kill()
+                except OSError:
+                    pass
+
+    return EXIT_SUCCESS
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint returning a process exit code."""
     raw_argv = list(sys.argv[1:] if argv is None else argv)
@@ -4616,6 +5195,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "init":
         return cmd_init()
+    if args.command == "setup":
+        return _coerce_exit_code(
+            cmd_setup(frontend_dir=Path(args.frontend_dir))
+        )
+    if args.command == "dev":
+        return _coerce_exit_code(
+            cmd_dev(
+                backend_port=args.port,
+                frontend_port=args.frontend_port,
+                frontend_dir=Path(args.frontend_dir),
+            )
+        )
     if args.command == "serve":
         return serve_main(raw_argv[1:])
     if args.command == "provider":
@@ -4625,6 +5216,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_provider_doctor()
         console.print("[red]provider requires a subcommand.[/red] Try: vibe-trading provider doctor")
         return EXIT_USAGE_ERROR
+    if args.command == "channels":
+        return _coerce_exit_code(_dispatch_channels(args))
     if args.command == "run":
         return _handle_prompt_command(
             args.run_prompt,
