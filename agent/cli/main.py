@@ -21,10 +21,12 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -671,6 +673,145 @@ def _print_debug_summary(
     )
 
 
+_SECRET_VALUE_RE = re.compile(
+    r"(?i)\b(api[_-]?key|token|secret|password|bearer)\b(\s*[:=]\s*)([^\s`]+)"
+)
+_OPENAI_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+
+
+def _append_turn_analysis_document(
+    session_id: str,
+    user_input: str,
+    result: Dict[str, Any],
+    elapsed: float,
+) -> None:
+    """Append a visible turn summary to ``agent/sessions/<session_id>/analysis.md``.
+
+    The file is an automatic session artifact, not a durable wiki page. Keep it
+    best-effort so filesystem issues never break the interactive chat loop.
+    """
+    if not session_id:
+        return
+    try:
+        path = _analysis_document_path(session_id)
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        turn_index = _next_analysis_turn_index(path)
+        is_new = not path.exists()
+        with path.open("a", encoding="utf-8") as handle:
+            if is_new:
+                handle.write(_render_analysis_header(session_id))
+            handle.write(
+                _render_analysis_turn(
+                    turn_index=turn_index,
+                    user_input=user_input,
+                    result=result,
+                    elapsed=elapsed,
+                )
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:  # noqa: BLE001 - documentation must never block chat
+        return
+
+
+def _analysis_document_path(session_id: str) -> Path | None:
+    """Return the analysis document path while guarding against traversal."""
+    store = _session_store()
+    base_dir = getattr(store, "base_dir", None)
+    if base_dir is None:
+        return None
+    root = Path(base_dir).resolve()
+    target = (root / session_id / "analysis.md").resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        return None
+    return target
+
+
+def _next_analysis_turn_index(path: Path) -> int:
+    if not path.exists():
+        return 1
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return 1
+    return sum(1 for line in text.splitlines() if line.startswith("## Turn ")) + 1
+
+
+def _render_analysis_header(session_id: str) -> str:
+    return (
+        "# CLI Session Analysis\n\n"
+        f"Session: `{_redact_sensitive_text(session_id)}`\n\n"
+        "> Auto-generated from visible CLI turns. Hidden reasoning, credentials, "
+        "environment values, and raw tool output are not recorded.\n\n"
+    )
+
+
+def _render_analysis_turn(
+    *,
+    turn_index: int,
+    user_input: str,
+    result: Dict[str, Any],
+    elapsed: float,
+) -> str:
+    status = str(result.get("status") or "unknown")
+    run_id = str(result.get("run_id") or "")
+    answer = str(result.get("content") or "").strip()
+    reason = str(result.get("reason") or "").strip()
+    lines = [
+        f"## Turn {turn_index} - {datetime.now().isoformat(timespec='seconds')}",
+        "",
+        f"- Status: {status}",
+        f"- Elapsed: {elapsed:.1f}s",
+        f"- Run ID: `{_redact_sensitive_text(run_id)}`" if run_id else "- Run ID: none",
+        f"- Tools: {_analysis_tool_count(result)}",
+    ]
+    if reason:
+        lines.append(f"- Reason: {_redact_sensitive_text(reason)}")
+    lines.extend(
+        [
+            "",
+            "### User",
+            "",
+            _markdown_text_block(_redact_sensitive_text(user_input)),
+            "",
+            "### Assistant",
+            "",
+            _markdown_text_block(_redact_sensitive_text(answer))
+            if answer
+            else "_No assistant content recorded._\n",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _analysis_tool_count(result: Dict[str, Any]) -> int:
+    trace = result.get("react_trace") or []
+    if not isinstance(trace, list):
+        return 0
+    return sum(
+        1
+        for entry in trace
+        if isinstance(entry, dict) and entry.get("type") == "tool_result"
+    )
+
+
+def _markdown_text_block(text: str) -> str:
+    fence = "```"
+    while fence in text:
+        fence += "`"
+    return f"{fence}text\n{text.rstrip()}\n{fence}\n"
+
+
+def _redact_sensitive_text(text: str) -> str:
+    redacted = _SECRET_VALUE_RE.sub(r"\1\2[REDACTED]", text)
+    return _OPENAI_KEY_RE.sub("[REDACTED]", redacted)
+
+
 def _run_one_turn(user_input: str, ctx: InteractiveContext) -> None:
     """Execute a single agent turn with the Rich dashboard.
 
@@ -742,6 +883,8 @@ def _run_one_turn(user_input: str, ctx: InteractiveContext) -> None:
     if answer:
         ctx.history.append({"role": "assistant", "content": answer})
         _append_message(ctx.session_id or "", "assistant", answer)
+
+    _append_turn_analysis_document(ctx.session_id or "", user_input, result, elapsed)
 
     if ctx.debug:
         _print_debug_summary(console, result, elapsed, ctx)
