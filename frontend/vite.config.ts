@@ -3,9 +3,11 @@ import react from "@vitejs/plugin-react";
 import path from "path";
 
 const PROXY_PATHS = [
+  "/auth",
   "/sessions",
   "/swarm/presets",
   "/swarm/runs",
+  "/qveris",
   "/settings/llm",
   "/settings/data-sources",
   "/channels",
@@ -13,8 +15,8 @@ const PROXY_PATHS = [
   "/live",
   "/upload",
   "/shadow-reports",
-  "/analytics",
-  "/ranking",
+  "/scheduled-runs",
+  "/options",
 ];
 
 export default defineConfig(({ mode }) => {
@@ -33,7 +35,7 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [react()],
     resolve: {
-      alias: { "@": path.resolve(__dirname, "./src") },
+      alias: { "@": path.resolve(import.meta.dirname, "./src") },
     },
     server: {
       port: 5899,
@@ -46,16 +48,20 @@ export default defineConfig(({ mode }) => {
         "^/runs/[^/]+/?$": apiProxyWithHtmlFallback,
         "/runs": apiProxy,
         "/correlation": apiProxyWithHtmlFallback,
-        "/ranking": apiProxyWithHtmlFallback,
+        // /options is both the SPA Options Lab route and an API prefix
+        // (/options/payoff, /options/chain) — same dual role as /correlation.
+        // Overrides the plain PROXY_PATHS entry above.
+        "/options": apiProxyWithHtmlFallback,
         "^/alpha(?:/|$)": apiProxy,
       },
     },
     build: {
       rollupOptions: {
         output: {
-          manualChunks: {
-            "vendor-react": ["react", "react-dom", "react-router-dom"],
-            "vendor-charts": ["echarts"],
+          manualChunks: (id: string) => {
+            if (/node_modules\/(react|react-dom|react-router)\//.test(id)) return "vendor-react";
+            if (/node_modules\/echarts\//.test(id)) return "vendor-charts";
+            return undefined;
           },
         },
       },

@@ -20,6 +20,7 @@ from typing import Any
 
 from backtest.loaders import eastmoney_client
 from src.agent.tools import BaseTool
+from src.tools import tushare_fallbacks
 
 logger = logging.getLogger(__name__)
 
@@ -61,14 +62,13 @@ def _extract_code(symbol: str) -> str | None:
     if not symbol:
         return None
     token = symbol.strip().upper()
-    if "." in token:
-        token = token.rpartition(".")[0]
-    for prefix in ("SH", "SZ", "BJ"):
-        if token.startswith(prefix):
-            token = token[len(prefix) :]
-    token = token.strip()
-    if len(token) == 6 and token.isdigit():
-        return token
+    parts = [p.strip() for p in token.split(".") if p.strip()]
+    for part in parts:
+        for prefix in ("SH", "SZ", "BJ"):
+            if part.startswith(prefix):
+                part = part[len(prefix):]
+        if len(part) == 6 and part.isdigit():
+            return part
     return None
 
 
@@ -83,7 +83,7 @@ def _clamp_days(days: Any) -> int:
     """
     try:
         value = int(days)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return _DEFAULT_DAYS
     if value <= 0:
         return _DEFAULT_DAYS
@@ -196,12 +196,44 @@ class MarginTradingTool(BaseTool):
             )
         except Exception as exc:  # noqa: BLE001 - surface any provider failure as envelope
             logger.warning("eastmoney margin fetch failed for %s: %s", code, exc)
-            return _err(f"Eastmoney margin request failed: {exc}")
+            try:
+                fallback_data = tushare_fallbacks.fetch_margin_trading(code, days=days)
+            except Exception as fallback_exc:  # noqa: BLE001 - return both provider failures
+                return _err(
+                    f"Eastmoney margin request failed: {exc}; "
+                    f"tushare fallback failed: {fallback_exc}"
+                )
+            return json.dumps(
+                {
+                    "ok": True,
+                    "market": "a_share",
+                    "source": "tushare",
+                    "warnings": [f"eastmoney failed ({exc}); used tushare fallback"],
+                    "data": fallback_data,
+                },
+                ensure_ascii=False,
+            )
 
         result = payload.get("result") if isinstance(payload, dict) else None
         data = result.get("data") if isinstance(result, dict) else None
         if not isinstance(data, list) or not data:
-            return _err(f"No margin-trading data returned for {code}.")
+            try:
+                fallback_data = tushare_fallbacks.fetch_margin_trading(code, days=days)
+            except Exception as fallback_exc:  # noqa: BLE001 - preserve the original empty-data error
+                return _err(
+                    f"No margin-trading data returned for {code}. "
+                    f"Tushare fallback failed: {fallback_exc}"
+                )
+            return json.dumps(
+                {
+                    "ok": True,
+                    "market": "a_share",
+                    "source": "tushare",
+                    "warnings": ["eastmoney returned no rows; used tushare fallback"],
+                    "data": fallback_data,
+                },
+                ensure_ascii=False,
+            )
 
         rows = [_normalize_row(item) for item in data if isinstance(item, dict)]
         rows = rows[:days]

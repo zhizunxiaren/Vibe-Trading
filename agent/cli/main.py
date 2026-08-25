@@ -20,13 +20,12 @@ hits :func:`main`.
 from __future__ import annotations
 
 import importlib
-import os
-import re
+import logging
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -85,7 +84,19 @@ def _register_live_slash_commands() -> None:
 
 
 _register_live_slash_commands()
-
+# QVERIS-INTEGRATION
+def _register_data_slash_commands() -> None:  # QVERIS-INTEGRATION
+    """Surface data routing mode in the shared slash registry."""  # QVERIS-INTEGRATION
+    from cli.commands import slash_router  # QVERIS-INTEGRATION
+    if any(cmd.name == "data" for cmd in slash_router.SLASH_COMMANDS):  # QVERIS-INTEGRATION
+        return  # QVERIS-INTEGRATION
+    commands = list(slash_router.SLASH_COMMANDS)  # QVERIS-INTEGRATION
+    quit_idx = next((i for i, c in enumerate(commands) if c.name == "quit"), len(commands))  # QVERIS-INTEGRATION
+    commands.insert(quit_idx, slash_router.Command("data", "Data routing mode", "cli.main"))  # QVERIS-INTEGRATION
+    slash_router.SLASH_COMMANDS = tuple(commands)  # QVERIS-INTEGRATION
+# QVERIS-INTEGRATION
+_register_data_slash_commands()  # QVERIS-INTEGRATION
+# QVERIS-INTEGRATION
 _AGENT_DIR = Path(__file__).resolve().parents[1]
 _ENV_PATH = Path.home() / ".vibe-trading" / ".env"
 _PROJECT_ENV_PATH = _AGENT_DIR / ".env"
@@ -110,7 +121,9 @@ _SESSION_STORE_CACHE: Any = None
 
 def _probe_model_name() -> str:
     """Return the configured LLM model id, or a placeholder."""
-    name = os.environ.get("LANGCHAIN_MODEL_NAME") or os.environ.get("OPENAI_MODEL")
+    from src.config.accessor import get_env_config
+
+    name = get_env_config().llm.langchain_model_name or get_env_config().llm.openai_model
     if name:
         return name
     env_path = _first_existing_env_path()
@@ -156,7 +169,9 @@ def _probe_skill_count() -> int:
 
 def _probe_session_count() -> int:
     """Count recorded sessions from the SQLite store."""
-    db_path = Path.home() / ".vibe-trading" / "sessions.db"
+    from src.config.paths import get_runtime_root
+
+    db_path = get_runtime_root() / "sessions.db"
     if not db_path.exists():
         return 0
     try:
@@ -342,6 +357,7 @@ class InteractiveContext:
     last_recap_history_len: int = 0
     pending_prompt: Optional[str] = None
     pending_proposal: Optional[Dict[str, Any]] = None
+    pending_scheduled_proposal: Optional[Dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +366,7 @@ class InteractiveContext:
 
 
 def _session_store() -> Any:
-    """Return a process-wide :class:`SessionStore` rooted at ``agent/sessions``.
+    """Return a process-wide :class:`SessionStore` rooted at the user-level sessions dir.
 
     Cached on the module so repeat ``_append_message`` / ``_new_session``
     calls don't re-import ``src.session.store`` every turn.
@@ -386,8 +402,8 @@ def _new_session(prompt_preview: str) -> Optional[str]:
     """Create a fresh session record. Returns the id, or None on failure.
 
     Dual-writes to the filesystem :class:`SessionStore` (canonical JSONL
-    log under ``agent/sessions/``) *and* to the SQLite FTS5 search index
-    (``~/.vibe-trading/sessions.db``) so cross-session search via
+    log in the user-level sessions dir) *and* to the SQLite FTS5 search
+    index (``sessions.db`` beside it) so cross-session search via
     :class:`SessionSearchIndex` finds turns recorded from the interactive
     loop. Matches the pattern in :class:`SessionService`.
     """
@@ -459,7 +475,9 @@ def _maybe_resume_last_session(console: Any) -> Optional[Dict[str, Any]]:
 
     Returns:
         A dict ``{"session_id": str, "history": list[dict], "title": str}``
-        when the user opts to resume, otherwise ``None`` (new session).
+        when the user opts to resume, ``{"pending_input": str}`` when the
+        user typed a first chat turn into the prompt, otherwise ``None`` (new
+        session).
     """
     try:
         store = _session_store()
@@ -476,11 +494,14 @@ def _maybe_resume_last_session(console: Any) -> Optional[Dict[str, Any]]:
         f"[dim]Resume last session ({title})? (r)esume / (n)ew (default: new)[/dim]"
     )
     try:
-        choice = input("> ").strip().lower()
+        raw_choice = input("> ").strip()
     except (EOFError, KeyboardInterrupt):
         return None
-    if choice not in {"r", "resume", "y", "yes"}:
+    choice = raw_choice.lower()
+    if choice in {"", "n", "new", "no"}:
         return None
+    if choice not in {"r", "resume", "y", "yes"}:
+        return {"pending_input": raw_choice}
 
     return {
         "session_id": last.session_id,
@@ -673,145 +694,6 @@ def _print_debug_summary(
     )
 
 
-_SECRET_VALUE_RE = re.compile(
-    r"(?i)\b(api[_-]?key|token|secret|password|bearer)\b(\s*[:=]\s*)([^\s`]+)"
-)
-_OPENAI_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
-
-
-def _append_turn_analysis_document(
-    session_id: str,
-    user_input: str,
-    result: Dict[str, Any],
-    elapsed: float,
-) -> None:
-    """Append a visible turn summary to ``agent/sessions/<session_id>/analysis.md``.
-
-    The file is an automatic session artifact, not a durable wiki page. Keep it
-    best-effort so filesystem issues never break the interactive chat loop.
-    """
-    if not session_id:
-        return
-    try:
-        path = _analysis_document_path(session_id)
-        if path is None:
-            return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        turn_index = _next_analysis_turn_index(path)
-        is_new = not path.exists()
-        with path.open("a", encoding="utf-8") as handle:
-            if is_new:
-                handle.write(_render_analysis_header(session_id))
-            handle.write(
-                _render_analysis_turn(
-                    turn_index=turn_index,
-                    user_input=user_input,
-                    result=result,
-                    elapsed=elapsed,
-                )
-            )
-            handle.flush()
-            os.fsync(handle.fileno())
-    except Exception:  # noqa: BLE001 - documentation must never block chat
-        return
-
-
-def _analysis_document_path(session_id: str) -> Path | None:
-    """Return the analysis document path while guarding against traversal."""
-    store = _session_store()
-    base_dir = getattr(store, "base_dir", None)
-    if base_dir is None:
-        return None
-    root = Path(base_dir).resolve()
-    target = (root / session_id / "analysis.md").resolve()
-    try:
-        target.relative_to(root)
-    except ValueError:
-        return None
-    return target
-
-
-def _next_analysis_turn_index(path: Path) -> int:
-    if not path.exists():
-        return 1
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return 1
-    return sum(1 for line in text.splitlines() if line.startswith("## Turn ")) + 1
-
-
-def _render_analysis_header(session_id: str) -> str:
-    return (
-        "# CLI Session Analysis\n\n"
-        f"Session: `{_redact_sensitive_text(session_id)}`\n\n"
-        "> Auto-generated from visible CLI turns. Hidden reasoning, credentials, "
-        "environment values, and raw tool output are not recorded.\n\n"
-    )
-
-
-def _render_analysis_turn(
-    *,
-    turn_index: int,
-    user_input: str,
-    result: Dict[str, Any],
-    elapsed: float,
-) -> str:
-    status = str(result.get("status") or "unknown")
-    run_id = str(result.get("run_id") or "")
-    answer = str(result.get("content") or "").strip()
-    reason = str(result.get("reason") or "").strip()
-    lines = [
-        f"## Turn {turn_index} - {datetime.now().isoformat(timespec='seconds')}",
-        "",
-        f"- Status: {status}",
-        f"- Elapsed: {elapsed:.1f}s",
-        f"- Run ID: `{_redact_sensitive_text(run_id)}`" if run_id else "- Run ID: none",
-        f"- Tools: {_analysis_tool_count(result)}",
-    ]
-    if reason:
-        lines.append(f"- Reason: {_redact_sensitive_text(reason)}")
-    lines.extend(
-        [
-            "",
-            "### User",
-            "",
-            _markdown_text_block(_redact_sensitive_text(user_input)),
-            "",
-            "### Assistant",
-            "",
-            _markdown_text_block(_redact_sensitive_text(answer))
-            if answer
-            else "_No assistant content recorded._\n",
-            "",
-        ]
-    )
-    return "\n".join(lines)
-
-
-def _analysis_tool_count(result: Dict[str, Any]) -> int:
-    trace = result.get("react_trace") or []
-    if not isinstance(trace, list):
-        return 0
-    return sum(
-        1
-        for entry in trace
-        if isinstance(entry, dict) and entry.get("type") == "tool_result"
-    )
-
-
-def _markdown_text_block(text: str) -> str:
-    fence = "```"
-    while fence in text:
-        fence += "`"
-    return f"{fence}text\n{text.rstrip()}\n{fence}\n"
-
-
-def _redact_sensitive_text(text: str) -> str:
-    redacted = _SECRET_VALUE_RE.sub(r"\1\2[REDACTED]", text)
-    return _OPENAI_KEY_RE.sub("[REDACTED]", redacted)
-
-
 def _run_one_turn(user_input: str, ctx: InteractiveContext) -> None:
     """Execute a single agent turn with the Rich dashboard.
 
@@ -825,7 +707,10 @@ def _run_one_turn(user_input: str, ctx: InteractiveContext) -> None:
     console = get_console()
 
     if ctx.session_id is None:
-        ctx.session_id = _new_session(user_input)
+        # Fall back to an unpersisted id: a session-store failure must not strip
+        # the turn of its session, which would fail every research-goal call
+        # with ``session_id is required`` (#885).
+        ctx.session_id = _new_session(user_input) or uuid.uuid4().hex[:12]
     _append_message(ctx.session_id or "", "user", user_input)
 
     start = time.perf_counter()
@@ -875,16 +760,18 @@ def _run_one_turn(user_input: str, ctx: InteractiveContext) -> None:
     # numbered choice block isn't clobbered by the live region, and arm the
     # REPL to intercept the next reply (SPEC.md Consent §2).
     if captured_proposal:
-        ctx.pending_proposal = dict(captured_proposal)
-        _render_mandate_proposal(console, ctx.pending_proposal)
+        if captured_proposal.get("type") == "scheduled_research.proposal":
+            ctx.pending_scheduled_proposal = dict(captured_proposal)
+            _render_scheduled_proposal(console, ctx.pending_scheduled_proposal)
+        else:
+            ctx.pending_proposal = dict(captured_proposal)
+            _render_mandate_proposal(console, ctx.pending_proposal)
 
     ctx.history.append({"role": "user", "content": user_input})
     answer = (result.get("content") or "").strip()
     if answer:
         ctx.history.append({"role": "assistant", "content": answer})
         _append_message(ctx.session_id or "", "assistant", answer)
-
-    _append_turn_analysis_document(ctx.session_id or "", user_input, result, elapsed)
 
     if ctx.debug:
         _print_debug_summary(console, result, elapsed, ctx)
@@ -894,15 +781,46 @@ def _print_interactive_result(console: Any, result: Dict[str, Any], elapsed: flo
     """Print the assistant answer after the rail without boxed run panels."""
 
     from cli.ui.transcript import render_answer, render_elapsed_status
+    from cli._legacy import _read_metric_values
 
     content = (result.get("content") or "").strip()
     if content:
         console.print(render_answer(content))
         console.print()
-    console.print(render_elapsed_status(elapsed))
     run_id = result.get("run_id")
-    if run_id:
+    run_dir = result.get("run_dir")
+    metrics = (
+        _read_metric_values(Path(run_dir) / "artifacts" / "metrics.csv") if run_dir else {}
+    )
+    if run_id and metrics:
+        console.print("[bold green]✓ Backtest complete[/bold green]")
+        metric_rows = (
+            ("Total return", "total_return", True),
+            ("Annual return", "annual_return", True),
+            ("Sharpe", "sharpe", False),
+            ("Max drawdown", "max_drawdown", True),
+            ("Win rate", "win_rate", True),
+            ("Trades", "trade_count", False),
+        )
+        for label, key, as_percent in metric_rows:
+            value = metrics.get(key)
+            if value is None:
+                continue
+            rendered = f"{value * 100:.1f}%" if as_percent else (
+                f"{int(value)}" if key == "trade_count" else f"{value:.2f}"
+            )
+            console.print(f"  {label:<14} [bold]{rendered}[/bold]")
+        console.print()
+        console.print(f"[bold]Run ID:[/bold] [cyan]{run_id}[/cyan]")
+        # Name the dashboard without starting a server: this is a print path, and
+        # a process spawned here would outlive the command that created it.
+        console.print(
+            f"[dim]Dashboard: run `vibe-trading serve`, then open "
+            f"/runs/{run_id}?view=dashboard[/dim]"
+        )
+    elif run_id:
         console.print(f"[dim]/show {run_id} · {elapsed:.1f}s[/dim]")
+    console.print(render_elapsed_status(elapsed))
 
 
 def _print_recap_if_needed(console: Any, ctx: InteractiveContext) -> None:
@@ -1044,8 +962,20 @@ def _run_connector_command_from_repl(console: Any, args: list[str]) -> None:
         _dispatch_connector(parsed)
     except Exception as exc:  # noqa: BLE001 — never let a connector command kill the loop
         console.print(f"[bold red]/connector failed:[/bold red] {exc}")
-
-
+# QVERIS-INTEGRATION
+def _run_data_command_from_repl(console: Any, args: list[str]) -> None:  # QVERIS-INTEGRATION
+    """Run a ``/data ...`` subcommand from the REPL via the CLI dispatcher."""  # QVERIS-INTEGRATION
+    from cli._legacy import _build_parser, _dispatch_data  # QVERIS-INTEGRATION
+    argv = ["data", *(args or ["status"])]  # QVERIS-INTEGRATION
+    try:  # QVERIS-INTEGRATION
+        parsed = _build_parser().parse_args(argv)  # QVERIS-INTEGRATION
+    except SystemExit:  # QVERIS-INTEGRATION
+        console.print("[dim]Usage: /data [status|mode free|mode paid|usage][/dim]")  # QVERIS-INTEGRATION
+        return  # QVERIS-INTEGRATION
+    try:  # QVERIS-INTEGRATION
+        _dispatch_data(parsed)  # QVERIS-INTEGRATION
+    except Exception as exc:  # noqa: BLE001  # QVERIS-INTEGRATION
+        console.print(f"[bold red]/data failed:[/bold red] {exc}")  # QVERIS-INTEGRATION
 def _is_numeric_pick(text: str) -> Optional[int]:
     """Return the chosen ordinal if ``text`` is a bare numeric pick, else None.
 
@@ -1095,6 +1025,7 @@ def _render_mandate_proposal(console: Any, proposal: Dict[str, Any]) -> None:
         )
     console.print()
 
+
     for profile in profiles:
         ordinal = profile.get("ordinal", "?")
         label = profile.get("label", "")
@@ -1132,6 +1063,69 @@ def _render_mandate_proposal(console: Any, proposal: Dict[str, Any]) -> None:
     console.print()
 
 
+def _render_scheduled_proposal(console: Any, proposal: Dict[str, Any]) -> None:
+    """Render the deterministic y/N confirmation block for a scheduled job."""
+    job = proposal.get("job") or {}
+    schedule = job.get("schedule") or {}
+    delivery = job.get("delivery") or {}
+    operation = proposal.get("operation")
+    verb = "创建" if operation == "create" else "取消"
+    channel_suffix = f" ({delivery.get('channel')})" if delivery.get("channel") else ""
+    console.print()
+    console.print(f"[bold orange1]定时研究确认 · {verb}[/bold orange1]")
+    console.print(f"  任务: {job.get('title') or job.get('id') or '?'}")
+    if operation == "create":
+        console.print(
+            f"  节奏: {schedule.get('expression')} · "
+            f"{schedule.get('timezone') or 'UTC'} · 截止 {schedule.get('end_at') or '无'}"
+        )
+        console.print(
+            f"  投递: {delivery.get('target_label') or '仅应用内'}{channel_suffix}"
+        )
+    console.print("[bold]确认执行？ [y/N][/bold]")
+
+
+def _handle_scheduled_proposal_reply(text: str, ctx: InteractiveContext) -> bool:
+    """Commit/discard an outstanding scheduled proposal before the model."""
+    token = text.strip().lower()
+    if token not in {"y", "yes", "确认", "n", "no", "取消", "放弃"}:
+        return False
+    proposal = ctx.pending_scheduled_proposal or {}
+    proposal_id = str(proposal.get("proposal_id") or "")
+    console = get_console()
+    try:
+        import httpx
+
+        from src.config.accessor import get_env_config, reset_env_config
+
+        reset_env_config()
+        api_config = get_env_config().api
+        base = api_config.vibe_trading_api_url.rstrip("/")
+        key = api_config.api_auth_key.strip()
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        endpoint = "commit" if token in {"y", "yes", "确认"} else "discard"
+        response = httpx.post(
+            f"{base}/scheduled-runs/proposals/{proposal_id}/{endpoint}",
+            headers=headers,
+            timeout=15.0,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if token in {"y", "yes", "确认"}:
+            action = "创建" if proposal.get("operation") == "create" else "取消"
+            console.print(
+                f"[green]定时研究任务已{action}:[/green] "
+                f"{result.get('committed_job_id') or '?'}"
+            )
+        else:
+            console.print("[dim]已放弃这次定时研究变更。[/dim]")
+    except Exception as exc:  # noqa: BLE001 - keep proposal open for retry
+        console.print(f"[red]定时研究确认失败:[/red] {exc}")
+        return True
+    ctx.pending_scheduled_proposal = None
+    return True
+
+
 def _commit_mandate(proposal: Dict[str, Any], selected_ordinal: int) -> Dict[str, Any]:
     """Commit a mandate selection via the surface commit endpoint.
 
@@ -1155,16 +1149,34 @@ def _commit_mandate(proposal: Dict[str, Any], selected_ordinal: int) -> Dict[str
     """
     import httpx
 
-    base = os.environ.get("VIBE_TRADING_API_URL", "http://127.0.0.1:8000").rstrip("/")
-    body = {
-        "proposal_id": proposal.get("proposal_id"),
-        "selected_ordinal": selected_ordinal,
-        "adjustments": None,
-        "session_id": proposal.get("session_id"),
-        "consent_ack": True,
-    }
+    from src.api.live_routes import CommitMandateRequest
+    from src.config.accessor import get_env_config, reset_env_config
+
+    reset_env_config()
+    api_config = get_env_config().api
+    base = api_config.vibe_trading_api_url.rstrip("/")
+    key = api_config.api_auth_key.strip()
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
     try:
-        response = httpx.post(f"{base}/mandate/commit", json=body, timeout=30.0)
+        account = proposal.get("account") or {}
+        body = CommitMandateRequest.model_validate(
+            {
+                "broker": account.get("broker"),
+                "proposal_id": proposal.get("proposal_id"),
+                "selected_ordinal": selected_ordinal,
+                "adjustments": None,
+                "session_id": proposal.get("session_id"),
+                "account_ref": account.get("account_ref", ""),
+                "consent_ack": True,
+            }
+        ).model_dump(mode="json")
+
+        response = httpx.post(
+            f"{base}/mandate/commit",
+            json=body,
+            headers=headers,
+            timeout=30.0,
+        )
         response.raise_for_status()
         return response.json()
     except Exception as exc:  # noqa: BLE001 — surface a clean error to the user
@@ -1238,6 +1250,7 @@ def _interactive_loop(max_iter: int, resume_session_id: Optional[str] = None) ->
     # the prompt appear only after the user presses Enter.
 
     ctx = InteractiveContext(max_iter=max_iter)
+    pending_input: Optional[str] = None
 
     if resume_session_id:
         # Resume a specific session by ID (``vibe-trading resume <session-id>``).
@@ -1259,11 +1272,14 @@ def _interactive_loop(max_iter: int, resume_session_id: Optional[str] = None) ->
         # Offer to resume the most recent session. Audit item 8.
         resume = _maybe_resume_last_session(console)
         if resume is not None:
-            ctx.session_id = resume["session_id"]
-            ctx.history = list(resume["history"])
-            console.print(
-                f"[dim]Resumed session: {resume['title']} ({len(ctx.history)} prior turns)[/dim]"
-            )
+            if "pending_input" in resume:
+                pending_input = str(resume["pending_input"])
+            else:
+                ctx.session_id = resume["session_id"]
+                ctx.history = list(resume["history"])
+                console.print(
+                    f"[dim]Resumed session: {resume['title']} ({len(ctx.history)} prior turns)[/dim]"
+                )
 
     # Build the prompt session once so history + completer persist.
     try:
@@ -1282,27 +1298,31 @@ def _interactive_loop(max_iter: int, resume_session_id: Optional[str] = None) ->
     session = make_session()
 
     while True:
-        _print_recap_if_needed(console, ctx)
-        try:
-            user_input = get_user_input(session=session)
-        except KeyboardInterrupt:
-            # Should not reach here — the keybinding raises EOFError instead.
-            continue
-        except EOFError:
-            # Two interpretations: Ctrl+D (always exit), or Ctrl+C on an
-            # empty line (show hint, exit on second press).
-            #
-            # ``ctrl_c_within_window`` reads a press-time decision cached
-            # by the keybinding: True iff the gap between the *previous*
-            # Ctrl+C press and *this* one is < 2 s. First press → False
-            # (no prior press) → we print the hint and continue. Second
-            # press inside the window → True → we break.
-            if ctrl_c_within_window(session, window_sec=2.0):
-                break
-            console.print(
-                "[dim]Press Ctrl+C again within 2s, Ctrl+D, or type /quit to exit[/dim]"
-            )
-            continue
+        if pending_input is not None:
+            user_input = pending_input
+            pending_input = None
+        else:
+            _print_recap_if_needed(console, ctx)
+            try:
+                user_input = get_user_input(session=session)
+            except KeyboardInterrupt:
+                # Should not reach here — the keybinding raises EOFError instead.
+                continue
+            except EOFError:
+                # Two interpretations: Ctrl+D (always exit), or Ctrl+C on an
+                # empty line (show hint, exit on second press).
+                #
+                # ``ctrl_c_within_window`` reads a press-time decision cached
+                # by the keybinding: True iff the gap between the *previous*
+                # Ctrl+C press and *this* one is < 2 s. First press → False
+                # (no prior press) → we print the hint and continue. Second
+                # press inside the window → True → we break.
+                if ctrl_c_within_window(session, window_sec=2.0):
+                    break
+                console.print(
+                    "[dim]Press Ctrl+C again within 2s, Ctrl+D, or type /quit to exit[/dim]"
+                )
+                continue
 
         text = user_input.strip()
         if not text:
@@ -1315,6 +1335,13 @@ def _interactive_loop(max_iter: int, resume_session_id: Optional[str] = None) ->
             _trip_halt_from_repl(console, reason=f"repl turn: {text}")
             ctx.pending_proposal = None
             continue
+
+        # Scheduled research confirmation is a surface commit. Exact y/N
+        # replies are intercepted before the model; any other text remains a
+        # normal conversational adjustment request.
+        if ctx.pending_scheduled_proposal is not None and not text.startswith("/"):
+            if _handle_scheduled_proposal_reply(text, ctx):
+                continue
 
         # Mandate pick — when a proposal is outstanding, a bare numeric reply
         # is a COMMIT handled here (the model never sees it). An adjust reply
@@ -1340,6 +1367,9 @@ def _interactive_loop(max_iter: int, resume_session_id: Optional[str] = None) ->
             if slash_name == "connector":
                 _run_connector_command_from_repl(console, slash_tokens[1:])
                 continue
+            if slash_name == "data":  # QVERIS-INTEGRATION
+                _run_data_command_from_repl(console, slash_tokens[1:])  # QVERIS-INTEGRATION
+                continue  # QVERIS-INTEGRATION
             rc = _dispatch_slash(text, ctx)
             if rc == 2:
                 break
@@ -1388,6 +1418,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         Process exit code.
     """
     raw_argv = list(sys.argv[1:] if argv is None else argv)
+
+    # One-time move of pre-#904 code-relative state into the runtime root.
+    # A failed migration must never block the CLI.
+    try:
+        from src.config import migrate as _migrate
+
+        _migrate.migrate_legacy_state()
+    except Exception:  # pragma: no cover — best-effort
+        logging.getLogger(__name__).warning(
+            "Legacy state migration failed", exc_info=True
+        )
+
     interactive = _is_interactive_invocation(raw_argv)
 
     if interactive:

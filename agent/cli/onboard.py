@@ -57,15 +57,49 @@ PROVIDERS: Final[tuple[Provider, ...]] = (
              "https://openrouter.ai/api/v1", "sk-or-",
              ("deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash",
               "openai/gpt-5.5-pro", "google/gemini-3.5-flash")),
+    Provider("requesty", "Requesty", "OpenAI-compatible gateway — 600+ models, one key",
+             "openai/gpt-4o-mini",
+             "REQUESTY_API_KEY", "REQUESTY_BASE_URL",
+             "https://router.requesty.ai/v1", None,
+             ("openai/gpt-4o-mini", "openai/gpt-4o",
+              "anthropic/claude-sonnet-4-5", "deepseek/deepseek-chat")),
     Provider("openai", "OpenAI", "GPT-5.5 direct",
              "gpt-5.5", "OPENAI_API_KEY", "OPENAI_BASE_URL",
              "https://api.openai.com/v1", "sk-",
              ("gpt-5.5", "gpt-5.5-pro", "gpt-5.5-instant")),
+    Provider("anthropic", "Anthropic", "Anthropic Messages API or compatible proxy",
+             "claude-sonnet-4-6", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL",
+             "https://api.anthropic.com", None,
+             ("claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5")),
+    Provider("openai-codex", "OpenAI Codex", "ChatGPT OAuth for Codex",
+             "openai-codex/gpt-5.4", None, "OPENAI_CODEX_BASE_URL",
+             "https://chatgpt.com/backend-api/codex/responses", None,
+             ("openai-codex/gpt-5.4", "openai-codex/gpt-5.4-mini")),
     Provider("deepseek", "DeepSeek",
              "cheapest tier — good for batch backtest research",
              "deepseek-v4-pro", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL",
              "https://api.deepseek.com/v1", "sk-",
              ("deepseek-v4-pro", "deepseek-v4-flash")),
+    Provider("siliconflow-cn", "SiliconFlow (CN)", "OpenAI-compatible MaaS endpoint in China",
+             "deepseek-ai/DeepSeek-V3.1-Terminus",
+             "SILICONFLOW_API_KEY", "SILICONFLOW_BASE_URL",
+             "https://api.siliconflow.cn/v1", "sk-",
+             ("deepseek-ai/DeepSeek-V3.1-Terminus",)),
+    Provider("siliconflow-global", "SiliconFlow (Global)", "OpenAI-compatible global MaaS endpoint",
+             "deepseek-ai/DeepSeek-V3.1-Terminus",
+             "SILICONFLOW_GLOBAL_API_KEY", "SILICONFLOW_GLOBAL_BASE_URL",
+             "https://api.siliconflow.com/v1", "sk-",
+             ("deepseek-ai/DeepSeek-V3.1-Terminus",)),
+    Provider("modelscope", "ModelScope", "Alibaba's OpenAI-compatible MaaS platform",
+             "Qwen/Qwen3.5-27B",
+             "MODELSCOPE_API_KEY", "MODELSCOPE_BASE_URL",
+             "https://api-inference.modelscope.cn/v1", None,
+             ("Qwen/Qwen3.5-27B", "Qwen/Qwen3.5-397B-A17B", "Qwen/Qwen3-235B-A22B")),
+    Provider("nvidia", "NVIDIA NIM", "hosted NVIDIA API catalog",
+             "nvidia/nemotron-3-ultra-550b-a55b",
+             "NVIDIA_API_KEY", "NVIDIA_BASE_URL",
+             "https://integrate.api.nvidia.com/v1", "nvapi-",
+             ("nvidia/nemotron-3-ultra-550b-a55b",)),
     Provider("ollama", "Ollama", "local, free, no API key",
              "qwen2.5:32b", None, "OLLAMA_BASE_URL",
              "http://localhost:11434", None,
@@ -95,14 +129,27 @@ def _render_env(values: dict[str, str]) -> str:
 
 
 def _save_partial(values: dict[str, str]) -> None:
-    """Best-effort write to ``.env.partial`` (crash-resilience nicety)."""
+    """Best-effort atomic write to ``.env.partial`` (crash-resilience nicety).
+
+    Mirrors :func:`_finalize`: ``mkstemp`` creates the temp file 0600-only, so
+    the mode is never applied to an already-visible file, and ``replace`` swaps
+    it in atomically. Writing to the destination directly would defeat the whole
+    point of the file — unlinking it first, or truncating it on open, throws away
+    the recovery state this function exists to preserve if the very next write
+    fails.
+    """
     try:
         _env_dir().mkdir(parents=True, exist_ok=True)
-        _partial_path().write_text(_render_env(values), encoding="utf-8")
+        fd, tmp_name = tempfile.mkstemp(prefix=".env.partial.", dir=str(_env_dir()))
         try:
-            _partial_path().chmod(0o600)
-        except OSError:
-            pass
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(_render_env(values))
+            Path(tmp_name).replace(_partial_path())
+        finally:
+            try:
+                Path(tmp_name).unlink()
+            except (FileNotFoundError, OSError):
+                pass
     except OSError:
         pass
 
@@ -411,8 +458,18 @@ def run_onboarding(*, console: Console | None = None) -> Path | None:
         provider: Provider = state["provider"]  # type: ignore[assignment]
         if provider.key_env is None:
             cons.print()
-            cons.print(Text("  Ollama runs locally — no API key needed.",
-                             style=Theme.success))
+            if provider.key == "openai-codex":
+                cons.print(Text(
+                    "  OpenAI Codex uses ChatGPT OAuth — no API key needed here.",
+                    style=Theme.success,
+                ))
+                cons.print(Text(
+                    "  After setup, run: vibe-trading provider login openai-codex",
+                    style=Theme.muted,
+                ))
+            else:
+                cons.print(Text("  Ollama runs locally — no API key needed.",
+                                 style=Theme.success))
             return "ok"
         while True:
             key = _prompt_secret(

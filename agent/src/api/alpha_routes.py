@@ -101,12 +101,15 @@ _ALPHA_ID_RE = re.compile(r"^[a-z][a-z0-9]+_[a-z0-9_]{1,64}$")
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # Filter enums — keep in sync with src.factors.registry.Theme / Universe.
-_VALID_ZOOS = {"alpha101", "gtja191", "qlib158", "academic"}
+_VALID_ZOOS = {"alpha101", "gtja191", "qlib158", "academic", "fundamental"}
 _VALID_THEMES = {
     "momentum", "reversal", "volume", "volatility", "quality", "value",
     "liquidity", "microstructure", "sentiment", "growth", "leverage",
 }
-_VALID_UNIVERSES = {"equity_us", "equity_cn", "equity_hk", "crypto", "futures"}
+_VALID_UNIVERSES = {
+    "equity_us", "equity_cn", "equity_hk", "equity_in", "equity_kr",
+    "crypto", "futures",
+}
 # Ranking metrics for /alpha/compare — keep in sync with
 # ``src.factors.compare_runner.SORT_KEYS`` (kept local to avoid a heavy import).
 _VALID_SORTS = {"ir", "ic_mean", "ic_positive_ratio", "ic_count"}

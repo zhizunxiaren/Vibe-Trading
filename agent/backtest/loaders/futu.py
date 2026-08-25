@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -21,10 +20,18 @@ logger = logging.getLogger(__name__)
 _OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
 
 _INTERVAL_MAP: dict[str, str] = {
+    "1m": "K_1M",
+    "5m": "K_5M",
+    "15m": "K_15M",
+    "30m": "K_30M",
     "1D": "K_DAY",
+    "1d": "K_DAY",
     "1H": "K_60M",
+    "1h": "K_60M",
     "4H": "K_240M",
+    "4h": "K_240M",
     "1W": "K_WEEK",
+    "1w": "K_WEEK",
     "1M": "K_MON",
 }
 
@@ -52,10 +59,24 @@ def _to_futu_ktype(interval: str):
     """Map project interval string to a futu KLType enum value.
 
     Lazy-imports futu so the module can be imported without futu installed.
-    Unknown intervals fall back to K_DAY.
+    Unsupported intervals fail explicitly so requested bar fidelity is never
+    changed silently.
     """
     from futu import KLType  # noqa: PLC0415
-    return getattr(KLType, _INTERVAL_MAP.get(interval.strip(), "K_DAY"))
+
+    token = interval.strip()
+    attr = _INTERVAL_MAP.get(token)
+    if attr is None:
+        raise NoAvailableSourceError(
+            f"unsupported Futu interval: {interval!r}; "
+            f"supported intervals: {sorted(_INTERVAL_MAP)}"
+        )
+    try:
+        return getattr(KLType, attr)
+    except AttributeError as exc:
+        raise NoAvailableSourceError(
+            f"installed Futu SDK does not expose KLType.{attr}"
+        ) from exc
 
 
 def _normalize_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -78,7 +99,8 @@ def _normalize_frame(df: pd.DataFrame) -> pd.DataFrame:
     result = result.apply(pd.to_numeric, errors="coerce")
     result["volume"] = result["volume"].fillna(0.0)
     result = result.dropna(subset=["open", "high", "low", "close"])
-    return result.sort_index()
+    result = result.sort_index()
+    return result[~result.index.duplicated(keep="last")]
 
 
 @register
@@ -94,12 +116,18 @@ class FutuLoader:
     requires_auth = True
 
     def __init__(self) -> None:
-        self._host = os.environ.get("FUTU_HOST", "127.0.0.1")
-        self._port = int(os.environ.get("FUTU_PORT", "11111"))
+        from src.config.accessor import get_env_config
+
+        cfg = get_env_config().data
+        self._host = cfg.futu_host
+        self._port = cfg.futu_port
 
     def is_available(self) -> bool:
-        """Return True if env vars are set and FutuOpenD is reachable."""
-        if not os.environ.get("FUTU_HOST") or not os.environ.get("FUTU_PORT"):
+        """Return True if FutuOpenD is reachable."""
+        from src.config.accessor import get_env_config
+
+        cfg = get_env_config().data
+        if not cfg.futu_host or not cfg.futu_port:
             return False
         try:
             import futu  # noqa: PLC0415
@@ -124,7 +152,7 @@ class FutuLoader:
             codes: Project symbols such as ``700.HK`` or ``000001.SZ``.
             start_date: Start date in ``YYYY-MM-DD`` format.
             end_date: End date in ``YYYY-MM-DD`` format.
-            interval: Backtest interval — ``1D``, ``1H``, or ``4H``.
+            interval: Backtest interval supported by :data:`_INTERVAL_MAP`.
             fields: Ignored; included for interface compatibility.
 
         Returns:
@@ -137,6 +165,11 @@ class FutuLoader:
         if not codes:
             return {}
         validate_date_range(start_date, end_date)
+        if interval.strip() not in _INTERVAL_MAP:
+            raise NoAvailableSourceError(
+                f"unsupported Futu interval: {interval!r}; "
+                f"supported intervals: {sorted(_INTERVAL_MAP)}"
+            )
 
         results: Dict[str, pd.DataFrame] = {}
 
@@ -153,7 +186,7 @@ class FutuLoader:
                 end_date=end_date,
                 fields=None,
             )
-            if cached is not None:
+            if cached is not None and not cached.empty:
                 results[code] = cached.copy()
             else:
                 pending.append(code)
@@ -163,6 +196,7 @@ class FutuLoader:
 
         try:
             import futu  # noqa: PLC0415
+
             ktype = _to_futu_ktype(interval)
             ctx = futu.OpenQuoteContext(host=self._host, port=self._port)
         except Exception as exc:
@@ -173,17 +207,35 @@ class FutuLoader:
         try:
             for code in pending:
                 futu_code = _to_futu_symbol(code)
-                ret, data = ctx.request_history_kline(
-                    futu_code,
-                    start=start_date,
-                    end=end_date,
-                    ktype=ktype,
-                    max_count=10_000,
-                )
-                if ret != futu.RET_OK:
-                    logger.warning("Futu returned error for %s: %s", futu_code, data)
+                page_key = None
+                pages: List[pd.DataFrame] = []
+                failed = False
+                while True:
+                    ret, data, next_page_key = ctx.request_history_kline(
+                        futu_code,
+                        start=start_date,
+                        end=end_date,
+                        ktype=ktype,
+                        max_count=10_000,
+                        page_req_key=page_key,
+                    )
+                    if ret != futu.RET_OK:
+                        logger.warning(
+                            "Futu returned error for %s: %s", futu_code, data
+                        )
+                        failed = True
+                        break
+                    if isinstance(data, pd.DataFrame) and not data.empty:
+                        pages.append(data)
+                    if not next_page_key:
+                        break
+                    page_key = next_page_key
+
+                if failed or not pages:
                     continue
-                normalized = _normalize_frame(data)
+                normalized = _normalize_frame(pd.concat(pages, ignore_index=True))
+                if normalized.empty:
+                    continue
                 loader_cache_put(
                     source=self.name,
                     symbol=code,

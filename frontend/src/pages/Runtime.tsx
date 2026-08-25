@@ -85,14 +85,14 @@ export function Runtime() {
   return (
     <div className="min-h-screen p-6 lg:p-8">
       <div className="mx-auto flex w-full max-w-6xl flex-col gap-6">
-        <section className="flex flex-col gap-4 border-b pb-6 lg:flex-row lg:items-end lg:justify-between">
+        <section className="flex flex-col gap-4 border-b border-border/60 pb-6 lg:flex-row lg:items-end lg:justify-between">
           <div className="space-y-3">
-            <div className="inline-flex items-center gap-2 rounded-md border px-2.5 py-1 text-xs font-medium text-muted-foreground">
+            <div className="inline-flex items-center gap-2 rounded-md border border-border/60 px-2.5 py-1 text-xs font-medium text-muted-foreground">
               <Activity className="h-3.5 w-3.5" />
               {t("runtime.monitorBadge")}
             </div>
             <div>
-              <h1 className="text-3xl font-bold tracking-tight">{t("runtime.title")}</h1>
+              <h1 className="text-2xl font-semibold tracking-tight">{t("runtime.title")}</h1>
               <p className="mt-2 max-w-2xl text-sm text-muted-foreground">
                 {t("runtime.subtitlePre")} <span className="font-mono">/live/status</span>
                 {t("runtime.subtitlePost")}
@@ -103,7 +103,7 @@ export function Runtime() {
             type="button"
             onClick={() => loadStatus("refresh")}
             disabled={refreshing}
-            className="inline-flex items-center gap-2 rounded-md border px-4 py-2 text-sm font-medium transition hover:bg-muted disabled:opacity-50"
+            className="inline-flex items-center gap-2 rounded-md border border-border/60 px-4 py-2 text-sm font-medium transition hover:bg-muted/60 disabled:opacity-50"
           >
             {refreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
             {t("runtime.refresh")}
@@ -113,14 +113,14 @@ export function Runtime() {
         {loading ? (
           <div className="grid gap-3 md:grid-cols-4">
             {[1, 2, 3, 4].map((item) => (
-              <div key={item} className="h-24 animate-pulse rounded-md border bg-muted/40" />
+              <div key={item} className="h-24 animate-pulse rounded-xl border border-border/60 bg-card shadow-sm" />
             ))}
           </div>
         ) : null}
 
         {!loading && error ? (
-          <section className="rounded-md border border-amber-500/30 bg-amber-500/5 p-5">
-            <div className="flex items-center gap-2 font-medium text-amber-700 dark:text-amber-300">
+          <section className="rounded-xl border border-warning/30 bg-warning/5 p-5 shadow-sm">
+            <div className="flex items-center gap-2 font-medium text-warning">
               <AlertTriangle className="h-5 w-5" />
               {t("runtime.unavailableTitle")}
             </div>
@@ -154,15 +154,22 @@ export function Runtime() {
             </section>
 
             {status.brokers.length === 0 ? (
-              <section className="rounded-md border border-dashed p-8 text-center">
+              <section className="rounded-xl border border-dashed border-border/60 bg-card p-5 text-center shadow-sm">
                 <ShieldOff className="mx-auto h-8 w-8 text-muted-foreground" />
-                <h2 className="mt-3 font-medium">{t("runtime.noProfilesTitle")}</h2>
+                <h2 className="mt-3 text-sm font-semibold">{t("runtime.noProfilesTitle")}</h2>
                 <p className="mt-1 text-sm text-muted-foreground">{t("runtime.noProfilesBody")}</p>
               </section>
             ) : (
               <section className="grid gap-4">
                 {status.brokers.map((broker) => (
-                  <BrokerRuntimeCard key={broker.auth.broker} broker={broker} globalHalted={status.global_halted} t={t} nowMs={nowMs} />
+                  <BrokerRuntimeCard
+                    key={broker.auth.profile_id || broker.auth.broker}
+                    broker={broker}
+                    globalHalted={status.global_halted}
+                    t={t}
+                    nowMs={nowMs}
+                    onRefresh={() => loadStatus("refresh")}
+                  />
                 ))}
               </section>
             )}
@@ -190,9 +197,9 @@ function isCurrentStatusRequest(
 
 function SummaryTile({ label, value, tone, icon: Icon }: SummaryTileProps) {
   return (
-    <div className="rounded-md border p-4">
+    <div className="rounded-xl border border-border/60 bg-card p-4 shadow-sm">
       <div className="flex items-center justify-between gap-3">
-        <span className="text-xs font-medium uppercase text-muted-foreground">{label}</span>
+        <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{label}</span>
         <Icon
           className={cn(
             "h-4 w-4",
@@ -220,11 +227,13 @@ function BrokerRuntimeCard({
   globalHalted,
   t,
   nowMs,
+  onRefresh,
 }: {
   broker: LiveBrokerStatus;
   globalHalted: boolean;
   t: TFunction;
   nowMs: number;
+  onRefresh: () => Promise<void>;
 }) {
   const brokerKey = broker.auth.broker;
   const runnerAlive = broker.runner?.alive ?? false;
@@ -233,12 +242,16 @@ function BrokerRuntimeCard({
   const risk = deriveRiskState(broker, globalHalted, t);
   const mandateCountdown = formatCountdown(mandate?.expires_at, t, nowMs);
 
+  if (broker.auth.transport === "broker_sdk") {
+    return <SdkBrokerRuntimeCard broker={broker} t={t} onRefresh={onRefresh} />;
+  }
+
   return (
-    <article className="rounded-md border p-4">
+    <article className="rounded-xl border border-border/60 bg-card p-4 shadow-sm">
       <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
         <div>
           <div className="flex flex-wrap items-center gap-2">
-            <h2 className="font-semibold capitalize">{brokerKey}</h2>
+            <h2 className="text-sm font-semibold capitalize">{brokerKey}</h2>
             <StatusPill
               label={broker.auth.oauth_token_present ? t("runtime.authPresent") : t("runtime.authMissing")}
               tone={broker.auth.oauth_token_present ? "success" : "neutral"}
@@ -283,10 +296,192 @@ function BrokerRuntimeCard({
   );
 }
 
+function SdkBrokerRuntimeCard({ broker, t, onRefresh }: { broker: LiveBrokerStatus; t: TFunction; onRefresh: () => Promise<void> }) {
+  const auth = broker.auth;
+  const [verifying, setVerifying] = useState(false);
+  const [verifyError, setVerifyError] = useState<string | null>(null);
+  const profileId = auth.profile_id || `${auth.broker}-live-sdk-readonly`;
+  const state = connectorState(auth, t);
+
+  const verify = useCallback(async () => {
+    if (verifying) return;
+    setVerifying(true);
+    setVerifyError(null);
+    try {
+      await api.verifyConnector(profileId);
+      await onRefresh();
+    } catch {
+      setVerifyError(t("runtime.connectorVerifyFailed"));
+    } finally {
+      setVerifying(false);
+    }
+  }, [onRefresh, profileId, t, verifying]);
+
+  return (
+    <article className="rounded-xl border border-border/60 bg-card p-4 shadow-sm">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="text-sm font-semibold capitalize">{auth.broker}</h2>
+            <StatusPill label={state.label} tone={state.tone} />
+          </div>
+          {isReadOnlyCompatible(auth) ? (
+            <p className="mt-2 text-sm text-muted-foreground">{t("runtime.sdkConnectorProfile")}</p>
+          ) : null}
+        </div>
+        {state.action ? (
+          <button
+            type="button"
+            onClick={verify}
+            disabled={verifying}
+            className="inline-flex items-center gap-2 rounded-md border border-border/60 px-4 py-2 text-sm font-medium transition hover:bg-muted/60 disabled:opacity-50"
+          >
+            {verifying ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+            {t(state.action)}
+          </button>
+        ) : null}
+      </div>
+
+      {state.kind === "not_configured" ? (
+        <ConnectorMissingSetup broker={auth.broker} t={t} />
+      ) : (
+        <div className="mt-4 grid gap-3 md:grid-cols-3">
+          <RuntimePanel title={t("runtime.connectionDetails")} icon={state.kind === "connected" ? Wifi : WifiOff}>
+            <KeyValue label={t("runtime.credentialSource")} value={auth.credential_source || t("runtime.unknown")} />
+            <KeyValue label={t("runtime.sdk")} value={formatSdkState(auth.sdk_installed, t)} />
+          </RuntimePanel>
+          <RuntimePanel title={t("runtime.environment")} icon={ShieldCheck}>
+            <KeyValue label={t("runtime.environmentIdentity")} value={formatEnvironmentIdentity(auth.environment_identity, t)} />
+            <KeyValue label={t("runtime.capabilities")} value={formatCapabilities(auth, t)} />
+          </RuntimePanel>
+          <RuntimePanel title={t("runtime.diagnostics")} icon={state.kind === "error" ? AlertTriangle : CheckCircle2}>
+            <KeyValue label={t("runtime.lastChecked")} value={auth.last_checked_at || t("runtime.never")} />
+            {auth.error_code ? <KeyValue label={t("runtime.errorCode")} value={auth.error_code} /> : null}
+            {state.kind === "error" ? <p className="text-sm text-muted-foreground">{connectorDiagnostic(auth.error_code, t)}</p> : null}
+          </RuntimePanel>
+        </div>
+      )}
+      {verifyError ? <p role="alert" className="mt-3 text-sm text-danger">{verifyError}</p> : null}
+    </article>
+  );
+}
+
+function connectorState(auth: LiveBrokerStatus["auth"], t: TFunction): {
+  kind: "not_configured" | "ready" | "connected" | "error" | "unknown";
+  label: string;
+  tone: "success" | "danger" | "warning" | "neutral";
+  action?: "runtime.verifyConnection" | "runtime.retry";
+} {
+  if (auth.connection_state === "connected") {
+    if (isReadOnlyCompatible(auth)) {
+      return { kind: "connected", label: t("runtime.connectedReadOnly"), tone: "success" };
+    }
+    return { kind: "connected", label: t("runtime.connectedAccessUnknown"), tone: "neutral" };
+  }
+  if (auth.connection_state === "not_configured" || auth.configured === false) {
+    return { kind: "not_configured", label: t("runtime.notConfigured"), tone: "neutral" };
+  }
+  if (auth.connection_state === "error") {
+    return { kind: "error", label: t("runtime.connectionFailed"), tone: "danger", action: "runtime.retry" };
+  }
+  if (auth.connection_state === "ready") {
+    return { kind: "ready", label: t("runtime.readyToVerify"), tone: "warning", action: "runtime.verifyConnection" };
+  }
+  return { kind: "unknown", label: t("runtime.connectorStatusUnavailable"), tone: "neutral" };
+}
+
+function connectorDiagnostic(errorCode: string | null | undefined, t: TFunction): string {
+  switch (errorCode) {
+    case "credentials_partial": return t("runtime.diagnosticCredentialsPartial");
+    case "credentials_conflict": return t("runtime.diagnosticCredentialsConflict");
+    case "sdk_missing": return t("runtime.diagnosticSdkMissing");
+    case "authentication_failed": return t("runtime.diagnosticAuthenticationFailed");
+    case "network_unreachable": return t("runtime.diagnosticNetworkUnreachable");
+    default: return t("runtime.diagnosticBrokerError");
+  }
+}
+
+function formatSdkState(installed: boolean | null | undefined, t: TFunction): string {
+  if (installed === true) return t("runtime.installed");
+  if (installed === false) return t("runtime.notInstalled");
+  return t("runtime.unknown");
+}
+
+function formatEnvironmentIdentity(identity: string | null | undefined, t: TFunction): string {
+  if (identity === "config_declared" || identity === "config-declared") return t("runtime.configDeclared");
+  if (identity === "path_separated_key_bound") return t("runtime.pathSeparatedKeyBound");
+  return identity || t("runtime.unknown");
+}
+
+const SDK_CONNECTOR_SETUP_HINTS = {
+  longbridge: {
+    introKey: "runtime.missingLongbridgeVariables",
+    variables: ["LONGBRIDGE_APP_KEY", "LONGBRIDGE_APP_SECRET", "LONGBRIDGE_ACCESS_TOKEN"],
+  },
+  etoro: {
+    introKey: "runtime.missingEtoroVariables",
+    variables: ["ETORO_API_KEY", "ETORO_USER_KEY"],
+    fileHintKey: "runtime.missingEtoroFileHint",
+  },
+} as const;
+
+function ConnectorMissingSetup({ broker, t }: { broker: string; t: TFunction }) {
+  const hints =
+    SDK_CONNECTOR_SETUP_HINTS[broker as keyof typeof SDK_CONNECTOR_SETUP_HINTS];
+  if (!hints) {
+    return (
+      <section className="mt-4 rounded-xl border border-dashed border-border/60 bg-muted/40 p-4 shadow-sm">
+        <p className="text-sm text-muted-foreground">{t("runtime.missingConnectorVariables")}</p>
+      </section>
+    );
+  }
+  return (
+    <section className="mt-4 rounded-xl border border-dashed border-border/60 bg-muted/40 p-4 shadow-sm">
+      <p className="text-sm text-muted-foreground">{t(hints.introKey)}</p>
+      <ul className="mt-2 grid gap-1 font-mono text-sm">
+        {hints.variables.map((variable) => (
+          <li key={variable}>{variable}</li>
+        ))}
+      </ul>
+      {"fileHintKey" in hints && hints.fileHintKey ? (
+        <p className="mt-2 text-sm text-muted-foreground">{t(hints.fileHintKey)}</p>
+      ) : null}
+    </section>
+  );
+}
+
+function isReadCapability(capability: string): boolean {
+  return capability.endsWith(".read");
+}
+
+function isReadOnlyCompatible(auth: LiveBrokerStatus["auth"]): boolean {
+  if (auth.connection_state !== "connected") return false;
+  if (auth.readonly !== true) return false;
+  if (!auth.profile_id?.endsWith("-readonly")) return false;
+  if (!auth.capabilities?.length) return false;
+  return auth.capabilities.every(isReadCapability);
+}
+
+function formatCapabilities(auth: LiveBrokerStatus["auth"], t: TFunction): string {
+  const labels: Record<string, string> = {
+    "account.read": t("runtime.capabilityAccount"),
+    "positions.read": t("runtime.capabilityPositions"),
+    "orders.read": t("runtime.capabilityOpenOrders"),
+    "quotes.read": t("runtime.capabilityQuotes"),
+    "history.read": t("runtime.capabilityHistory"),
+  };
+  const readCapabilities = auth.capabilities?.filter(isReadCapability) ?? [];
+  const rendered = readCapabilities.map((capability) => labels[capability] || capability).join(", ");
+  if (!isReadOnlyCompatible(auth)) {
+    return rendered ? `${rendered} · ${t("runtime.accessUnknown")}` : t("runtime.accessUnknown");
+  }
+  return `${rendered} · ${t("runtime.readOnly")}`;
+}
+
 function RuntimePanel({ title, icon: Icon, children }: { title: string; icon: typeof Activity; children: ReactNode }) {
   return (
-    <section className="rounded-md border bg-muted/20 p-3">
-      <div className="mb-3 flex items-center gap-2 text-xs font-medium uppercase text-muted-foreground">
+    <section className="rounded-xl border border-border/60 bg-muted/40 p-4 shadow-sm">
+      <div className="mb-3 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
         <Icon className="h-3.5 w-3.5" />
         {title}
       </div>
@@ -311,7 +506,7 @@ function StatusPill({ label, tone }: { label: string; tone: "success" | "danger"
         "inline-flex items-center rounded px-2 py-0.5 text-xs font-medium",
         tone === "success" && "bg-success/10 text-success",
         tone === "danger" && "bg-danger/10 text-danger",
-        tone === "warning" && "bg-amber-500/10 text-amber-700 dark:text-amber-300",
+        tone === "warning" && "bg-warning/10 text-warning",
         tone === "neutral" && "bg-muted text-muted-foreground",
       )}
     >
@@ -324,7 +519,9 @@ function summarizeRuntime(status: LiveStatus | null) {
   const brokers = status?.brokers || [];
   return {
     brokerCount: brokers.length,
-    authorizedCount: brokers.filter((broker) => broker.auth.oauth_token_present).length,
+    authorizedCount: brokers.filter(
+      (broker) => broker.auth.oauth_token_present || broker.auth.connection_state === "connected",
+    ).length,
     runningCount: brokers.filter((broker) => broker.runner?.alive).length,
   };
 }

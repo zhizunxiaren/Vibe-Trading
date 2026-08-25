@@ -5,14 +5,51 @@ ChatLLM is designed specifically for the AgentLoop ReAct cycle.
 
 from __future__ import annotations
 
+import asyncio
 import html
+import inspect
+import logging
 import os
 import re
+import time as _time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from src.config.accessor import get_env_config
 from src.providers.content_filter import is_content_filter_triggered
 from src.providers.llm import build_llm
+
+logger = logging.getLogger(__name__)
+
+
+def _dedupe_finish_reason(raw: str) -> str:
+    """Relays (OpenRouter) emit finish_reason per chunk; AIMessageChunk.__add__
+    concatenates into 'stopstop', 'tool_callstool_calls', etc. Return the
+    canonical suffix so ReAct equality checks survive.
+    """
+    return next(
+        (m for m in ("tool_calls", "function_call", "content_filter", "length", "stop")
+         if raw.endswith(m)),
+        raw,
+    )
+
+
+def _text_content(content: Any) -> str:
+    """Normalize provider text or content blocks to plain assistant text."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict) and isinstance(block.get("text"), str):
+            parts.append(block["text"])
+        elif isinstance(getattr(block, "text", None), str):
+            parts.append(block.text)
+    return "".join(parts)
 
 
 def _dedupe_finish_reason(raw: str) -> str:
@@ -47,6 +84,15 @@ class ToolCallRequest:
     extra_content: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class LLMRuntimeSnapshot:
+    """Immutable identity of the model configuration used by one ChatLLM."""
+
+    provider: str
+    configured_model: str
+    reasoning_effort: str
+
+
 @dataclass
 class LLMResponse:
     """LLM response.
@@ -64,6 +110,9 @@ class LLMResponse:
         content_filter_triggered: ``True`` when the provider blocked the
             response via content moderation (e.g. DashScope/Qwen content
             moderation filter, ``finish_reason == "content_filter"``).
+        response_model: Model identifier reported by the provider response,
+            when available. This is authoritative runtime metadata and must
+            not be inferred from the model's natural-language self-report.
     """
 
     content: Optional[str] = None
@@ -72,6 +121,7 @@ class LLMResponse:
     finish_reason: str = "stop"
     usage_metadata: Optional[Dict[str, int]] = None
     content_filter_triggered: bool = False
+    response_model: Optional[str] = None
 
     @property
     def has_tool_calls(self) -> bool:
@@ -95,9 +145,20 @@ class ProviderStreamError(RuntimeError):
         self.original = original
         self.status_code: Optional[int] = getattr(original, "status_code", None)
         safe_message = _redact_provider_error(str(original))
+        hint = ""
+        lowered = safe_message.lower()
+        if any(m in lowered for m in ("<!doctype html", "<html", "__next_error__")):
+            # An HTML body from a JSON API almost always means the base URL
+            # points at a website root, not the API root (a frequent .env
+            # misconfiguration for OpenAI-compatible coding-plan gateways).
+            hint = (
+                " — the endpoint returned an HTML page instead of a JSON API "
+                f"response; verify the {provider} base URL points at the API "
+                "root (e.g. the OpenAI-compatible '/v1' path), not the site root"
+            )
         super().__init__(
             f"provider_stream_error provider={provider} model={model}: "
-            f"{type(original).__name__}: {safe_message}"
+            f"{type(original).__name__}: {safe_message}{hint}"
         )
 
     @property
@@ -126,6 +187,18 @@ def _redact_provider_error(message: str) -> str:
         if any(marker in key.upper() for marker in sensitive_markers):
             redacted = redacted.replace(value, "[redacted]")
     return redacted
+
+
+def _is_no_stream_chunk_error(exc: Exception) -> bool:
+    """True when a provider accepted the request but streamed zero chunks.
+
+    LangChain raises ``ValueError("No generation chunks were returned")`` when
+    an OpenAI-compatible endpoint returns a non-streaming (or empty-SSE) body.
+    That's a streaming-capability gap, not a provider failure — a plain
+    non-streaming ``invoke`` still succeeds, so ``stream_chat`` falls back
+    instead of surfacing it as a hard ``ProviderStreamError``.
+    """
+    return isinstance(exc, ValueError) and "no generation chunks" in str(exc).lower()
 
 
 _DSML_BAR = r"(?:\|\||｜｜)"
@@ -214,7 +287,7 @@ def _parse_dsml_tool_calls(content: Any) -> list[ToolCallRequest]:
 class ChatLLM:
     """LLM chat client with function calling support.
 
-    Uses build_llm() to obtain a ChatOpenAI instance and bind_tools() to attach tool definitions.
+    Uses build_llm() to obtain a provider model and bind_tools() to attach tool definitions.
 
     Attributes:
         model_name: Model name.
@@ -226,8 +299,100 @@ class ChatLLM:
         Args:
             model_name: Model name; defaults to the environment variable value.
         """
-        self.model_name = model_name
         self._llm = build_llm(model_name=model_name)
+        runtime_cfg = get_env_config().llm
+        configured_model = (
+            model_name or runtime_cfg.langchain_model_name
+        ).strip()
+        self.model_name = configured_model
+        self.runtime_snapshot = LLMRuntimeSnapshot(
+            provider=runtime_cfg.langchain_provider.strip().lower() or "openai",
+            configured_model=configured_model,
+            reasoning_effort=runtime_cfg.langchain_reasoning_effort.strip().lower(),
+        )
+
+    def close(self) -> None:
+        """Best-effort release of HTTP clients owned by this adapter.
+
+        LangChain may lend multiple adapters the same cached HTTPX clients.
+        Those process-scoped clients must remain open when one ``ChatLLM`` is
+        discarded. Only explicitly marked, Vibe-created clients are closed;
+        adapters without the ownership marker keep the legacy best-effort
+        behavior for compatibility.
+        """
+        for label, client in self._close_candidates():
+            close_fn = getattr(client, "aclose", None)
+            if not callable(close_fn):
+                close_fn = getattr(client, "close", None)
+            if not callable(close_fn):
+                continue
+            try:
+                result = close_fn()
+                if inspect.isawaitable(result):
+                    self._run_or_schedule_close(result, label)
+            except Exception:
+                logger.debug("ChatLLM.close: failed to close %s", label, exc_info=True)
+
+    async def aclose(self) -> None:
+        """Asynchronously release HTTP clients owned by this adapter."""
+        for label, client in self._close_candidates():
+            close_fn = getattr(client, "aclose", None)
+            if not callable(close_fn):
+                close_fn = getattr(client, "close", None)
+            if not callable(close_fn):
+                continue
+            try:
+                result = close_fn()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.debug("ChatLLM.aclose: failed to close %s", label, exc_info=True)
+
+    def _close_candidates(self) -> list[tuple[str, Any]]:
+        """Return unique clients this wrapper is responsible for closing."""
+        llm = self._llm
+        if hasattr(llm, "_vibe_owned_http_clients"):
+            candidates = [
+                ("owned_http_client", client)
+                for client in llm._vibe_owned_http_clients
+            ]
+        else:
+            candidates = [
+                (attr, getattr(llm, attr, None))
+                for attr in ("root_client", "root_async_client", "client")
+            ]
+
+        unique: list[tuple[str, Any]] = []
+        seen: set[int] = set()
+        for label, client in candidates:
+            if client is None or id(client) in seen:
+                continue
+            seen.add(id(client))
+            unique.append((label, client))
+        return unique
+
+    @staticmethod
+    def _run_or_schedule_close(awaitable: Any, label: str) -> None:
+        """Consume an async close from either synchronous or async code."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(awaitable)
+            return
+
+        task = loop.create_task(awaitable)
+
+        def _log_failure(done: asyncio.Task[Any]) -> None:
+            try:
+                done.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.debug(
+                    "ChatLLM.close: async close failed for %s", label, exc_info=True
+                )
+
+        task.add_done_callback(_log_failure)
 
     def chat(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None, timeout: Optional[int] = None) -> LLMResponse:
         """Call the LLM synchronously.
@@ -252,6 +417,7 @@ class ChatLLM:
         on_text_chunk: Optional[Any] = None,
         on_reasoning_chunk: Optional[Any] = None,
         timeout: Optional[int] = None,
+        idle_timeout_s: Optional[float] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> LLMResponse:
         """Stream the LLM and optionally forward text deltas (e.g. thinking).
@@ -266,6 +432,9 @@ class ChatLLM:
             on_text_chunk: Optional callback ``(delta: str) -> None``.
             on_reasoning_chunk: Optional callback ``(delta: str) -> None``.
             timeout: Optional per-call timeout in seconds.
+            idle_timeout_s: Optional per-chunk idle timeout; when no stream
+                delta arrives for this long the call fails as a retryable
+                timeout instead of hanging the loop silently.
             should_cancel: Optional predicate polled per chunk; when it returns
                 True the stream stops early and the partial response is returned.
                 Lets a caller abort a live stream promptly (cooperative cancel).
@@ -279,12 +448,25 @@ class ChatLLM:
             accumulated = None
             pending_text = ""
             possible_dsml_text = True
+            cancelled = False
+            last_chunk_ts = _time.monotonic()
             for chunk in llm.stream(messages, config=config):
+                now = _time.monotonic()
+                if idle_timeout_s and now - last_chunk_ts > idle_timeout_s:
+                    # No delta for too long: the provider is stalled, not
+                    # thinking. Raising a bare TimeoutError lets the wrapper
+                    # below convert it into a retryable ProviderStreamError.
+                    raise TimeoutError(
+                        f"no stream delta for {idle_timeout_s:.0f}s"
+                    )
+                last_chunk_ts = now
                 if should_cancel and should_cancel():
+                    cancelled = True
                     break
-                if chunk.content and on_text_chunk:
+                chunk_text = _text_content(chunk.content)
+                if chunk_text and on_text_chunk:
                     if possible_dsml_text:
-                        pending_text += chunk.content
+                        pending_text += chunk_text
                         if _is_possible_dsml_tool_call_prefix(pending_text):
                             pass
                         else:
@@ -292,20 +474,38 @@ class ChatLLM:
                             on_text_chunk(pending_text)
                             pending_text = ""
                     else:
-                        on_text_chunk(chunk.content)
+                        on_text_chunk(chunk_text)
                 reasoning = getattr(chunk, "additional_kwargs", {}).get("reasoning_content")
                 if reasoning and not chunk.content and on_reasoning_chunk:
                     on_reasoning_chunk(reasoning)
                 accumulated = chunk if accumulated is None else accumulated + chunk
             if accumulated is None:
-                return LLMResponse(content="", tool_calls=[], finish_reason="stop")
+                if cancelled:
+                    return LLMResponse(content="", tool_calls=[], finish_reason="stop")
+                # Endpoint streamed nothing (no SSE support); a non-streaming
+                # invoke still works — fall back rather than return empty.
+                logger.warning(
+                    "Provider stream returned no chunks; falling back to "
+                    "non-streaming invoke."
+                )
+                return self.chat(messages, tools=tools, timeout=timeout)
             response = self._parse_response(accumulated)
             if pending_text and not (response.has_tool_calls and response.content == ""):
                 on_text_chunk(pending_text)
             return response
         except Exception as exc:
-            provider = os.getenv("LANGCHAIN_PROVIDER", "openai").strip().lower() or "openai"
-            model = self.model_name or os.getenv("LANGCHAIN_MODEL_NAME", "").strip() or "(unset)"
+            if _is_no_stream_chunk_error(exc):
+                # Provider streamed zero chunks (endpoint lacks real SSE); a
+                # non-streaming invoke still returns a valid response.
+                logger.warning(
+                    "Provider stream produced no chunks (%s); falling back to "
+                    "non-streaming invoke.",
+                    type(exc).__name__,
+                )
+                return self.chat(messages, tools=tools, timeout=timeout)
+            _cfg = get_env_config()
+            provider = _cfg.llm.langchain_provider.strip().lower() or "openai"
+            model = self.model_name or _cfg.llm.langchain_model_name.strip() or "(unset)"
             raise ProviderStreamError(provider=provider, model=model, original=exc) from exc
 
     @staticmethod
@@ -359,6 +559,10 @@ class ChatLLM:
             except (TypeError, ValueError):
                 usage = None
         additional_kwargs = getattr(ai_message, "additional_kwargs", {}) or {}
+        response_metadata = getattr(ai_message, "response_metadata", {}) or {}
+        response_model = response_metadata.get("model_name") or response_metadata.get("model")
+        if response_model is not None:
+            response_model = str(response_model).strip() or None
         thought_signatures_by_id, thought_signatures_by_index = (
             ChatLLM._tool_call_thought_signature_maps(ai_message)
         )
@@ -389,27 +593,36 @@ class ChatLLM:
                 )
             )
 
-        dsml_tool_calls = [] if native_tool_calls else _parse_dsml_tool_calls(ai_message.content)
+        content = _text_content(ai_message.content)
+        dsml_tool_calls = [] if native_tool_calls else _parse_dsml_tool_calls(content)
         tool_calls = native_tool_calls or dsml_tool_calls
 
+        raw_finish_reason = (
+            ai_message.response_metadata.get("finish_reason")
+            or ai_message.response_metadata.get("stop_reason")
+            or "stop"
+        )
         finish_reason = (
             "tool_calls"
             if dsml_tool_calls
+            else "tool_calls"
+            if raw_finish_reason == "tool_use"
             else _dedupe_finish_reason(
-                ai_message.response_metadata.get("finish_reason", "stop")
+                raw_finish_reason
             )
         )
         content_filter_triggered = is_content_filter_triggered(
-            ai_message.response_metadata.get("finish_reason")
+            raw_finish_reason
         )
 
         return LLMResponse(
-            content="" if dsml_tool_calls else ai_message.content,
+            content="" if dsml_tool_calls else content,
             tool_calls=tool_calls,
             reasoning_content=additional_kwargs.get("reasoning_content"),
             finish_reason=finish_reason,
             usage_metadata=usage,
             content_filter_triggered=content_filter_triggered,
+            response_model=response_model,
         )
 
 

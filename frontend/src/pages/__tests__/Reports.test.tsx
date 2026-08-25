@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter } from "react-router";
 import { Reports } from "../Reports";
 
 const apiMock = vi.hoisted(() => ({
@@ -55,6 +55,8 @@ describe("Reports page", () => {
     const fullReportLinks = screen.getAllByRole("link", { name: "Full Report" });
     expect(fullReportLinks[0]).toHaveAttribute("href", "/runs/new-report");
     expect(fullReportLinks[1]).toHaveAttribute("href", "/runs/old-report");
+    expect(screen.getByRole("textbox", { name: "Search" })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Status" })).toBeInTheDocument();
   });
 
   it("filters reports by search text", async () => {
@@ -80,7 +82,7 @@ describe("Reports page", () => {
     render(<Reports />, { wrapper: MemoryRouter });
     await screen.findByText("aapl-report");
 
-    fireEvent.change(screen.getByPlaceholderText("Search run id, prompt, symbol, status..."), {
+    fireEvent.change(screen.getByRole("textbox", { name: "Search" }), {
       target: { value: "MSFT" },
     });
 

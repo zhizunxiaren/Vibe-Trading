@@ -3,8 +3,12 @@
 Wraps the shared :mod:`backtest.loaders.yahoo_client` (the public v8 chart
 endpoint) rather than the ``yfinance`` package, so it pulls in no new
 dependency and shares the process-wide throttle/session that keeps Yahoo from
-IP-rate-limiting us. Covers US equities (``AAPL.US``) and HK equities
-(``00700.HK``); the client maps each project symbol to Yahoo's ticker form.
+IP-rate-limiting us. Covers US equities (``AAPL.US``), HK equities
+(``00700.HK``), Canadian equities (``TD.TO`` / ``PNG.V``), and Vietnamese
+equities (``VIC.VN``); the client maps each project symbol to Yahoo's ticker
+form.
+
+Yahoo officially lists HOSE under ``.VN``; HNX and UPCOM are not supported.
 
 The chart endpoint returns each bar's ``trade_date`` as an epoch-second
 timestamp; this loader converts those to a tz-naive ``DatetimeIndex`` and clips
@@ -33,14 +37,25 @@ _OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
 _INTERVAL_MAP = {
     "1D": "1d",
     "1H": "1h",
+    # Yahoo chart has no 4h bar; match yfinance's 4H → 1h approximation.
+    "4H": "1h",
     "1W": "1wk",
     "1M": "1mo",
 }
 
 
-def _is_us_or_hk(code: str) -> bool:
-    """Return whether *code* is a US or HK equity symbol this loader handles."""
-    return code.strip().upper().endswith((".US", ".HK"))
+def _is_supported(code: str) -> bool:
+    """Return whether *code* is a symbol this loader handles.
+
+    Covers US/HK/India/Korea/Canada/Vietnam equities plus Yahoo's own futures
+    (``GC=F``) and forex (``EURUSD=X``) suffix conventions, which the public
+    chart endpoint serves verbatim (the code is used as-is in the request URL,
+    no conversion) (#718).
+    """
+    upper = code.strip().upper()
+    return upper.endswith(
+        (".US", ".HK", ".NS", ".BO", ".KS", ".KQ", ".TO", ".V", ".VN", "=F", "=X")
+    )
 
 
 def _to_yahoo_interval(interval: str) -> str:
@@ -53,6 +68,11 @@ def _to_yahoo_interval(interval: str) -> str:
         Yahoo-compatible interval string (e.g. ``1d``).
     """
     normalized = str(interval or "1D").strip()
+    if not normalized:
+        return "1d"
+    # Bare trailing ``m`` is minutes; do not uppercase into monthly ``1M`` → ``1mo``.
+    if normalized.endswith("m") and not normalized.endswith("M"):
+        return normalized.lower()
     return _INTERVAL_MAP.get(normalized.upper(), normalized.lower())
 
 
@@ -155,10 +175,17 @@ def _rows_to_frame(
 
 @register
 class DataLoader:
-    """Yahoo Finance US/HK equity OHLCV loader (free, direct HTTP, no auth)."""
+    """Yahoo Finance global-equity OHLCV loader (free, direct HTTP, no auth)."""
 
     name = "yahoo"
-    markets = {"us_equity", "hk_equity"}
+    markets = {
+        "us_equity", "hk_equity", "india_equity", "kr_equity", "ca_equity",
+        "vietnam_equity",
+    }
+    # Yahoo chart volume is single shares for US/HK equities
+    # (HKUDS/Vibe-Trading#1062; HK verified 2026-08-11, 00700.HK ratio 1.00
+    # vs tencent/eastmoney). Other equity markets stay undeclared.
+    volume_units = {"us_equity": "shares", "hk_equity": "shares"}
     requires_auth = False
 
     def is_available(self) -> bool:
@@ -181,7 +208,8 @@ class DataLoader:
         """Fetch OHLCV history keyed by the original project symbols.
 
         Args:
-            codes: Project symbols such as ``AAPL.US`` and ``00700.HK``.
+            codes: Project symbols such as ``AAPL.US``, ``00700.HK``,
+                ``TD.TO``, and ``VIC.VN``.
             start_date: Inclusive start date (``YYYY-MM-DD``).
             end_date: Inclusive end date (``YYYY-MM-DD``).
             interval: Backtest interval such as ``1D`` or ``1H``.
@@ -229,10 +257,10 @@ class DataLoader:
             interval: Backtest interval string.
 
         Returns:
-            The OHLCV DataFrame for *code*, ``None`` if it is not a US/HK symbol
-            or Yahoo returns no usable bars.
+            The OHLCV DataFrame for *code*, ``None`` if it is not a US/HK/India
+            symbol or Yahoo returns no usable bars.
         """
-        if not _is_us_or_hk(code):
+        if not _is_supported(code):
             return None
 
         # period2 is exclusive on Yahoo; extend one day past end_date so the

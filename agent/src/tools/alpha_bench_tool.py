@@ -14,36 +14,47 @@ Output contract — JSON envelope:
      "top": [{"id": ..., "ic_mean": ..., "ir": ..., ...}, ...]}
 
 Cache integrity note: the universe panel cache lives in ``~/.vibe-trading/cache/``
-as pickle blobs. Each pickle is paired with a ``<name>.sha256`` sidecar; on
-load we recompute the digest and refuse the cache on mismatch. This guards
-against accidental corruption (truncated writes, partial syncs) — it is NOT a
-defence against an attacker with local write access (they can rewrite both
-files). Cache files are user-local; if shared across machines they can be
-tampered with and the sha256 sidecar is only an integrity check, not authenticity.
+as pickle blobs. Each pickle is paired with a ``<name>.sha256`` sidecar holding a
+**keyed HMAC-SHA256 tag** (not a bare digest) computed over the blob. On load we
+recompute the tag with the same key and refuse the cache on mismatch before the
+``pickle.loads`` call. The key is ``API_AUTH_KEY`` when configured, else a
+machine-local random 32-byte secret persisted at ``cache/.hmac_key`` (mode 0600).
+Because the tag is keyed, a local attacker who rewrites the pickle cannot forge a
+matching sidecar without the secret — so this is an authenticity guard against
+local-write RCE via ``pickle.loads``, not merely a corruption check.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import html
 import json
 import logging
 import os
 import re
+import secrets
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
+from backtest.loaders.cn_adjust import apply_qfq as _apply_qfq
 from src.agent.tools import BaseTool
+from src.config.accessor import get_env_config
 
 logger = logging.getLogger(__name__)
 
 # Date the SP500 constituent list was sampled from Wikipedia (best-effort label
 # for the survivorship-bias warning in the bench summary's ``meta`` block).
 _SP500_CONSTITUENT_SOURCE_DATE = "2026-05-17"
+# Below this share of named sectors the tag is worse than absent: one
+# "unknown" bucket demeans as a single group, which is the global fallback
+# the alphas already have, but reported as industry neutralization.
+_SP500_MIN_SECTOR_COVERAGE = 0.9
 
 # Concurrent Tushare ``pro.daily`` fetches when building CSI300. Free tier
 # allows ~200 calls/min; 4 workers stays well under that with a 300-name list.
@@ -72,13 +83,19 @@ def _parse_period(period: str) -> tuple[str, str]:
         raise ValueError(f"period must be string, got {type(period).__name__}")
     m = _PERIOD_DATE.match(period)
     if m:
-        return m.group(1), m.group(2)
-    m = _PERIOD_YEAR.match(period)
-    if m:
-        return f"{m.group(1)}-01-01", f"{m.group(2)}-12-31"
-    raise ValueError(
-        f"period {period!r} must be YYYY-YYYY or YYYY-MM-DD/YYYY-MM-DD"
-    )
+        start, end = m.group(1), m.group(2)
+    else:
+        m = _PERIOD_YEAR.match(period)
+        if m:
+            start, end = f"{m.group(1)}-01-01", f"{m.group(2)}-12-31"
+        else:
+            raise ValueError(
+                f"period {period!r} must be YYYY-YYYY or YYYY-MM-DD/YYYY-MM-DD"
+            )
+    # Match backtest loaders.validate_date_range: reject inverted ranges.
+    if pd.Timestamp(start) > pd.Timestamp(end):
+        raise ValueError(f"start_date ({start}) > end_date ({end})")
+    return start, end
 
 
 def _load_universe_panel(
@@ -151,8 +168,55 @@ def _sha256_path(cache_path: Path) -> Path:
     return cache_path.with_suffix(cache_path.suffix + ".sha256")
 
 
+def _cache_hmac_key(cache_dir: Path) -> bytes:
+    """Return the secret backing the cache sidecar HMAC.
+
+    Priority: ``API_AUTH_KEY`` (UTF-8) when configured, else a persisted
+    machine-local 32-byte random key. The fallback is required because an empty
+    HMAC key would let any local attacker forge a matching sidecar for a
+    malicious pickle — defeating the whole point of the tag.
+    """
+    configured = get_env_config().api.api_auth_key.strip()
+    if configured:
+        return configured.encode("utf-8")
+
+    key_path = cache_dir / ".hmac_key"
+    try:
+        return bytes.fromhex(key_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        pass
+
+    key = secrets.token_bytes(32)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        # O_EXCL + mode 0600 from creation: a concurrent writer can't race us
+        # into a world-readable key, and we never widen perms after the fact.
+        fd = os.open(str(key_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, key.hex().encode("utf-8"))
+        finally:
+            os.close(fd)
+    except FileExistsError:
+        try:
+            return bytes.fromhex(key_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return key
+    except OSError as exc:
+        logger.warning("hmac key persist failed (%s); using ephemeral key", exc)
+    return key
+
+
+def _cache_mac(key: bytes, blob: bytes) -> str:
+    """Keyed HMAC-SHA256 authentication tag (hex) for a cache blob."""
+    return hmac.new(key, blob, hashlib.sha256).hexdigest()
+
+
 def _read_pickle_cache(cache_path: Path) -> dict[str, pd.DataFrame] | None:
-    """Load a pickle cache, validating its sha256 sidecar. None on any failure."""
+    """Load a pickle cache, authenticating its keyed HMAC sidecar. None on failure.
+
+    The HMAC is verified before ``pickle.loads`` so a locally-tampered blob whose
+    sidecar was forged without the secret is rejected, never deserialized.
+    """
     import pickle
 
     sidecar = _sha256_path(cache_path)
@@ -173,7 +237,7 @@ def _read_pickle_cache(cache_path: Path) -> dict[str, pd.DataFrame] | None:
     except OSError as exc:
         logger.warning("cache sidecar read failed (%s); refetching", exc)
         return None
-    actual = hashlib.sha256(blob).hexdigest()
+    actual = _cache_mac(_cache_hmac_key(cache_path.parent), blob)
     if not _hashes_equal(expected, actual):
         logger.warning(
             "cache integrity mismatch for %s (expected %s..., got %s...); refetching",
@@ -182,7 +246,7 @@ def _read_pickle_cache(cache_path: Path) -> dict[str, pd.DataFrame] | None:
         return None
 
     try:
-        cached = pickle.loads(blob)  # noqa: S301 — local cache, integrity-checked above
+        cached = pickle.loads(blob)  # noqa: S301 — local cache, HMAC-authenticated above
     except Exception as exc:  # noqa: BLE001 — degrade to fresh fetch
         logger.warning("cache unpickle failed (%s); refetching", exc)
         return None
@@ -195,7 +259,7 @@ def _read_pickle_cache(cache_path: Path) -> dict[str, pd.DataFrame] | None:
 def _write_pickle_cache(
     cache_dir: Path, cache_path: Path, panel: dict[str, Any]
 ) -> None:
-    """Pickle ``panel`` + write its sha256 sidecar. Failures are non-fatal."""
+    """Pickle ``panel`` + write its keyed HMAC sidecar. Failures are non-fatal."""
     import pickle
 
     try:
@@ -203,16 +267,14 @@ def _write_pickle_cache(
         blob = pickle.dumps(panel, protocol=pickle.HIGHEST_PROTOCOL)
         cache_path.write_bytes(blob)
         _sha256_path(cache_path).write_text(
-            hashlib.sha256(blob).hexdigest(), encoding="utf-8"
+            _cache_mac(_cache_hmac_key(cache_dir), blob), encoding="utf-8"
         )
     except Exception as exc:  # noqa: BLE001 — cache miss is non-fatal
         logger.warning("cache write failed: %s", exc)
 
 
 def _hashes_equal(a: str, b: str) -> bool:
-    """Constant-time comparison of two hex digests."""
-    import hmac
-
+    """Constant-time comparison of two hex authentication tags."""
     return hmac.compare_digest(a.strip().lower(), b.strip().lower())
 
 
@@ -251,7 +313,7 @@ def _load_csi300_panel(start: str, end: str) -> dict[str, pd.DataFrame]:
     the requested window; if that call fails we degrade to a 30-name
     blue-chip fallback so the bench still runs.
     """
-    token = os.getenv("TUSHARE_TOKEN", "").strip()
+    token = get_env_config().data.tushare_token.strip()
     if not token or token == "your-tushare-token":
         raise RuntimeError(
             "TUSHARE_TOKEN not in agent/.env or environment; required for csi300 universe"
@@ -267,23 +329,47 @@ def _load_csi300_panel(start: str, end: str) -> dict[str, pd.DataFrame]:
     ed = end.replace("-", "")
 
     codes: list[str] = []
+    constituent_source = "tushare index_weight"
+    constituent_source_date: str | None = None
+    membership: pd.DataFrame | None = None
     try:
+        # Reach back before ``start`` so the snapshot that was in force on the
+        # first requested day is included; Tushare publishes month-end rosters.
+        lookback = (pd.Timestamp(start) - pd.Timedelta(days=60)).strftime("%Y%m%d")
         weights = pro.index_weight(
-            index_code="399300.SZ", start_date=sd, end_date=ed
+            index_code="399300.SZ", start_date=lookback, end_date=ed
         )
         if weights is not None and not weights.empty:
-            latest_date = weights["trade_date"].max()
-            codes = (
-                weights[weights["trade_date"] == latest_date]["con_code"]
-                .drop_duplicates()
-                .tolist()
+            frame = weights.copy()
+            frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+            frame = frame.dropna(subset=["trade_date", "con_code"])
+            constituent_source_date = str(weights["trade_date"].max())
+            # Every name that was a member at any point in the window, so the
+            # panel can carry a name that later left the index.
+            codes = sorted(frame["con_code"].astype(str).unique())
+            membership = (
+                frame.assign(_member=True)
+                .pivot_table(
+                    index="trade_date",
+                    columns="con_code",
+                    values="_member",
+                    aggfunc="first",
+                )
+                .notna()
+                .sort_index()
             )
-            logger.info("csi300: %d constituents from index_weight @ %s", len(codes), latest_date)
+            logger.info(
+                "csi300: %d names ever a member across %d roster snapshots",
+                len(codes),
+                len(membership),
+            )
     except Exception as exc:  # noqa: BLE001
         logger.warning("csi300 index_weight failed (%s); using fallback list", exc)
 
     if not codes:
         codes = list(_CSI300_FALLBACK_CODES)
+        constituent_source = "hand-picked fallback"
+        constituent_source_date = None
         logger.warning("csi300: using %d-name fallback (degraded run)", len(codes))
 
     # Fetch raw daily in parallel — we need ``amount`` which the standard
@@ -301,7 +387,9 @@ def _load_csi300_panel(start: str, end: str) -> dict[str, pd.DataFrame]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         keep = [c for c in ("open", "high", "low", "close", "volume", "amount") if c in df.columns]
-        return code, df[keep].dropna(subset=["open", "high", "low", "close"])
+        df = df[keep].dropna(subset=["open", "high", "low", "close"])
+        factor = _retry(lambda: pro.adj_factor(ts_code=code, start_date=sd, end_date=ed))
+        return code, _apply_qfq(df, factor)
 
     fetched: dict[str, pd.DataFrame] = {}
     with ThreadPoolExecutor(max_workers=_CSI300_FETCH_WORKERS) as pool:
@@ -315,6 +403,26 @@ def _load_csi300_panel(start: str, end: str) -> dict[str, pd.DataFrame]:
             if frame is not None and not frame.empty:
                 fetched[code] = frame
 
+    # A name with no usable adjustment factors is dropped rather than benched on
+    # raw prices, so the drop has to be visible or it becomes its own silent bias.
+    dropped = sorted(set(codes) - set(fetched))
+    if not fetched:
+        raise RuntimeError(
+            "csi300: no symbol survived corporate-action adjustment — "
+            "pro.adj_factor returned nothing usable for any of the "
+            f"{len(codes)} names, which usually means the Tushare token lacks "
+            "adj_factor permission. Benching on unadjusted prices is not an "
+            "alternative: an ex-date injects a fabricated cross-sectional "
+            "return, measured at -47.2% on 300750.SZ 2023-04-26."
+        )
+    if dropped:
+        logger.warning(
+            "csi300: dropped %d/%d name(s) with no usable adjustment factors: %s",
+            len(dropped),
+            len(codes),
+            ", ".join(dropped[:10]) + ("..." if len(dropped) > 10 else ""),
+        )
+
     panel = _wide_from_fetched(fetched, include_amount=True)
     # CN equity vwap: Tushare ``amount`` is in 千元, ``volume`` in 手. True VWAP
     # = (amount * 1000 CNY) / (volume * 100 shares). Matches
@@ -325,6 +433,39 @@ def _load_csi300_panel(start: str, end: str) -> dict[str, pd.DataFrame]:
         panel["vwap"] = safe_div(
             panel["amount"] * 1000.0, panel["volume"] * 100.0 + 1.0
         )
+
+    # Restrict each date's cross-section to the names that were index members on
+    # that date. Without this the panel carries today's roster back through the
+    # whole window, so a name is only present because it survived to the end —
+    # every IC is then measured on a set selected with hindsight.
+    if membership is not None:
+        mask = (
+            membership.reindex(columns=panel["close"].columns)
+            .reindex(index=panel["close"].index.union(membership.index))
+            .ffill()
+            .reindex(panel["close"].index)
+            .bfill()
+            .fillna(False)
+            .astype(bool)
+        )
+        for key, frame in panel.items():
+            if isinstance(frame, pd.DataFrame):
+                panel[key] = frame.where(mask)
+
+    panel["_meta"] = {
+        "universe": "csi300",
+        # True only on the degraded path: the hand-picked fallback is a
+        # survivor-selected static roster with no point-in-time membership.
+        "survivorship_bias": membership is None,
+        "pit_membership": membership is not None,
+        "degraded": constituent_source != "tushare index_weight",
+        "constituent_source": constituent_source,
+        "constituent_source_date": constituent_source_date,
+        "constituent_count": len(codes),
+        # Prices are corporate-action adjusted; raw pro.daily is not.
+        "price_adjustment": "qfq",
+        "dropped_unadjustable": len(dropped),
+    }
     return panel
 
 
@@ -338,16 +479,20 @@ def _load_sp500_panel(start: str, end: str) -> dict[str, pd.DataFrame]:
     runner) surfaces this in the bench summary's ``meta`` block via the
     ``_meta`` panel key set below.
     """
-    codes = _fetch_sp500_constituents()
+    codes, sectors = _fetch_sp500_constituents()
     constituent_source = "wikipedia"
+    constituent_source_date: str | None = _SP500_CONSTITUENT_SOURCE_DATE
     if not codes:
         codes = list(_SP500_FALLBACK_CODES)
+        sectors = {}
         constituent_source = "hand-picked fallback"
+        constituent_source_date = None
         logger.warning("sp500: using %d-name fallback (degraded run)", len(codes))
 
     logger.warning(
         "SP500 universe uses current constituents (%s @ %s) → survivorship-biased",
-        constituent_source, _SP500_CONSTITUENT_SOURCE_DATE,
+        constituent_source,
+        constituent_source_date,
     )
 
     # yfinance loader expects project-style symbols (``AAPL.US``).
@@ -362,20 +507,57 @@ def _load_sp500_panel(start: str, end: str) -> dict[str, pd.DataFrame]:
     if all(k in panel for k in ("open", "high", "low", "close")):
         panel["vwap"] = (panel["open"] + panel["high"] + panel["low"] + panel["close"]) / 4.0
 
+    # 19 alpha101 alphas are industry-neutralized and the registry refuses them
+    # outright when the panel carries no ``sector`` tag, so the bench reported
+    # n_skipped=19 on every SP500 run. The labels come from the same Wikipedia
+    # table the constituents do — no extra request, no per-name lookup.
+    sector_coverage = 0.0
+    if sectors and "close" in panel and not panel["close"].empty:
+        columns = panel["close"].columns
+        labels = [sectors.get(str(code).removesuffix(".US"), "") for code in columns]
+        sector_coverage = sum(1 for label in labels if label) / len(labels)
+        # A mostly-unlabelled panel would demean one big "unknown" bucket, which
+        # is the global-demean fallback wearing a sector tag. Say so instead.
+        if sector_coverage >= _SP500_MIN_SECTOR_COVERAGE:
+            panel["sector"] = pd.DataFrame(
+                np.repeat(
+                    np.array([label or "UNKNOWN" for label in labels], dtype=object)[None, :],
+                    len(panel["close"].index),
+                    axis=0,
+                ),
+                index=panel["close"].index,
+                columns=columns,
+            )
+        else:
+            logger.warning(
+                "sp500: sector coverage %.1f%% below %.0f%% — leaving the tag off "
+                "so industry-neutralized alphas skip rather than demean one bucket",
+                sector_coverage * 100,
+                _SP500_MIN_SECTOR_COVERAGE * 100,
+            )
+
     # Attach a non-DataFrame metadata blob. Registry.compute() only iterates
     # required column names, so this extra key is ignored by the compute path.
     panel["_meta"] = {
         "universe": "sp500",
         "survivorship_bias": True,
+        "degraded": constituent_source == "hand-picked fallback",
         "constituent_source": constituent_source,
-        "constituent_source_date": _SP500_CONSTITUENT_SOURCE_DATE,
+        "constituent_source_date": constituent_source_date,
         "constituent_count": len(codes),
+        "sector_source": "wikipedia GICS" if "sector" in panel else None,
+        "sector_coverage": round(sector_coverage, 4),
     }
     return panel
 
 
-def _fetch_sp500_constituents() -> list[str]:
-    """Pull current S&P 500 tickers from Wikipedia. Returns [] on any failure."""
+def _fetch_sp500_constituents() -> tuple[list[str], dict[str, str]]:
+    """Pull current S&P 500 tickers and GICS sectors from Wikipedia.
+
+    The sector labels ride along in the table we already request, so the 19
+    industry-neutralized alpha101 alphas cost no extra call. Returns
+    ``([], {})`` on any failure.
+    """
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     try:
         import io
@@ -396,14 +578,27 @@ def _fetch_sp500_constituents() -> list[str]:
         tables = pd.read_html(io.StringIO(resp.text))
         for tbl in tables:
             if "Symbol" in tbl.columns:
-                tickers = tbl["Symbol"].astype(str).str.strip().tolist()
                 # yfinance prefers ``BRK-B`` over ``BRK.B`` — normalise
-                tickers = [t.replace(".", "-") for t in tickers if t and t != "nan"]
-                logger.info("sp500: %d tickers from Wikipedia", len(tickers))
-                return tickers
+                symbols = tbl["Symbol"].astype(str).str.strip().str.replace(".", "-", regex=False)
+                keep = symbols.ne("") & symbols.ne("nan")
+                tickers = symbols[keep].tolist()
+                sectors: dict[str, str] = {}
+                if "GICS Sector" in tbl.columns:
+                    labels = tbl["GICS Sector"].astype(str).str.strip()
+                    sectors = {
+                        symbol: label
+                        for symbol, label in zip(symbols[keep], labels[keep])
+                        if label and label != "nan"
+                    }
+                logger.info(
+                    "sp500: %d tickers from Wikipedia (%d with a GICS sector)",
+                    len(tickers),
+                    len(sectors),
+                )
+                return tickers, sectors
     except Exception as exc:  # noqa: BLE001
         logger.warning("sp500 Wikipedia fetch failed: %s", exc)
-    return []
+    return [], {}
 
 
 def _load_btc_panel(start: str, end: str) -> dict[str, pd.DataFrame]:
@@ -479,7 +674,7 @@ def _compute_forward_returns(panel: dict[str, pd.DataFrame]) -> pd.DataFrame:
     if close is None:
         raise ValueError("panel missing 'close' — cannot derive forward returns")
     # Next-period return aligned to current row (use t+1 close, shift back).
-    fwd = close.pct_change().shift(-1)
+    fwd = close.pct_change(fill_method=None).shift(-1)
     return fwd
 
 
@@ -583,6 +778,28 @@ _JINJA_TEMPLATE = """<!doctype html>
 {% endfor %}
 </table>
 
+{% if strict %}
+<h2>Strict gate</h2>
+<div class="meta">
+  Alpha t-stats against the same-universe random control. The strict gate
+  decides on these, not on IC.
+</div>
+<table>
+<tr><th>Alpha ID</th><th>alpha_t full</th><th>alpha_t train</th>
+    <th>alpha_t test</th><th>random IC mean</th><th>Category</th></tr>
+{% for row in top %}
+<tr>
+  <td>{{ row.id }}</td>
+  <td>{{ "%.4f"|format(row.get('alpha_t_full')) if row.get('alpha_t_full') is not none else "n/a" }}</td>
+  <td>{{ "%.4f"|format(row.get('alpha_t_train')) if row.get('alpha_t_train') is not none else "n/a" }}</td>
+  <td>{{ "%.4f"|format(row.get('alpha_t_test')) if row.get('alpha_t_test') is not none else "n/a" }}</td>
+  <td>{{ "%.6f"|format(row.get('random_ic_mean')) if row.get('random_ic_mean') is not none else "n/a" }}</td>
+  <td>{{ row.category }}</td>
+</tr>
+{% endfor %}
+</table>
+{% endif %}
+
 <h2>Formulas</h2>
 <table>
 <tr><th>Alpha ID</th><th>Formula (LaTeX source)</th></tr>
@@ -654,7 +871,30 @@ def _render_html_manual(ctx: dict[str, Any]) -> str:
             f"<td>{ic_pos}</td>"
             f"<td>{_esc(row['ic_count'])}</td></tr>"
         )
-    parts.append("</table><h2>Formulas</h2><table>")
+    parts.append("</table>")
+    if ctx.get("strict"):
+        parts.append(
+            "<h2>Strict gate</h2>"
+            "<div class=\"meta\">Alpha t-stats against the same-universe random "
+            "control. The strict gate decides on these, not on IC.</div><table>"
+            "<tr><th>Alpha ID</th><th>alpha_t full</th><th>alpha_t train</th>"
+            "<th>alpha_t test</th><th>random IC mean</th><th>Category</th></tr>"
+        )
+
+        def _fmt(value: Any, places: int = 4) -> str:
+            return "n/a" if value is None else _esc(f"{value:.{places}f}")
+
+        for row in ctx["top"]:
+            parts.append(
+                f"<tr><td>{_esc(row['id'])}</td>"
+                f"<td>{_fmt(row.get('alpha_t_full'))}</td>"
+                f"<td>{_fmt(row.get('alpha_t_train'))}</td>"
+                f"<td>{_fmt(row.get('alpha_t_test'))}</td>"
+                f"<td>{_fmt(row.get('random_ic_mean'), 6)}</td>"
+                f"<td>{_esc(row.get('category'))}</td></tr>"
+            )
+        parts.append("</table>")
+    parts.append("<h2>Formulas</h2><table>")
     parts.append("<tr><th>Alpha ID</th><th>Formula (LaTeX source)</th></tr>")
     for row in ctx["top"]:
         parts.append(
@@ -769,7 +1009,7 @@ def run_alpha_bench(**kwargs: Any) -> dict[str, Any]:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    report_path = output_dir / f"alpha_bench_{ts}.html"
+    report_path = output_dir / f"alpha_bench_{ts}_{secrets.token_hex(16)}.html"
 
     context = {
         "csp": _CSP,
@@ -784,7 +1024,11 @@ def run_alpha_bench(**kwargs: Any) -> dict[str, Any]:
     }
 
     try:
-        report_path.write_text(_render_html(context), encoding="utf-8")
+        report_html = _render_html(context)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        report_fd = os.open(report_path, flags, 0o666)
+        with os.fdopen(report_fd, "w", encoding="utf-8") as report_file:
+            report_file.write(report_html)
     except OSError as exc:
         return {"status": "error", "error": f"failed to write report: {exc}"}
 

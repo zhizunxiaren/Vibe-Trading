@@ -16,7 +16,6 @@ and session reuse — Tiingo rate-limits by client and rejects unspaced bursts.
 from __future__ import annotations
 
 import logging
-import os
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -51,7 +50,9 @@ def _resolve_key() -> str:
         The trimmed ``TIINGO_API_KEY`` value, or ``""`` when absent or a known
         placeholder.
     """
-    key = os.getenv(_AUTH_ENV, "").strip()
+    from src.config.accessor import get_env_config
+
+    key = get_env_config().data.tiingo_api_key.strip()
     return "" if key.lower() in _KEY_PLACEHOLDERS else key
 
 
@@ -175,6 +176,14 @@ class DataLoader:
         """
         del fields
         validate_date_range(start_date, end_date)
+
+        # Daily-only EOD endpoint; do not silently return day bars for ``1H``.
+        if str(interval).strip().lower() not in {"1d", "d", "day", "daily"}:
+            logger.warning(
+                "tiingo supports daily bars only; rejecting interval=%r",
+                interval,
+            )
+            return {}
 
         key = _resolve_key()
         if not key:

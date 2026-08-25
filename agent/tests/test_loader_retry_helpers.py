@@ -29,6 +29,7 @@ from backtest.loaders.base import (
     DEFAULT_BACKOFF,
     DEFAULT_MAX_RETRIES,
     LOADER_CACHE_ENV,
+    LOADER_CACHE_ROOT_ENV,
     cached_loader_fetch,
     check_budget,
     loader_cache_get,
@@ -203,6 +204,13 @@ def fake_duckdb(monkeypatch):
     )
 
 
+@pytest.fixture
+def loader_cache_root(tmp_path, monkeypatch):
+    cache_root = tmp_path / "loader-cache"
+    monkeypatch.setenv(LOADER_CACHE_ROOT_ENV, str(cache_root))
+    return cache_root
+
+
 def _cache_frame(value: float = 1.0) -> pd.DataFrame:
     frame = pd.DataFrame(
         {
@@ -243,6 +251,47 @@ def test_loader_cache_disabled_by_default_bypasses_home(tmp_path, monkeypatch):
     assert not (home / ".vibe-trading").exists()
 
 
+def test_stubbed_config_cannot_enable_cache_or_redirect_root_into_cwd(monkeypatch, tmp_path):
+    """A MagicMock config must not switch the cache on or escape the home root.
+
+    A bare ``MagicMock`` reads truthy and its ``__fspath__`` returns a
+    *relative* string, so an unguarded implementation both enabled the opt-in
+    cache and resolved its root against the CWD — writing market data inside
+    the working tree, which the project forbids.
+    """
+    from unittest.mock import MagicMock
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    stub = MagicMock()
+    monkeypatch.setattr(
+        "src.config.accessor.get_env_config", lambda: stub, raising=False
+    )
+
+    assert base.loader_cache_enabled() is False
+
+    root = base.loader_cache_root()
+    assert root.is_absolute()
+    assert root == home / ".vibe-trading" / "cache" / "loaders"
+
+
+def test_loader_cache_root_honors_real_string_override(monkeypatch, tmp_path):
+    """A genuine string override is still respected."""
+    stub = SimpleNamespace(
+        data=SimpleNamespace(
+            vibe_trading_data_cache=True,
+            vibe_trading_data_cache_root=str(tmp_path / "custom"),
+        )
+    )
+    monkeypatch.setattr(
+        "src.config.accessor.get_env_config", lambda: stub, raising=False
+    )
+
+    assert base.loader_cache_enabled() is True
+    assert base.loader_cache_root() == tmp_path / "custom"
+
+
 def test_loader_cache_key_partitions_source_symbol_timeframe_date_and_fields():
     base_args = {
         "source": "tushare",
@@ -266,9 +315,9 @@ def test_loader_cache_happy_path_writes_then_reuses(
     tmp_path,
     monkeypatch,
     fake_duckdb,
+    loader_cache_root,
 ):
     monkeypatch.setenv(LOADER_CACHE_ENV, "1")
-    monkeypatch.setenv("HOME", str(tmp_path))
     calls = {"count": 0}
     frame = _cache_frame()
 
@@ -291,16 +340,16 @@ def test_loader_cache_happy_path_writes_then_reuses(
     pd.testing.assert_frame_equal(first, frame)
     pd.testing.assert_frame_equal(second, frame)
     assert loader_cache_path(**kwargs).is_file()
-    assert str(loader_cache_path(**kwargs)).startswith(str(tmp_path / ".vibe-trading" / "cache"))
+    assert str(loader_cache_path(**kwargs)).startswith(str(loader_cache_root))
 
 
 def test_loader_cache_corrupt_entry_falls_back_to_live_fetch(
     tmp_path,
     monkeypatch,
     fake_duckdb,
+    loader_cache_root,
 ):
     monkeypatch.setenv(LOADER_CACHE_ENV, "true")
-    monkeypatch.setenv("HOME", str(tmp_path))
     kwargs = {
         "source": "tushare",
         "symbol": "000001.SZ",
@@ -333,9 +382,9 @@ def test_tushare_daily_fetch_uses_opt_in_cache_for_bars_and_fields(
     tmp_path,
     monkeypatch,
     fake_duckdb,
+    loader_cache_root,
 ):
     monkeypatch.setenv(LOADER_CACHE_ENV, "yes")
-    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("TUSHARE_TOKEN", "test-token")
 
     class _FakeApi:
@@ -394,10 +443,9 @@ def test_loader_cache_range_is_final_only_for_settled_past():
     assert loader_cache_range_is_final("not-a-date") is False
 
 
-def test_loader_cache_skips_unsettled_today_range(tmp_path, monkeypatch):
+def test_loader_cache_skips_unsettled_today_range(tmp_path, monkeypatch, loader_cache_root):
     """A range ending today must never be cached: its last bar is still forming."""
     monkeypatch.setenv(LOADER_CACHE_ENV, "1")
-    monkeypatch.setenv("HOME", str(tmp_path))
     today = dt.date.today().isoformat()
     start = (dt.date.today() - dt.timedelta(days=5)).isoformat()
     kwargs = {
@@ -413,14 +461,13 @@ def test_loader_cache_skips_unsettled_today_range(tmp_path, monkeypatch):
 
     assert loader_cache_get(**kwargs) is None
     assert not loader_cache_path(**kwargs).exists()
-    assert not (tmp_path / ".vibe-trading").exists()
+    assert not loader_cache_root.exists()
 
 
-def test_loader_cache_real_duckdb_round_trip(tmp_path, monkeypatch):
+def test_loader_cache_real_duckdb_round_trip(tmp_path, monkeypatch, loader_cache_root):
     """Exercise the real duckdb -> parquet -> duckdb path (CI mocks duckdb elsewhere)."""
     pytest.importorskip("duckdb")
     monkeypatch.setenv(LOADER_CACHE_ENV, "1")
-    monkeypatch.setenv("HOME", str(tmp_path))
     frame = _cache_frame()
     kwargs = {
         "source": "yfinance",
@@ -443,10 +490,9 @@ def test_loader_cache_real_duckdb_round_trip(tmp_path, monkeypatch):
     pd.testing.assert_frame_equal(restored, frame)
 
 
-def test_yfinance_loader_serves_second_fetch_from_cache(tmp_path, monkeypatch, fake_duckdb):
+def test_yfinance_loader_serves_second_fetch_from_cache(tmp_path, monkeypatch, fake_duckdb, loader_cache_root):
     """A batch loader (yfinance) must skip its bulk download on a full cache hit."""
     monkeypatch.setenv(LOADER_CACHE_ENV, "1")
-    monkeypatch.setenv("HOME", str(tmp_path))
     import backtest.loaders.yfinance_loader as yfl
 
     calls = {"n": 0}

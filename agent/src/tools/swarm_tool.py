@@ -11,7 +11,6 @@ import logging
 import os
 import re
 import time
-from pathlib import Path
 from typing import Any
 
 from src.agent.tools import BaseTool
@@ -19,7 +18,15 @@ from src.agent.tools import BaseTool
 logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_SECONDS = 5
-_MAX_WAIT_SECONDS = int(os.getenv("SWARM_TIMEOUT", "1800"))
+
+
+def _max_wait_seconds() -> int:
+    import sys as _sys
+    _mod = _sys.modules.get(__name__)
+    if _mod is not None and "_MAX_WAIT_SECONDS" in _mod.__dict__:
+        return _mod.__dict__["_MAX_WAIT_SECONDS"]
+    from src.config.accessor import get_env_config
+    return get_env_config().swarm.swarm_timeout
 
 # Preset matching: (preset_name, keyword_patterns, weight_boost). Patterns match user intent (EN + ZH).
 _PRESET_KEYWORDS: list[tuple[str, list[str], float]] = [
@@ -235,6 +242,22 @@ _PRESET_KEYWORDS: list[tuple[str, list[str], float]] = [
         0.9,
     ),
     (
+        "value_investing_committee",
+        [
+            r"value\s+investing",
+            "价值投资",
+            r"\bbuffett\b",
+            "巴菲特",
+            r"\bmunger\b",
+            "芒格",
+            "段永平",
+            "李录",
+            "四大师",
+            r"four\s+master",
+        ],
+        0.9,
+    ),
+    (
         "investment_committee",
         [
             r"investment\s+committee",
@@ -425,9 +448,25 @@ _CONTINUATION_PATTERNS = (
 
 
 def _normalize_preset_name(value: str) -> str | None:
-    """Normalize an explicit preset name and validate it against bundled presets."""
+    """Normalize an explicit preset name and validate it resolves to a preset.
+
+    Names in the static routing table are accepted as before. Names outside it
+    are accepted only when they resolve to an actual preset file — which lets
+    explicitly named user presets (``~/.vibe-trading/swarm/presets/``) run
+    through this tool. Keyword ROUTING stays limited to the curated table: a
+    user preset is reachable only by naming it, never by keyword match.
+    """
     normalized = re.sub(r"[\s-]+", "_", value.strip().lower())
-    return normalized if normalized in _PRESET_NAMES else None
+    if normalized in _PRESET_NAMES:
+        return normalized
+    from src.swarm.presets import resolve_preset_path
+
+    try:
+        if resolve_preset_path(normalized) is not None:
+            return normalized
+    except ValueError:
+        return None
+    return None
 
 
 def _has_preset_signal(prompt: str) -> bool:
@@ -454,7 +493,10 @@ def _resolve_preset(prompt: str, explicit_preset: str | None = None) -> tuple[st
         preset = _normalize_preset_name(explicit_preset)
         if preset is None:
             available = ", ".join(sorted(_PRESET_NAMES))
-            return None, f"Unknown preset_name '{explicit_preset}'. Available presets: {available}"
+            return None, (
+                f"Unknown preset_name '{explicit_preset}'. Available presets: {available}. "
+                "User presets in ~/.vibe-trading/swarm/presets/ are also accepted by name."
+            )
         return preset, None
 
     if _looks_like_continuation_prompt(prompt) and not _has_preset_signal(prompt):
@@ -624,6 +666,7 @@ def _build_variables(preset_name: str, prompt: str) -> dict[str, str]:
         "geopolitical_war_room": {"crisis": g, "market": market},
         "pairs_research_lab": {"market": market, "sector": _extract_sector(prompt)},
         "investment_committee": {"target": g, "market": market},
+        "value_investing_committee": {"company": g, "market": market},
         "macro_strategy_forum": {"market": market, "horizon": "quarterly"},
         "statistical_arbitrage_desk": {"market": market, "goal": g, "sector": _extract_sector(prompt)},
         "sentiment_intelligence_team": {"market": market, "timeframe": "daily"},
@@ -728,18 +771,20 @@ class SwarmTool(BaseTool):
 
         from src.config import load_swarm_agent_config
         from src.swarm.runtime import SwarmRuntime
-        from src.swarm.store import SwarmStore
+        from src.swarm.store import SwarmStore, swarm_runs_root
 
-        swarm_base_dir = Path(__file__).resolve().parents[2] / ".swarm" / "runs"
+        swarm_base_dir = swarm_runs_root()
         swarm_base_dir.mkdir(parents=True, exist_ok=True)
         store = SwarmStore(base_dir=swarm_base_dir)
         # Boot-time / operator-trusted: even when reached via the in-process
         # agent tool, the config path is resolved from disk / env, never from
         # the calling LLM's prompt (R-06).
         agent_config = load_swarm_agent_config()
+        from src.config.accessor import get_env_config
+
         runtime = SwarmRuntime(
             store=store,
-            max_workers=int(os.getenv("SWARM_MAX_WORKERS", "4")),
+            max_workers=get_env_config().swarm.swarm_max_workers,
             agent_config=agent_config,
         )
 
@@ -802,7 +847,8 @@ class SwarmTool(BaseTool):
         pending_live_events.clear()
 
         t0 = time.monotonic()
-        while time.monotonic() - t0 < _MAX_WAIT_SECONDS:
+        max_wait = _max_wait_seconds()
+        while time.monotonic() - t0 < max_wait:
             time.sleep(_POLL_INTERVAL_SECONDS)
 
             loaded = store.load_run(run_id)
@@ -828,7 +874,7 @@ class SwarmTool(BaseTool):
             )
 
         return json.dumps(
-            {"status": "timeout", "error": f"Swarm run {run_id} timed out after {_MAX_WAIT_SECONDS}s"},
+            {"status": "timeout", "error": f"Swarm run {run_id} timed out after {max_wait}s"},
             ensure_ascii=False,
         )
 
@@ -873,3 +919,9 @@ def _format_result(
         },
     }
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def __getattr__(name: str):
+    if name == "_MAX_WAIT_SECONDS":
+        return _max_wait_seconds()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

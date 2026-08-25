@@ -20,11 +20,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from typing import Any
 
 from backtest.loaders._http import resolve_min_interval, throttled_get_json
 from src.agent.tools import BaseTool
+from src.config.accessor import get_env_config
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +103,7 @@ class FredMacroTool(BaseTool):
             ``True`` when ``FRED_API_KEY`` is set in the environment, otherwise
             ``False`` so the tool is silently excluded from the registry.
         """
-        return bool(os.getenv("FRED_API_KEY"))
+        return bool(get_env_config().data.fred_api_key)
 
     def execute(self, **kwargs: Any) -> str:
         """Fetch one FRED series and return a JSON envelope.
@@ -119,7 +119,7 @@ class FredMacroTool(BaseTool):
             "data": {"series_id", "observations": [{"date", "value"}, ...],
             "count"}}``. On failure: ``{"ok": false, "error": str}``.
         """
-        api_key = os.getenv("FRED_API_KEY")
+        api_key = get_env_config().data.fred_api_key or None
         if not api_key:
             return _error("FRED_API_KEY is not configured")
 
@@ -228,7 +228,7 @@ def _clamp_limit(value: Any) -> int:
     """Coerce a requested observation count into the supported range."""
     try:
         n = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return _DEFAULT_LIMIT
     return max(1, min(n, _MAX_LIMIT))
 

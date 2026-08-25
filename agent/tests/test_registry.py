@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-import pandas as pd
 import pytest
 
 from backtest.loaders.base import DataLoaderProtocol, NoAvailableSourceError
@@ -133,18 +132,28 @@ class TestProtocol:
 
 class TestFallbackChains:
     def test_all_expected_markets_present(self) -> None:
-        expected = {"a_share", "us_equity", "hk_equity", "crypto", "futures", "fund", "macro", "forex"}
+        expected = {
+            "a_share", "us_equity", "hk_equity", "india_equity", "kr_equity",
+            "ca_equity", "vietnam_equity", "crypto", "futures", "fund", "macro",
+            "forex",
+        }
         assert expected == set(FALLBACK_CHAINS.keys())
+
+    def test_canada_chain_uses_only_compatible_sources(self) -> None:
+        assert FALLBACK_CHAINS["ca_equity"] == ["yahoo", "yfinance", "local"]
+
+    def test_vietnam_chain_uses_only_compatible_sources(self) -> None:
+        assert FALLBACK_CHAINS["vietnam_equity"] == ["yahoo", "yfinance", "local"]
 
     def test_chains_are_non_empty(self) -> None:
         for market, chain in FALLBACK_CHAINS.items():
             assert len(chain) > 0, f"Fallback chain for {market} is empty"
 
     def test_crypto_chain_includes_yfinance_fallback(self) -> None:
-        """yfinance is the third-tier fallback for crypto when OKX and CCXT fail."""
+        """yfinance is a fallback for crypto when OKX, Binance and CCXT fail."""
         assert "yfinance" in FALLBACK_CHAINS["crypto"]
-        # OKX and CCXT should still be preferred
-        assert FALLBACK_CHAINS["crypto"][:2] == ["okx", "ccxt"]
+        # OKX, Binance and CCXT should be preferred in that order
+        assert FALLBACK_CHAINS["crypto"][:3] == ["okx", "binance", "ccxt"]
 
     def test_chains_ordered_by_ip_ban_risk(self) -> None:
         """Equity chains lead with throttle-tolerant public sources and trail
@@ -154,10 +163,10 @@ class TestFallbackChains:
         ]
         assert FALLBACK_CHAINS["us_equity"] == [
             "yahoo", "stooq", "sina", "eastmoney", "yfinance", "tiingo", "fmp",
-            "finnhub", "alphavantage", "akshare", "local",
+            "finnhub", "alphavantage", "longbridge", "akshare", "local",
         ]
         assert FALLBACK_CHAINS["hk_equity"] == [
-            "eastmoney", "yahoo", "futu", "yfinance", "akshare", "local",
+            "tencent", "eastmoney", "yahoo", "futu", "akshare", "yfinance", "tushare", "longbridge", "local",
         ]
 
     def test_us_equity_includes_sina_fallback(self) -> None:
@@ -174,11 +183,22 @@ class TestFallbackChains:
 
     def test_unchanged_chains_preserved(self) -> None:
         """crypto/futures/fund/macro/forex chains must be left untouched."""
-        assert FALLBACK_CHAINS["crypto"] == ["okx", "ccxt", "yfinance", "local"]
+        assert FALLBACK_CHAINS["crypto"] == ["okx", "binance", "ccxt", "yfinance", "local"]
         assert FALLBACK_CHAINS["futures"] == ["tushare", "akshare", "local"]
         assert FALLBACK_CHAINS["fund"] == ["tushare", "akshare", "local"]
         assert FALLBACK_CHAINS["macro"] == ["akshare", "tushare", "local"]
-        assert FALLBACK_CHAINS["forex"] == ["akshare", "yfinance", "local"]
+        # mt5 heads the forex chain (terminal feed when attached), degrading to
+        # the previous chain unchanged.
+        assert FALLBACK_CHAINS["forex"] == ["mt5", "akshare", "yfinance", "local"]
+
+    def test_tickerall_is_explicit_only_never_a_fallback(self) -> None:
+        """TickerAll is a valid explicit source but must NEVER join an automatic
+        fallback chain. It reads a user's own broker account over a hosted API, so
+        it runs only on a deliberate ``source="tickerall"`` request - never silently
+        as a degradation target for another source. This guards that contract."""
+        assert "tickerall" in VALID_SOURCES
+        for market, chain in FALLBACK_CHAINS.items():
+            assert "tickerall" not in chain, f"tickerall must not be in the {market} fallback chain"
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +214,12 @@ class TestValidSources:
             "finnhub", "alphavantage", "tiingo", "fmp",
         }
         assert new_sources <= VALID_SOURCES
+
+    def test_includes_binance(self) -> None:
+        """Binance was added as a dedicated crypto source alongside OKX so the
+        market_data fallback chain can fall through without aliasing CCXT. A
+        config with ``source: binance`` must validate against VALID_SOURCES."""
+        assert "binance" in VALID_SOURCES
 
     def test_covers_all_registered_loaders(self) -> None:
         """Every registered loader name must be an accepted config source so a
@@ -291,6 +317,32 @@ class TestGetLoaderWithFallback:
         assert "local" in msg
         # The error must point the user at the Data Bridge config, not a network hop.
         assert "data-bridge" in msg.lower() or "config" in msg.lower()
+
+    def test_explicit_tickerall_does_not_fall_through_to_network(self) -> None:
+        """An explicit unavailable 'tickerall' must raise, never silently degrade to a
+        public forex source (akshare/yfinance) via its markets — it reads the user's own
+        broker account, so a missing key is a config error to surface, not paper over."""
+        class _FakeTickerall:
+            name = "tickerall"
+            markets = {"forex"}
+            requires_auth = True
+
+            def is_available(self) -> bool:
+                return False
+
+            def fetch(self, codes, start_date, end_date, *, interval="1D", fields=None):
+                return {}
+
+        with patch.dict(LOADER_REGISTRY, {
+            "tickerall": _FakeTickerall,
+            "fake_available": _FakeAvailableLoader,  # an available loader listed in the forex chain
+        }, clear=True):
+            with patch.dict(FALLBACK_CHAINS, {"forex": ["fake_available"]}):
+                with pytest.raises(NoAvailableSourceError) as excinfo:
+                    get_loader_cls_with_fallback("tickerall")
+        msg = str(excinfo.value)
+        assert "tickerall" in msg
+        assert "TICKERALL_API_KEY" in msg
 
 
 # ---------------------------------------------------------------------------

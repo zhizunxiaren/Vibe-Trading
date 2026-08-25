@@ -22,7 +22,6 @@ the user-home loader cache via :func:`cached_loader_fetch`.
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -161,7 +160,9 @@ class DataLoader:
 
     def is_available(self) -> bool:
         """Return whether a Finnhub API key is present in the environment."""
-        return bool(os.getenv(_API_KEY_ENV))
+        from src.config.accessor import get_env_config
+
+        return bool(get_env_config().data.finnhub_api_key)
 
     def fetch(
         self,
@@ -196,7 +197,17 @@ class DataLoader:
         del fields
         validate_date_range(start_date, end_date)
 
-        api_key = os.getenv(_API_KEY_ENV)
+        # Daily-only candle resolution; do not silently return day bars for ``1H``.
+        if str(interval).strip().lower() not in {"1d", "d", "day", "daily"}:
+            logger.warning(
+                "finnhub supports daily bars only; rejecting interval=%r",
+                interval,
+            )
+            return {}
+
+        from src.config.accessor import get_env_config
+
+        api_key = get_env_config().data.finnhub_api_key
         if not api_key:
             logger.warning("finnhub fetch skipped: %s not set", _API_KEY_ENV)
             return {}

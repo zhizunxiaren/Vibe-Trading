@@ -8,22 +8,18 @@ Usage: ``python -m backtest.runner <run_dir>``
 """
 
 import ast
+import copy
 import importlib.util
 import inspect
 import json
 import logging
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Literal, Optional
 
 import pandas as pd
-from pydantic import BaseModel, ConfigDict, model_validator, field_validator
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+from pydantic import BaseModel, ConfigDict, Field, model_validator, field_validator
 
 from backtest.loaders.registry import (
     FALLBACK_CHAINS,
@@ -48,6 +44,19 @@ logger = logging.getLogger(__name__)
 
 _VALID_INTERVALS = {"1m", "5m", "15m", "30m", "1H", "4H", "1D"}
 _VALID_ENGINES = {"daily", "options"}
+_PRICE_PANEL_COLUMNS = ("open", "high", "low", "close", "volume", "vwap", "amount")
+_FUND_PREFIX = "fund:"
+
+
+@dataclass(frozen=True)
+class DataFetchResult:
+    """Market data plus the routing metadata selected by the central registry."""
+
+    data_map: Dict[str, pd.DataFrame]
+    codes: List[str]
+    source: str
+    loader: Any
+    effective_sources: List[str]
 
 
 class BacktestConfigSchema(BaseModel):
@@ -61,6 +70,19 @@ class BacktestConfigSchema(BaseModel):
     source: str = "tushare"
     interval: str = "1D"
     engine: str = "daily"
+    position_adjustment: Literal["hold", "rebalance"] = "hold"
+    # Under "rebalance", a resize executes only once the held weight has
+    # drifted further than this fraction of its target -- the tolerance band
+    # practitioners describe as "rebalance when weights move more than X".
+    # 0.0 is the historical behaviour and stays the default: without a band the
+    # resize test is decided by the slippage width alone, which re-pins a
+    # position on a one-basis-point move. A CHANGED target breaches any sane
+    # band on its own, so target changes always execute whatever this is set to.
+    rebalance_tolerance: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
+    # Returns divide by initial_cash, so a non-positive value yields inf/NaN
+    # metrics (total_return, annual_return, ...). Reject it at the config
+    # boundary instead of letting the run produce non-finite results.
+    initial_cash: float = Field(default=1_000_000, gt=0, allow_inf_nan=False)
     fundamental_fields: Optional[Dict[str, List[str]]] = None
     event_feeds: Optional[List[Dict[str, Any]]] = None
 
@@ -164,6 +186,17 @@ def _is_literal_node(node: ast.AST) -> bool:
     """Return whether an AST node is made only from literal values."""
     if isinstance(node, ast.Constant):
         return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        # Signed numbers (e.g. a mined ``-0.08`` return threshold) parse as a
+        # UnaryOp over a Constant rather than a bare Constant. They are
+        # compile-time constants: no name lookup, call, or attribute access
+        # runs when the definition is imported, so they stay import-time safe.
+        operand = node.operand
+        return (
+            isinstance(operand, ast.Constant)
+            and isinstance(operand.value, (int, float, complex))
+            and not isinstance(operand.value, bool)
+        )
     if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
         return all(_is_literal_node(item) for item in node.elts)
     if isinstance(node, ast.Dict):
@@ -240,6 +273,468 @@ def _validate_class_body(node: ast.ClassDef) -> None:
         )
 
 
+# --- Runtime-reachable operation scrubber (VT-001 defense-in-depth) ---
+#
+# The structural checks above only reject *import-time* execution. The real
+# exposure is that once ``SignalEngine`` is instantiated and ``.generate()`` is
+# called, arbitrary code inside its method bodies runs with no runtime sandbox.
+# This scrubber walks the code that actually executes during a backtest — every
+# ``SignalEngine`` method plus any module-level helper transitively called from
+# one — and rejects network / process-spawn / dynamic-exec / filesystem-write
+# operations there.
+#
+# It is deliberately scoped to *reachable* code, not the whole file: the bundled
+# skill examples (agent/src/skills/*/example_signal_engine.py) legitimately carry
+# ``import requests`` + ``requests.get`` inside standalone ``_fetch_okx`` helpers
+# and ``if __name__ == "__main__"`` demo blocks that the runner never executes
+# (it does ``import module; SignalEngine().generate(data_map)``). Blocking those
+# imports file-wide would reject strategies generated from ~12 shipped skills, so
+# we block the dangerous *use* along the executed path instead of a harmless
+# unused top-level import. Direct ``getattr``/``setattr``/``delattr`` indirection
+# onto ``os`` / forbidden modules is now rejected (see _reject_forbidden_getattr),
+# and a renamed binding no longer hides the root (see
+# _module_level_forbidden_aliases). This is defense-in-depth, not a kernel-level
+# guarantee: an AST denylist cannot be complete.
+#
+# MEASURED RESIDUAL, so it is not left implied. After the lists below, these
+# still reach the executed path: ``inspect``, ``operator``, ``threading``,
+# ``codeop``, ``tempfile``, and ``os.makedirs``. None of them reaches a broker
+# on its own — ``inspect``/``operator`` need an object you already hold,
+# ``threading`` runs code that is still in this file and gets scanned if it is
+# reachable, ``codeop`` yields a code object that needs the already-blocked
+# ``eval``/``exec`` to run, and the last two are filesystem, not the red line.
+# They are named here so the next person extends this list from evidence rather
+# than from a fresh survey.
+_FORBIDDEN_IMPORT_MODULES = frozenset(
+    {
+        "socket",
+        "socketserver",
+        "subprocess",
+        "urllib",
+        "urllib2",
+        "urllib3",
+        "http",
+        "requests",
+        "httpx",
+        "aiohttp",
+        "ftplib",
+        "smtplib",
+        "telnetlib",
+        "multiprocessing",
+        "ctypes",
+        # Modules that resolve or execute a module BY NAME. Blocking the
+        # ``src.trading`` prefix is worth nothing while any of these can fetch
+        # the same module from a string, and every one of them was measured
+        # ACCEPTED against the live scanner:
+        #   importlib.import_module("src.trading.service")
+        #   builtins.__import__("src.trading.service")
+        #   sys.modules["src.trading.service"]
+        #   pkgutil.resolve_name("src.trading.service:place_order")
+        #   runpy.run_module("src.trading.service")
+        # ``pickle``/``marshal`` belong here for the same reason: a crafted
+        # payload imports and calls through ``__reduce__`` without naming the
+        # module in the source at all. None has a use in a signal engine, which
+        # receives a data_map and returns signals.
+        "importlib",
+        "builtins",
+        "sys",
+        "pkgutil",
+        "runpy",
+        "pickle",
+        "marshal",
+        # Process spawn and filesystem reach, alongside the subprocess entry
+        # already above.
+        "shutil",
+        "webbrowser",
+        "gc",
+    }
+)
+# Project-internal subtrees that reach a broker. The red line is that no
+# research or backtest path can arrive at a connector's ``place_order``, and
+# until now that separation rested on the subprocess never being handed
+# credentials rather than on the scanner refusing the import. It refuses now.
+#
+# These are matched on the dotted PREFIX rather than the root package, because
+# the root is ``src`` — which also holds ``src.quantlib``, the finance-math
+# layer strategies are explicitly meant to import (see the credit-analysis
+# skill). Blocking the root would take that away to close this.
+_FORBIDDEN_IMPORT_PREFIXES = (
+    "src.trading",
+    "src.live",
+    "agent.src.trading",
+    "agent.src.live",
+    "trading.connectors",
+    "live.sdk_order_gate",
+)
+
+
+def _is_forbidden_module_path(name: str) -> bool:
+    """Return True when a dotted module path names a forbidden module or subtree.
+
+    Args:
+        name: Dotted module path, e.g. ``socket`` or ``src.trading.service``.
+
+    Returns:
+        True when the root package is forbidden outright, or the path falls
+        inside a forbidden subtree.
+    """
+    if not name:
+        return False
+    if name.split(".")[0] in _FORBIDDEN_IMPORT_MODULES:
+        return True
+    return any(
+        name == prefix or name.startswith(prefix + ".")
+        for prefix in _FORBIDDEN_IMPORT_PREFIXES
+    )
+# ``os`` itself is allowed (os.path etc.), but these attributes shell out, spawn,
+# or read the process environment — none has a place in a signal engine.
+_FORBIDDEN_OS_ATTRS = frozenset(
+    {
+        "system",
+        "popen",
+        "popen2",
+        "popen3",
+        "popen4",
+        "fork",
+        "forkpty",
+        "putenv",
+        "unsetenv",
+        "getenv",
+        "environ",
+        "environb",
+        "startfile",
+        # Filesystem mutation, alongside the open()/pathlib write guards. A
+        # signal engine returns signals; deleting or renaming files is not part
+        # of that contract, and os.remove was measured ACCEPTED.
+        "remove",
+        "unlink",
+        "rmdir",
+        "removedirs",
+        "rename",
+        "renames",
+        "replace",
+        "truncate",
+        "chmod",
+        "chown",
+        "symlink",
+        "link",
+    }
+)
+# The object graph is the last structural route to a module the import checks
+# refuse: ``().__class__.__mro__[1].__subclasses__()`` reaches every loaded
+# class without naming one, and ``(lambda: 0).__globals__['__builtins__']``
+# hands back the builtins mapping that ``_FORBIDDEN_BUILTINS`` exists to gate.
+# Both were measured ACCEPTED.
+#
+# Only the traversal attributes are listed, not every dunder: a signal engine
+# has no reason to walk ``__mro__`` or read ``__globals__``, but banning dunders
+# wholesale would reject ordinary code. This does not make the sandbox complete
+# — see the residual note on _FORBIDDEN_IMPORT_MODULES.
+_FORBIDDEN_DUNDER_ATTRS = frozenset(
+    {
+        "__class__",
+        "__bases__",
+        "__base__",
+        "__mro__",
+        "__subclasses__",
+        "__globals__",
+        "__builtins__",
+        "__code__",
+        "__closure__",
+        "__func__",
+        "__self__",
+        "__reduce__",
+        "__reduce_ex__",
+        "__getattribute__",
+        "__init_subclass__",
+        "__subclasshook__",
+    }
+)
+_FORBIDDEN_BUILTINS = frozenset(
+    {"eval", "exec", "compile", "__import__", "globals", "locals", "vars", "breakpoint"}
+)
+# getattr/setattr/delattr can indirect around the attribute scanner
+# (``getattr(os, "system")("id")``). We reject them ONLY when the target object
+# is ``os`` or a forbidden module — keyed off the target, not the attribute
+# string, so ``getattr(os, "sys" + "tem")`` is caught too. Legitimate dynamic
+# access on user objects (``getattr(tech, name, None)``, ``getattr(self, x)``)
+# is unaffected.
+_GETATTR_INDIRECTION = frozenset({"getattr", "setattr", "delattr"})
+_OPEN_WRITE_MODE_CHARS = frozenset("wax+")
+_SCRUB_MSG = "is not allowed inside generated strategy code"
+
+
+def _is_forbidden_os_attr(attr: str) -> bool:
+    """Return whether ``os.<attr>`` shells out, spawns, execs, or reads env."""
+    return attr in _FORBIDDEN_OS_ATTRS or attr.startswith(("spawn", "exec"))
+
+
+def _attribute_root_name(node: ast.Attribute) -> str | None:
+    """Return the leftmost ``Name`` id of an attribute chain (``a.b.c`` -> ``a``)."""
+    current: ast.AST = node
+    while isinstance(current, ast.Attribute):
+        current = current.value
+    return current.id if isinstance(current, ast.Name) else None
+
+
+def _attribute_dotted_path(node: ast.Attribute) -> str | None:
+    """Rebuild the dotted path of an attribute chain (``a.b.c`` -> ``a.b.c``).
+
+    The root name alone cannot decide a forbidden-subtree check: ``src`` is
+    shared by the blocked ``src.trading`` and the permitted ``src.quantlib``.
+
+    Args:
+        node: Attribute node at the end of the chain.
+
+    Returns:
+        The dotted path, or None when the chain is not rooted in a plain name
+        (e.g. it starts from a call or subscript).
+    """
+    parts: list[str] = []
+    current: ast.AST = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return None
+    parts.append(current.id)
+    return ".".join(reversed(parts))
+
+
+def _reject_forbidden_open(node: ast.Call) -> None:
+    """Reject ``open()`` used to write files or read a non-relative-literal path."""
+    func = node.func
+    is_builtin_open = isinstance(func, ast.Name) and func.id == "open"
+    is_io_os_open = (
+        isinstance(func, ast.Attribute)
+        and func.attr == "open"
+        and isinstance(func.value, ast.Name)
+        and func.value.id in {"io", "os"}
+    )
+    if not (is_builtin_open or is_io_os_open):
+        return
+
+    mode_node: ast.AST | None = node.args[1] if len(node.args) >= 2 else None
+    for kw in node.keywords:
+        if kw.arg == "mode":
+            mode_node = kw.value
+    if mode_node is not None:
+        if not (isinstance(mode_node, ast.Constant) and isinstance(mode_node.value, str)):
+            raise ValueError(f"open() with a non-literal mode {_SCRUB_MSG}")
+        if any(ch in _OPEN_WRITE_MODE_CHARS for ch in mode_node.value):
+            raise ValueError(f"Writing files via open(mode={mode_node.value!r}) {_SCRUB_MSG}")
+
+    path_node = node.args[0] if node.args else None
+    if not (isinstance(path_node, ast.Constant) and isinstance(path_node.value, str)):
+        raise ValueError(f"open() with a non-literal path {_SCRUB_MSG}")
+    path = path_node.value
+    if path.startswith(("/", "~", "\\")) or ".." in path or (len(path) > 1 and path[1] == ":"):
+        raise ValueError(f"open() with a non-relative path {path!r} {_SCRUB_MSG}")
+
+
+def _reject_forbidden_pathlib_write(node: ast.Call) -> None:
+    """Reject the pathlib spellings of a file write that ``open()`` already bars.
+
+    ``_reject_forbidden_open`` refuses ``open(path, "w")``, but the identical
+    write reaches disk through ``Path(p).write_text()``, ``.write_bytes()`` and
+    ``Path(p).open("w")``, none of which that check can see — it only matches a
+    bare ``open`` or ``io``/``os.open``. The guard therefore did not do the one
+    thing it says it does. Measured against the live scanner,
+    ``Path('/tmp/x').write_text('x')`` was ACCEPTED.
+
+    Matching is on the method name rather than on proving the receiver is a
+    ``Path``: the receiver is usually a call expression, and a signal engine
+    that defines its own ``write_text`` is not a pattern worth preserving. A
+    strategy is handed a data_map and returns signals; it writes nothing.
+
+    Args:
+        node: Call node on the executed path.
+
+    Raises:
+        ValueError: If the call writes to the filesystem.
+    """
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return
+    if func.attr in {"write_text", "write_bytes"}:
+        raise ValueError(f"Writing files via .{func.attr}() {_SCRUB_MSG}")
+    if func.attr != "open":
+        return
+    if isinstance(func.value, ast.Name) and func.value.id in {"io", "os"}:
+        return  # module-level open(path, mode) — _reject_forbidden_open owns it
+    # A BOUND ``.open()`` takes the mode first: the receiver is not an argument,
+    # so the index is 0 here where the module-level form uses 1.
+    mode_node: ast.AST | None = node.args[0] if node.args else None
+    for kw in node.keywords:
+        if kw.arg == "mode":
+            mode_node = kw.value
+    if mode_node is None:
+        return
+    if not (isinstance(mode_node, ast.Constant) and isinstance(mode_node.value, str)):
+        raise ValueError(f".open() with a non-literal mode {_SCRUB_MSG}")
+    if any(ch in _OPEN_WRITE_MODE_CHARS for ch in mode_node.value):
+        raise ValueError(f"Writing files via .open(mode={mode_node.value!r}) {_SCRUB_MSG}")
+
+
+def _reject_forbidden_getattr(node: ast.Call) -> None:
+    """Reject getattr/setattr/delattr indirection onto ``os`` / forbidden modules.
+
+    Closes the documented bypass ``getattr(os, "system")("id")`` — and computed
+    variants like ``getattr(os, "sys" + "tem")`` — by keying off the *target*
+    object (first positional arg), not the attribute string. Dynamic access on
+    ordinary user objects (``getattr(tech, name, None)``) is left untouched.
+    """
+    func = node.func
+    if not (isinstance(func, ast.Name) and func.id in _GETATTR_INDIRECTION):
+        return
+    if not node.args:
+        return
+    target = node.args[0]
+    if isinstance(target, ast.Name):
+        root: str | None = target.id
+    elif isinstance(target, ast.Attribute):
+        root = _attribute_root_name(target)
+        dotted = _attribute_dotted_path(target)
+        if dotted and _is_forbidden_module_path(dotted):
+            raise ValueError(f"{func.id}() indirection onto {dotted!r} {_SCRUB_MSG}")
+    else:
+        root = None
+    if root == "os" or root in _FORBIDDEN_IMPORT_MODULES:
+        raise ValueError(f"{func.id}() indirection onto {root!r} {_SCRUB_MSG}")
+
+
+def _reject_forbidden_node(node: ast.AST) -> None:
+    """Raise ``ValueError`` if a single AST node performs a forbidden operation."""
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            if _is_forbidden_module_path(alias.name):
+                raise ValueError(f"Import of {alias.name!r} {_SCRUB_MSG}")
+    elif isinstance(node, ast.ImportFrom):
+        module = node.module or ""
+        root = module.split(".")[0]
+        if _is_forbidden_module_path(module):
+            raise ValueError(f"Import from {node.module!r} {_SCRUB_MSG}")
+        # "from src.trading import service" names the subtree in the alias,
+        # not the module, so the prefix check above cannot see it.
+        for alias in node.names:
+            if _is_forbidden_module_path(f"{module}.{alias.name}" if module else alias.name):
+                raise ValueError(f"Import of {module}.{alias.name!r} {_SCRUB_MSG}")
+        if root == "os":
+            for alias in node.names:
+                if _is_forbidden_os_attr(alias.name):
+                    raise ValueError(f"Import of os.{alias.name} {_SCRUB_MSG}")
+    elif isinstance(node, ast.Attribute):
+        root = _attribute_root_name(node)
+        if root in _FORBIDDEN_IMPORT_MODULES:
+            raise ValueError(f"Use of {root}.{node.attr} {_SCRUB_MSG}")
+        dotted = _attribute_dotted_path(node)
+        if dotted and _is_forbidden_module_path(dotted):
+            raise ValueError(f"Use of {dotted} {_SCRUB_MSG}")
+        if root == "os" and _is_forbidden_os_attr(node.attr):
+            raise ValueError(f"Use of os.{node.attr} {_SCRUB_MSG}")
+        if node.attr in _FORBIDDEN_DUNDER_ATTRS:
+            raise ValueError(f"Object-graph traversal via .{node.attr} {_SCRUB_MSG}")
+    elif isinstance(node, ast.Name):
+        if node.id in _FORBIDDEN_BUILTINS:
+            raise ValueError(f"Use of {node.id!r} {_SCRUB_MSG}")
+    elif isinstance(node, ast.Call):
+        _reject_forbidden_open(node)
+        _reject_forbidden_pathlib_write(node)
+        _reject_forbidden_getattr(node)
+
+
+def _module_level_forbidden_aliases(tree: ast.Module) -> dict[str, str]:
+    """Map module-level names that are bound to a forbidden module.
+
+    Module-level imports are deliberately not rejected outright (see the
+    ``_FORBIDDEN_IMPORT_MODULES`` comment): the shipped skill examples carry an
+    unused ``import requests`` beside a helper the runner never reaches, and a
+    file-wide import block would reject strategies generated from them. The
+    compensating check is on the *use* along the executed path — but that check
+    matches dotted chains rooted in the module's own name, so a binding that
+    renames it slipped past both::
+
+        from socket import socket as S              ->  S()
+        import socket as sk                         ->  sk.socket()
+        from src.trading.service import place_order ->  place_order(1)
+
+    This recovers the binding so the use site can be judged by what the name
+    actually refers to, which closes the aliasing half of the VT-001 residual
+    without touching the harmless unused import.
+
+    Args:
+        tree: Parsed signal engine module.
+
+    Returns:
+        Bound name -> the dotted path it refers to, for forbidden targets only.
+    """
+    aliases: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            # A plain ``import socket`` needs no entry: its use is a dotted
+            # chain rooted in ``socket``, which the attribute check already
+            # rejects. Only a rename hides that root.
+            for alias in node.names:
+                if alias.asname and _is_forbidden_module_path(alias.name):
+                    aliases[alias.asname] = alias.name
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            for alias in node.names:
+                target = f"{module}.{alias.name}" if module else alias.name
+                if (
+                    _is_forbidden_module_path(module)
+                    or _is_forbidden_module_path(target)
+                    or (module.split(".")[0] == "os" and _is_forbidden_os_attr(alias.name))
+                ):
+                    aliases[alias.asname or alias.name] = target
+    return aliases
+
+
+def _scan_runtime_reachable(tree: ast.Module) -> None:
+    """Reject forbidden ops in ``SignalEngine`` methods + their transitive callees.
+
+    Entry points are every method defined directly on the ``SignalEngine`` class.
+    From there, any bare-name call that resolves to a module-level function is
+    followed and scanned too, so a payload hidden in a helper that ``generate()``
+    calls is still caught. Module-level functions never reached from a
+    ``SignalEngine`` method (standalone data-fetch helpers, ``__main__`` demos)
+    are intentionally left unscanned.
+    """
+    engine_cls = next(
+        (n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SignalEngine"),
+        None,
+    )
+    if engine_cls is None:
+        return
+
+    module_funcs = {
+        n.name: n
+        for n in tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    worklist: list[ast.AST] = [
+        m for m in engine_cls.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    aliases = _module_level_forbidden_aliases(tree)
+    visited: set[int] = set()
+    while worklist:
+        fn = worklist.pop()
+        if id(fn) in visited:
+            continue
+        visited.add(id(fn))
+        for node in ast.walk(fn):
+            _reject_forbidden_node(node)
+            if isinstance(node, ast.Name) and node.id in aliases:
+                raise ValueError(
+                    f"Use of {node.id!r}, bound at module level to "
+                    f"{aliases[node.id]!r}, {_SCRUB_MSG}"
+                )
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                target = module_funcs.get(node.func.id)
+                if target is not None:
+                    worklist.append(target)
+
+
 def _validate_signal_engine_source(file_path: Path) -> None:
     """Reject import-time executable statements before loading signal_engine.py."""
     try:
@@ -268,6 +763,10 @@ def _validate_signal_engine_source(file_path: Path) -> None:
         raise ValueError(
             f"Executable top-level statement {type(node).__name__} is not allowed"
         )
+
+    # Deep pass: the structural loop above only guards import-time execution;
+    # this walks the code that runs on SignalEngine().generate() (VT-001).
+    _scan_runtime_reachable(tree)
 
 
 def _validate_signal_engine_class(engine_cls) -> None:
@@ -300,6 +799,10 @@ _MARKET_TO_SOURCE = {
     "a_share": "tushare",
     "us_equity": "yfinance",
     "hk_equity": "yfinance",
+    "india_equity": "yahoo",
+    "kr_equity": "pykrx",
+    "ca_equity": "yahoo",
+    "vietnam_equity": "yahoo",
     "crypto": "okx",
     "futures": "tushare",
     "fund": "tushare",
@@ -386,6 +889,252 @@ def _normalize_codes(codes: List[str], source: str) -> List[str]:
     return codes
 
 
+def _restore_original_codes(
+    data_map: dict,
+    original_codes: List[str],
+    normalized_codes: List[str],
+) -> dict:
+    """Map provider-normalized result keys back to requested symbols."""
+    aliases = dict(zip(normalized_codes, original_codes))
+    return {aliases.get(code, code): frame for code, frame in data_map.items()}
+
+
+def _columns_required_from_factor_spec(spec: Any) -> list[str]:
+    """Extract ``columns_required`` from supported factor spec shapes.
+
+    Args:
+        spec: Factor metadata as a dict, an Alpha-like object with ``meta``, an
+            object with ``columns_required``, or a raw string alpha id.
+
+    Returns:
+        Declared panel columns, or an empty list when the shape has none.
+    """
+    if isinstance(spec, dict):
+        meta = spec.get("meta")
+        if isinstance(meta, dict):
+            return [str(c) for c in meta.get("columns_required", [])]
+        return [str(c) for c in spec.get("columns_required", [])]
+    meta = getattr(spec, "meta", None)
+    if isinstance(meta, dict):
+        return [str(c) for c in meta.get("columns_required", [])]
+    columns = getattr(spec, "columns_required", None)
+    if columns is not None:
+        return [str(c) for c in columns]
+    return []
+
+
+def _selected_factor_specs(config: dict) -> list[Any]:
+    """Return selected factor metadata configured for the run.
+
+    The current runner has no dedicated factor-zoo execution path, so this
+    accepts the shapes used by callers that already know factor metadata
+    (``selected_factors``/``factors``/``alpha_metas``) and alpha-id lists that
+    can be resolved through the registry.
+
+    Args:
+        config: Backtest config.
+
+    Returns:
+        Factor specs or metadata dictionaries.
+    """
+    specs: list[Any] = []
+    for key in ("selected_factors", "factors", "alpha_metas"):
+        raw = config.get(key)
+        if isinstance(raw, list):
+            specs.extend(raw)
+        elif raw:
+            specs.append(raw)
+
+    alpha_ids: list[str] = []
+    for key in ("alpha_ids", "factor_ids", "alphas"):
+        raw = config.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, str):
+            alpha_ids.append(raw)
+        else:
+            alpha_ids.extend(str(item) for item in raw)
+
+    if alpha_ids:
+        from src.factors.registry import get_default_registry
+
+        registry = get_default_registry()
+        for alpha_id in alpha_ids:
+            try:
+                specs.append(registry.get(alpha_id).meta)
+            except KeyError:
+                logger.warning("selected alpha_id %r is not registered; skipping", alpha_id)
+    return specs
+
+
+def _fund_columns_required(selected_factors: Iterable[Any]) -> list[str]:
+    """Collect requested ``fund:*`` panel columns from selected factors.
+
+    Args:
+        selected_factors: Factor metadata/spec objects.
+
+    Returns:
+        Stable, de-duplicated ``fund:*`` column names.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for spec in selected_factors:
+        for column in _columns_required_from_factor_spec(spec):
+            if not column.startswith(_FUND_PREFIX) or column in seen:
+                continue
+            seen.add(column)
+            out.append(column)
+    return out
+
+
+def _build_price_panel(data_map: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """Convert ``code -> OHLCV frame`` rows into the factor panel shape.
+
+    Args:
+        data_map: Backtest loader output.
+
+    Returns:
+        ``column -> dates x symbols`` panel for price columns present in the
+        data map.
+    """
+    panel: dict[str, pd.DataFrame] = {}
+    for column in _PRICE_PANEL_COLUMNS:
+        series_by_symbol = {
+            symbol: frame[column]
+            for symbol, frame in data_map.items()
+            if column in frame.columns
+        }
+        if series_by_symbol:
+            panel[column] = pd.DataFrame(series_by_symbol)
+    return panel
+
+
+def _nan_fundamental_frame(
+    index: pd.DatetimeIndex,
+    symbols: list[str],
+) -> pd.DataFrame:
+    """Build an all-NaN fundamental panel frame."""
+    return pd.DataFrame(float("nan"), index=index, columns=symbols)
+
+
+def _inject_fundamental_panel(
+    panel: dict[str, pd.DataFrame],
+    *,
+    symbols: list[str],
+    fund_columns: Iterable[str],
+    start: str,
+    end: str,
+    freq: str = "ttm",
+    pit: bool = True,
+    source: str = "auto",
+    index: pd.DatetimeIndex | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Inject required fundamental fields into a factor panel.
+
+    Args:
+        panel: Existing factor panel keyed by column name.
+        symbols: Symbols to load.
+        fund_columns: Requested ``fund:*`` columns.
+        start: Start date string.
+        end: End date string.
+        freq: Fundamental frequency. Defaults to ``ttm``.
+        pit: Whether point-in-time loading is enforced.
+        source: Fundamental data source route.
+        index: Optional price index to align to. Defaults to ``panel["close"]``.
+
+    Returns:
+        The same panel dictionary with ``fund:<field>`` frames added.
+    """
+    fields = [column[len(_FUND_PREFIX):] for column in fund_columns if column.startswith(_FUND_PREFIX)]
+    fields = list(dict.fromkeys(fields))
+    if not fields:
+        return panel
+
+    price_index = index
+    if price_index is None:
+        close = panel.get("close")
+        price_index = close.index if close is not None else pd.DatetimeIndex([])
+
+    try:
+        from backtest.loaders.fundamentals_loader import load_fundamental_panel
+
+        loaded = load_fundamental_panel(
+            symbols=symbols,
+            fields=fields,
+            start=start,
+            end=end,
+            freq=freq,
+            pit=pit,
+            source=source,
+            index=price_index,
+        )
+    except Exception as exc:  # noqa: BLE001 - data-source failure must not kill backtest
+        logger.warning(
+            "fundamental panel load failed for fields=%s symbols=%s: %s; injecting NaN frames",
+            fields,
+            symbols,
+            exc,
+            exc_info=True,
+        )
+        loaded = {}
+
+    for field in fields:
+        frame = loaded.get(field)
+        if not isinstance(frame, pd.DataFrame):
+            frame = _nan_fundamental_frame(price_index, symbols)
+        else:
+            frame = frame.reindex(index=price_index, columns=symbols)
+        panel[f"{_FUND_PREFIX}{field}"] = frame
+    return panel
+
+
+def _project_panel_fields_to_data_map(
+    data_map: dict[str, pd.DataFrame],
+    panel: dict[str, pd.DataFrame],
+    fund_columns: Iterable[str],
+) -> dict[str, pd.DataFrame]:
+    """Copy injected panel fields back to per-symbol backtest frames."""
+    out = {symbol: frame.copy() for symbol, frame in data_map.items()}
+    for column in fund_columns:
+        frame = panel.get(column)
+        if frame is None:
+            continue
+        for symbol, symbol_frame in out.items():
+            if symbol in frame.columns:
+                symbol_frame[column] = frame[symbol].reindex(symbol_frame.index)
+            else:
+                symbol_frame[column] = float("nan")
+    return out
+
+
+def _maybe_inject_fundamentals_for_factor_panel(
+    data_map: dict[str, pd.DataFrame],
+    config: dict,
+) -> dict[str, pd.DataFrame]:
+    """Inject ``fund:*`` factor dependencies when selected factors request them."""
+    selected_factors = _selected_factor_specs(config)
+    fund_columns = _fund_columns_required(selected_factors)
+    if not fund_columns:
+        return data_map
+
+    panel = _build_price_panel(data_map)
+    close = panel.get("close")
+    price_index = close.index if close is not None else pd.DatetimeIndex([])
+    symbols = list(data_map)
+    _inject_fundamental_panel(
+        panel,
+        symbols=symbols,
+        fund_columns=fund_columns,
+        start=config.get("start_date", ""),
+        end=config.get("end_date", ""),
+        freq="ttm",
+        pit=True,
+        source="auto",
+        index=price_index,
+    )
+    return _project_panel_fields_to_data_map(data_map, panel, fund_columns)
+
+
 # --- Main entry ---
 
 def main(run_dir: Path) -> None:
@@ -400,6 +1149,19 @@ def main(run_dir: Path) -> None:
             file is read so an arbitrary filesystem location cannot be used
             to source ``code/signal_engine.py``.
     """
+    # Loading `.env` belongs to the process that RUNS a backtest, not to
+    # importing this module. At import time it ran during pytest collection --
+    # before the per-test os.environ snapshot exists -- so a developer's own
+    # LANGCHAIN_MODEL_NAME leaked into every later test and could not be undone
+    # by any fixture, which is how seven redaction tests failed locally while
+    # CI (with no .env checked out) stayed green.
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except ImportError:
+        pass
+
     # Guard the CLI entry point with the same root whitelist the MCP
     # ``backtest`` tool already uses (src/tools/backtest_tool.py:23). Without
     # this, ``python -m backtest.runner /tmp/attacker_path`` would happily
@@ -458,55 +1220,18 @@ def main(run_dir: Path) -> None:
         print(json.dumps({"error": f"SignalEngine interface error: {exc}"}))
         sys.exit(1)
 
-    # Data: auto split vs single loader
+    fetch_result = fetch_data_map(config)
+    data_map = fetch_result.data_map
+    codes = fetch_result.codes
+    source = fetch_result.source
+    loader = fetch_result.loader
+    config["codes"] = codes
+    config["_run_card_effective_sources"] = fetch_result.effective_sources
     interval = config.get("interval", "1D")
-
-    if source == "auto":
-        data_map = _fetch_auto(codes, config, interval)
-    else:
-        codes = _normalize_codes(codes, source)
-        config["codes"] = codes
-        LoaderCls = _get_loader(source)
-        loader = LoaderCls()
-        data_map = loader.fetch(
-            codes,
-            config.get("start_date", ""),
-            config.get("end_date", ""),
-            fields=config.get("extra_fields") or None,
-            interval=interval,
-        )
-        if data_map and len(data_map) < len(codes):
-            missing = set(codes) - set(data_map.keys())
-            logger.warning(
-                "source=%s returned data for %d/%d symbols; missing: %s",
-                source, len(data_map), len(codes), missing,
-            )
-        # Runtime fallback: try next sources in chain when primary returns empty
-        if not data_map and codes:
-            market = _detect_market(codes[0])
-            for fb_name in FALLBACK_CHAINS.get(market, []):
-                if fb_name == source or fb_name not in LOADER_REGISTRY:
-                    continue
-                fb_loader = LOADER_REGISTRY[fb_name]()
-                if not fb_loader.is_available():
-                    continue
-                fb_codes = _normalize_codes(codes, fb_name)
-                data_map = fb_loader.fetch(
-                    fb_codes, config.get("start_date", ""),
-                    config.get("end_date", ""), interval=interval,
-                )
-                if data_map:
-                    logger.info("Runtime fallback: %s -> %s", source, fb_name)
-                    source = fb_name
-                    loader = fb_loader
-                    break
-
-    # Loader-boundary OHLC sanity for every source, centralized at the one
-    # point all fetch paths converge (auto / single / runtime fallback).
-    data_map = _sanitize_data_map(data_map)
     if not data_map:
         print(json.dumps({"error": "No data fetched"}))
         sys.exit(1)
+    data_map = _maybe_inject_fundamentals_for_factor_panel(data_map, config)
 
     if source == "auto":
         config["_run_card_effective_sources"] = sorted(_group_codes_by_source(codes))
@@ -527,9 +1252,10 @@ def main(run_dir: Path) -> None:
     else:
         bars_per_year = calc_bars_per_year(interval, effective_source)
 
-    # Auto mode: wrap preloaded data in a dummy loader
-    if source == "auto":
-        loader = _AutoLoader(data_map)
+    # Every source has already been fetched, sanitized, and enriched above.
+    # Reuse that exact snapshot so provider costs and run-card provenance stay
+    # aligned with the data consumed by the engine.
+    loader = _AutoLoader(data_map)
 
     if engine_type == "options":
         from backtest.engines.options_portfolio import run_options_backtest
@@ -576,22 +1302,57 @@ def _create_market_engine(source: str, config: dict, codes: List[str]):
         from backtest.engines.forex import ForexEngine
         return ForexEngine(config)
 
+    # India equity routing — must precede source-based routing because India's
+    # effective source is ``yahoo``, which has no Wave-1 branch and would
+    # otherwise fall through to the crypto default.
+    if "india_equity" in markets:
+        from backtest.engines.india_equity import IndiaEquityEngine
+        return IndiaEquityEngine(config)
+
+    # Korea equity routing — same reason as India: its effective source
+    # (``pykrx``) has no Wave-1 branch and would fall through to the default.
+    if "kr_equity" in markets:
+        from backtest.engines.korea_equity import KoreaEquityEngine
+        return KoreaEquityEngine(config)
+
+    # Vietnam equity routing — same reason as India and Korea: its effective
+    # source (``yahoo``) has no Wave-1 branch and would fall through to the
+    # default.
+    if "vietnam_equity" in markets:
+        from backtest.engines.vietnam_equity import VietnamEquityEngine
+        return VietnamEquityEngine(config)
+
     # Original routing (Wave 1)
     if source in ("okx", "ccxt"):
         from backtest.engines.crypto import CryptoEngine
         return CryptoEngine(config)
     elif source in ("tushare", "akshare"):
-        if markets & {"us_equity", "hk_equity"}:
+        if markets & {"us_equity", "hk_equity", "ca_equity"}:
             from backtest.engines.global_equity import GlobalEquityEngine
             market = _detect_submarket(codes)
             return GlobalEquityEngine(config, market=market)
         from backtest.engines.china_a import ChinaAEngine
         return ChinaAEngine(config)
     elif source == "yfinance":
+        # yfinance serves crypto pairs (BTC-USDT, BTC-USD) next to equities,
+        # so route on the instrument market here too. Handing crypto to
+        # GlobalEquityEngine applies zero-commission equity rules while the
+        # CryptoEngine fee keys (taker_rate/maker_rate/slippage) sit ignored
+        # in the config, and nothing warns.
+        if "crypto" in markets:
+            from backtest.engines.crypto import CryptoEngine
+            return CryptoEngine(config)
         from backtest.engines.global_equity import GlobalEquityEngine
         market = _detect_submarket(codes)
         return GlobalEquityEngine(config, market=market)
     else:
+        # Sources without a dedicated branch (local, stooq, ...): follow the
+        # instrument market rather than the loader name, so e.g. a local
+        # AAPL.US dataset gets US-equity execution rules instead of crypto.
+        if markets & {"us_equity", "hk_equity", "ca_equity"}:
+            from backtest.engines.global_equity import GlobalEquityEngine
+            market = _detect_submarket(codes)
+            return GlobalEquityEngine(config, market=market)
         from backtest.engines.crypto import CryptoEngine
         return CryptoEngine(config)
 
@@ -620,7 +1381,12 @@ def _fetch_auto(codes: List[str], config: dict, interval: str = "1D") -> dict:
 
     Args:
         codes: All symbols.
-        config: Backtest config dict.
+        config: Backtest config dict. On success the loaders that actually
+            returned rows are recorded under the private key
+            ``_actual_sources`` so the caller can report true provenance
+            instead of the symbol-pattern guess (``_group_codes_by_source``
+            names the *head* of each chain, which lies whenever that head is an
+            optional package that is not installed).
         interval: Bar interval string.
 
     Returns:
@@ -628,6 +1394,7 @@ def _fetch_auto(codes: List[str], config: dict, interval: str = "1D") -> dict:
     """
     market_groups = _group_codes_by_market(codes)
     merged = {}
+    served_by: set[str] = set()
     start_date = config.get("start_date", "")
     end_date = config.get("end_date", "")
 
@@ -644,25 +1411,163 @@ def _fetch_auto(codes: List[str], config: dict, interval: str = "1D") -> dict:
         src_name = getattr(loader, "name", "unknown")
         normalized_codes = _normalize_codes(market_codes, src_name)
         fields = config.get("extra_fields") if src_name == "tushare" else None
-        result = loader.fetch(normalized_codes, start_date, end_date, fields=fields, interval=interval)
+        result = loader.fetch(
+            normalized_codes,
+            start_date,
+            end_date,
+            fields=fields,
+            interval=interval,
+        )
+        market_result = _restore_original_codes(
+            result, market_codes, normalized_codes
+        )
+        if market_result:
+            served_by.add(src_name)
+        missing = [code for code in market_codes if code not in market_result]
 
-        # Runtime fallback: try remaining sources when primary returns empty
-        if not result:
-            for fb_name in FALLBACK_CHAINS.get(market, []):
-                if fb_name == src_name or fb_name not in LOADER_REGISTRY:
-                    continue
-                fb_loader = LOADER_REGISTRY[fb_name]()
-                if not fb_loader.is_available():
-                    continue
-                fb_codes = _normalize_codes(market_codes, fb_name)
-                result = fb_loader.fetch(fb_codes, start_date, end_date, interval=interval)
-                if result:
-                    logger.info("Runtime fallback: %s -> %s for %s", src_name, fb_name, market)
-                    break
+        # Retry only missing symbols so a partial primary response does not
+        # silently shrink the requested universe or refetch successful data.
+        for fb_name in FALLBACK_CHAINS.get(market, []):
+            if not missing:
+                break
+            if fb_name == src_name or fb_name not in LOADER_REGISTRY:
+                continue
+            fb_loader = LOADER_REGISTRY[fb_name]()
+            if not fb_loader.is_available():
+                continue
+            fb_codes = _normalize_codes(missing, fb_name)
+            fallback_result = fb_loader.fetch(
+                fb_codes, start_date, end_date, interval=interval
+            )
+            mapped = _restore_original_codes(fallback_result, missing, fb_codes)
+            if mapped:
+                market_result.update(mapped)
+                missing = [code for code in missing if code not in mapped]
+                served_by.add(str(getattr(fb_loader, "name", fb_name) or fb_name))
+                logger.info(
+                    "Runtime fallback: %s -> %s for %s", src_name, fb_name, market
+                )
 
-        merged.update(result)
+        if missing:
+            raise NoAvailableSourceError(
+                f"incomplete data for {market}; missing symbols: {missing}"
+            )
+        merged.update(market_result)
 
+    config["_actual_sources"] = sorted(served_by)
     return merged
+
+
+def fetch_data_map(config: dict) -> DataFetchResult:
+    """Fetch and sanitize bars through the canonical loader registry.
+
+    This is the shared entry point for backtest execution and reconstruction
+    consumers. It preserves auto routing and the runtime fallback chain.
+
+    Args:
+        config: Backtest configuration containing codes, dates, source, and interval.
+
+    Returns:
+        Data and effective routing metadata. The input config is not mutated.
+    """
+    config = copy.deepcopy(config)
+    source = str(config.get("source") or "tushare")
+    codes = list(config.get("codes") or [])
+    interval = str(config.get("interval") or "1D")
+
+    if source == "auto":
+        data_map = _fetch_auto(codes, config, interval)
+        loader: Any = _AutoLoader(data_map)
+        # Prefer the loaders that actually served rows; the symbol-pattern guess
+        # is only a fallback for a stubbed/patched fetcher that recorded nothing.
+        recorded = config.pop("_actual_sources", None)
+        used_sources: list[str] = [
+            str(name) for name in recorded or [] if str(name).strip()
+        ] or sorted(_group_codes_by_source(codes))
+    else:
+        codes = _normalize_codes(codes, source)
+        primary_source = source
+        loader = _get_loader(source)()
+        # ``_get_loader`` may hand back a *different* loader when the requested
+        # one is unavailable (e.g. an optional package like pykrx is missing, so
+        # the kr_equity chain resolves to yahoo). Record who actually served the
+        # bars, never the name that was asked for — a run card that claims
+        # ``pykrx`` while Yahoo supplied the data is a provenance lie.
+        served_by = str(getattr(loader, "name", source) or source)
+        if served_by != source:
+            logger.warning(
+                "source=%s is unavailable; %s served this request",
+                source,
+                served_by,
+            )
+        data_map = loader.fetch(
+            codes,
+            config.get("start_date", ""),
+            config.get("end_date", ""),
+            fields=config.get("extra_fields") or None,
+            interval=interval,
+        )
+        used_sources = [served_by] if data_map else []
+        missing = [code for code in codes if code not in data_map]
+        if missing:
+            logger.warning(
+                "source=%s returned data for %d/%d symbols; missing: %s",
+                source,
+                len(data_map),
+                len(codes),
+                missing,
+            )
+        if missing:
+            market = _detect_market(codes[0])
+            for fallback_source in FALLBACK_CHAINS.get(market, []):
+                if not missing:
+                    break
+                if (
+                    fallback_source == primary_source
+                    or fallback_source not in LOADER_REGISTRY
+                ):
+                    continue
+                fallback_loader = LOADER_REGISTRY[fallback_source]()
+                if not fallback_loader.is_available():
+                    continue
+                fallback_codes = _normalize_codes(missing, fallback_source)
+                fallback_result = fallback_loader.fetch(
+                    fallback_codes,
+                    config.get("start_date", ""),
+                    config.get("end_date", ""),
+                    interval=interval,
+                )
+                mapped = _restore_original_codes(
+                    fallback_result, missing, fallback_codes
+                )
+                if mapped:
+                    data_map.update(mapped)
+                    missing = [code for code in missing if code not in mapped]
+                    fb_served_by = str(
+                        getattr(fallback_loader, "name", fallback_source)
+                        or fallback_source
+                    )
+                    if not used_sources:
+                        source = fb_served_by
+                        loader = fallback_loader
+                    used_sources.append(fb_served_by)
+                    logger.info(
+                        "Runtime fallback: %s -> %s", primary_source, fb_served_by
+                    )
+
+        if missing:
+            raise NoAvailableSourceError(
+                f"incomplete data for source={primary_source}; missing symbols: {missing}"
+            )
+
+    data_map = _sanitize_data_map(data_map)
+    return DataFetchResult(
+        data_map=data_map,
+        codes=codes,
+        source=source,
+        loader=loader,
+        effective_sources=used_sources,
+    )
 
 
 def _sanitize_data_map(data_map: dict) -> dict:
@@ -686,7 +1591,7 @@ def _sanitize_data_map(data_map: dict) -> dict:
 
 
 class _AutoLoader:
-    """Dummy loader for auto mode: returns pre-fetched data maps."""
+    """Loader adapter that returns a pre-fetched data map."""
 
     def __init__(self, data_map: dict):
         self._data = data_map

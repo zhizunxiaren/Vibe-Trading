@@ -9,7 +9,6 @@ from unittest.mock import patch
 import pytest
 
 from src.tools.skill_writer_tool import (
-    CreateSkillTool,
     SaveSkillTool,
     PatchSkillTool,
     DeleteSkillTool,
@@ -37,6 +36,20 @@ class TestSanitizeSkillName:
 
     def test_empty(self) -> None:
         assert _sanitize_skill_name("") == ""
+
+    def test_cjk_name_keeps_distinct_slug(self) -> None:
+        a = _sanitize_skill_name("动量策略")
+        b = _sanitize_skill_name("均值回归")
+        assert a == "动量策略"
+        assert b == "均值回归"
+        assert a != b
+
+    def test_punctuation_only_uses_stable_digest(self) -> None:
+        slug = _sanitize_skill_name("???")
+        assert len(slug) == 8
+        assert slug.isalnum()
+        assert slug == _sanitize_skill_name("???")
+        assert slug != _sanitize_skill_name("!!!")
 
 
 # ---------------------------------------------------------------------------
@@ -88,46 +101,6 @@ class TestSaveSkillTool:
         tool.execute(name="overwrite", content="---\nname: overwrite\n---\nv2")
         text = (user_dir / "overwrite" / "SKILL.md").read_text(encoding="utf-8")
         assert "v2" in text
-
-
-# ---------------------------------------------------------------------------
-# CreateSkillTool
-# ---------------------------------------------------------------------------
-
-
-class TestCreateSkillTool:
-    def test_create_skill_from_natural_language(self, tmp_path: Path) -> None:
-        with patch("src.tools.skill_writer_tool.USER_SKILLS_DIR", tmp_path):
-            tool = CreateSkillTool()
-            result = json.loads(tool.execute(
-                request="以后我说查放量股，就调用 run_analysis 的 top-volume，days 默认 20，limit 默认 100，并用中文表格总结。",
-                name="volume-ranking-auto",
-                category="analysis",
-                tools=["run_analysis"],
-                defaults={"days": 20, "limit": 100},
-            ))
-
-        assert result["status"] == "ok"
-        skill_path = tmp_path / "volume-ranking-auto" / "SKILL.md"
-        assert skill_path.exists()
-        text = skill_path.read_text(encoding="utf-8")
-        assert "name: volume-ranking-auto" in text
-        assert "run_analysis" in text
-        assert "top-volume" in text
-        assert "days" in text
-        assert "limit" in text
-
-    def test_create_skill_requires_request(self, tmp_path: Path) -> None:
-        with patch("src.tools.skill_writer_tool.USER_SKILLS_DIR", tmp_path):
-            result = json.loads(CreateSkillTool().execute(name="empty"))
-
-        assert result["status"] == "error"
-
-    def test_user_skills_default_to_project_codex_dir(self) -> None:
-        parts = set(USER_SKILLS_DIR.parts)
-        assert ".codex" in parts
-        assert "skills" in parts
-        assert USER_SKILLS_DIR.name == "user"
 
 
 # ---------------------------------------------------------------------------
@@ -195,21 +168,6 @@ class TestDeleteSkillTool:
         result = json.loads(tool.execute(name="deleteme"))
         assert result["status"] == "ok"
         assert not skill_dir.exists()
-
-    def test_delete_refuses_skill_with_extra_files(self, setup) -> None:
-        tool, user_dir = setup
-        skill_dir = user_dir / "with-assets"
-        skill_dir.mkdir()
-        (skill_dir / "SKILL.md").write_text("body", encoding="utf-8")
-        assets_dir = skill_dir / "assets"
-        assets_dir.mkdir()
-        (assets_dir / "sample.txt").write_text("asset", encoding="utf-8")
-
-        result = json.loads(tool.execute(name="with-assets"))
-
-        assert result["status"] == "error"
-        assert "single-file deletion policy" in result["error"]
-        assert skill_dir.exists()
 
     def test_delete_nonexistent(self, setup) -> None:
         tool, _ = setup
@@ -341,8 +299,7 @@ class TestSkillCRUDLifecycle:
             assert r["status"] == "ok"
             assert len(r["files"]) >= 2  # SKILL.md + helper.py
 
-            # 5. Delete is refused because auxiliary files require explicit single-file removal.
+            # 5. Delete
             r = json.loads(delete.execute(name="lifecycle"))
-            assert r["status"] == "error"
-            assert "single-file deletion policy" in r["error"]
-            assert (tmp_path / "lifecycle").exists()
+            assert r["status"] == "ok"
+            assert not (tmp_path / "lifecycle").exists()

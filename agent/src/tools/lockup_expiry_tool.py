@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from backtest.loaders import eastmoney_client
@@ -46,7 +46,7 @@ _PAGE_SIZE = 200
 
 def _today() -> date:
     """Return today's date (indirection kept for test monkeypatching)."""
-    return datetime.now().date()
+    return datetime.now(timezone.utc).date()
 
 
 def _compact(d: date) -> str:
@@ -65,7 +65,7 @@ def _clamp_horizon(horizon_days: Any) -> int:
     """
     try:
         value = int(horizon_days)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return _DEFAULT_HORIZON_DAYS
     if value < 1:
         return 1
@@ -235,8 +235,9 @@ def get_lockup_expiry(code: str | None, horizon_days: int) -> str:
     """
     horizon = _clamp_horizon(horizon_days)
     bare_code: str | None = None
-    if code and code.strip():
-        bare_code = _normalize_code(code)
+    code_str = str(code).strip() if code is not None else ""
+    if code_str:
+        bare_code = _normalize_code(code_str)
         if bare_code is None:
             return json.dumps(
                 {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -62,6 +63,24 @@ class RunStateStore:
         """
         self._write_json(run_dir / "state.json", {"status": "failed", "reason": reason})
 
+    def mark_cancelled(self, run_dir: Path, reason: str = "cancelled by user") -> None:
+        """Mark the run as cancelled by the user.
+
+        Distinct from a failure so the run artifact agrees with the session
+        transcript: a user stop is not an outage, and reporting it as one made
+        the Reports view contradict the chat history.
+
+        Args:
+            run_dir: Run directory.
+            reason: Cancellation reason.
+        """
+        self._write_json(run_dir / "state.json", {"status": "cancelled", "reason": reason})
+
     @staticmethod
     def _write_json(path: Path, data: Any) -> None:
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        # Write + fsync so a crash can't leave a truncated/empty state.json.
+        payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        with open(path, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())

@@ -119,15 +119,15 @@ class TestSymbolIsolation:
 
         engine = ChinaAEngine({"initial_cash": 1_000_000})
 
-        # Patch _rebalance to throw for BAD only
-        original_rebalance = ChinaAEngine._rebalance
+        # Patch the opening-plan boundary to throw for BAD only.
+        original_plan = ChinaAEngine._plan_open_order
 
-        def _exploding_rebalance(self, symbol, target_weight, df, ts, equity):
+        def _exploding_plan(self, symbol, target_weight, df, ts, equity):
             if symbol == "BAD":
                 raise RuntimeError("Simulated failure for BAD")
-            return original_rebalance(self, symbol, target_weight, df, ts, equity)
+            return original_plan(self, symbol, target_weight, df, ts, equity)
 
-        with patch.object(ChinaAEngine, "_rebalance", _exploding_rebalance):
+        with patch.object(ChinaAEngine, "_plan_open_order", _exploding_plan):
             # Should NOT raise — exception is caught internally
             engine._execute_bars(dates, data_map, close_df, target_pos, valid_codes)
 
@@ -290,6 +290,24 @@ class TestBacktestConfigSchema:
         assert c.codes == ["AAPL.US"]
         assert c.interval == "1D"
         assert c.engine == "daily"
+        assert c.position_adjustment == "hold"
+
+    def test_position_adjustment_accepts_rebalance_and_rejects_unknown_mode(self) -> None:
+        valid = BacktestConfigSchema(
+            codes=["AAPL.US"],
+            start_date="2025-01-01",
+            end_date="2025-06-01",
+            position_adjustment="rebalance",
+        )
+        assert valid.position_adjustment == "rebalance"
+
+        with pytest.raises(ValueError, match="position_adjustment"):
+            BacktestConfigSchema(
+                codes=["AAPL.US"],
+                start_date="2025-01-01",
+                end_date="2025-06-01",
+                position_adjustment="resize",
+            )
 
     def test_fundamental_fields_must_be_table_to_field_list_mapping(self) -> None:
         with pytest.raises(ValueError, match="fundamental_fields"):
@@ -354,6 +372,35 @@ class TestBacktestConfigSchema:
                 end_date="2025-06-01",
                 source="bloomberg",
             )
+
+    @pytest.mark.parametrize(
+        "initial_cash", [0, -1, -1_000_000, float("inf"), float("-inf"), float("nan"), "Infinity"]
+    )
+    def test_non_finite_or_non_positive_initial_cash_rejected(
+        self, initial_cash: object
+    ) -> None:
+        """A non-positive initial_cash makes returns divide by <= 0 and yields
+        inf/NaN metrics; reject it at the config boundary."""
+        with pytest.raises(Exception, match="initial_cash"):
+            BacktestConfigSchema(
+                codes=["AAPL.US"],
+                start_date="2025-01-01",
+                end_date="2025-06-01",
+                initial_cash=initial_cash,
+            )
+
+    def test_initial_cash_defaults_and_accepts_positive(self) -> None:
+        default = BacktestConfigSchema(
+            codes=["AAPL.US"], start_date="2025-01-01", end_date="2025-06-01"
+        )
+        assert default.initial_cash == 1_000_000
+        explicit = BacktestConfigSchema(
+            codes=["AAPL.US"],
+            start_date="2025-01-01",
+            end_date="2025-06-01",
+            initial_cash=50_000,
+        )
+        assert explicit.initial_cash == 50_000
 
     def test_mootdx_and_futu_sources_accepted(self) -> None:
         """mootdx and futu are registered loaders, so config validation must
@@ -517,3 +564,78 @@ class TestFullBacktestRobustness:
         engine = ChinaAEngine({"initial_cash": 1_000_000})
         engine._execute_bars(dates, data_map, close_df, target_pos, valid_codes)
         assert len(engine.equity_snapshots) == 20
+
+
+# ---------------------------------------------------------------------------
+# 6. Validation artifact — write must not assume artifacts/ already exists
+# ---------------------------------------------------------------------------
+
+
+class TestValidationArtifactDir:
+    def test_validation_json_written_when_artifacts_dir_absent(
+        self, tmp_path: Path
+    ) -> None:
+        """Enabling validation must not crash when run_dir/artifacts is absent.
+
+        The validation.json write (step 7) runs before _write_artifacts()
+        (step 8) creates run_dir/artifacts, so the write must create the
+        directory itself. Regression test for the FileNotFoundError hit when
+        run_dir has no pre-created artifacts/ (e.g. a swarm agent workspace).
+        """
+        dates = pd.bdate_range("2024-04-01", periods=3)
+        bars = pd.DataFrame(
+            {
+                "open": [10.0, 11.0, 12.0],
+                "high": [10.5, 11.5, 12.5],
+                "low": [9.5, 10.5, 11.5],
+                "close": [10.2, 11.2, 12.2],
+                "volume": [1000, 1100, 1200],
+            },
+            index=dates,
+        )
+
+        class FakeLoader:
+            def fetch(self, *args, **kwargs):
+                return {"000001.SZ": bars.copy()}
+
+        class SignalEngine:
+            def generate(self, data_map):
+                return {"000001.SZ": pd.Series(1.0, index=data_map["000001.SZ"].index)}
+
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        assert not (run_dir / "artifacts").exists()
+
+        engine = ChinaAEngine({"initial_cash": 1_000_000})
+        non_finite = {
+            "bootstrap": {
+                "observed_sharpe": float("inf"),
+                "median_sharpe": float("nan"),
+            }
+        }
+        with patch("backtest.validation.run_validation", return_value=non_finite):
+            metrics = engine.run_backtest(
+                {
+                    "codes": ["000001.SZ"],
+                    "start_date": "2024-04-01",
+                    "end_date": "2024-04-30",
+                    "source": "tushare",
+                    "initial_cash": 1_000_000,
+                    "validation": {"bootstrap": {"n_bootstrap": 20, "seed": 1}},
+                },
+                FakeLoader(),
+                SignalEngine(),
+                run_dir,
+            )
+
+        assert "validation" in metrics
+        validation_path = run_dir / "artifacts" / "validation.json"
+        parsed = json.loads(
+            validation_path.read_text(encoding="utf-8"),
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"non-strict JSON constant: {value}")
+            ),
+        )
+        assert parsed == {
+            "bootstrap": {"observed_sharpe": None, "median_sharpe": None}
+        }

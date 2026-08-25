@@ -10,12 +10,13 @@ import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from functools import wraps
 from pathlib import Path
 from typing import Callable, TypeVar
 
+from src.config.accessor import get_env_config
 from src.goal.models import (
     AuditRow,
     EvidenceInput,
@@ -27,10 +28,11 @@ from src.goal.models import (
     RiskTier,
     StaleGoalError,
 )
+from src.config.paths import get_runtime_root
 from src.goal.policy import normalize_required_text, reject_live_execution_objective
 from src.tools.path_utils import safe_document_path, safe_run_id
 
-_DEFAULT_DB_PATH = Path.home() / ".vibe-trading" / "sessions.db"
+_DEFAULT_DB_PATH = get_runtime_root() / "sessions.db"
 _DB_PATH_ENV = "VIBE_TRADING_GOAL_DB_PATH"
 
 _CURRENT_STATUSES = {
@@ -51,7 +53,7 @@ _COMPLETION_RESULTS = {
 
 
 def _now_iso() -> str:
-    return datetime.now().isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _id(prefix: str) -> str:
@@ -65,12 +67,15 @@ def _json_dumps(value: object) -> str:
 def _json_loads(value: str | None, default: object) -> object:
     if not value:
         return default
-    return json.loads(value)
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return default
 
 
 def _default_db_path() -> Path:
     """Return the configured goal ledger database path."""
-    raw_path = os.getenv(_DB_PATH_ENV, "").strip()
+    raw_path = get_env_config().paths.vibe_trading_goal_db_path.strip()
     if raw_path:
         return Path(raw_path).expanduser()
     return _DEFAULT_DB_PATH

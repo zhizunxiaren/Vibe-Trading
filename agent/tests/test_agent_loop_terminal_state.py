@@ -45,6 +45,8 @@ class _StubLLMNoFinal:
         tools: list[Any] | None = None,
         on_text_chunk: Callable[[str], None] | None = None,
         on_reasoning_chunk: Callable[[str], None] | None = None,
+        timeout: int | None = None,
+        idle_timeout_s: float | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> _StubLLMResponse:
         return _StubLLMResponse()
@@ -62,11 +64,38 @@ class _StubLLMWithUsage:
         tools: list[Any] | None = None,
         on_text_chunk: Callable[[str], None] | None = None,
         on_reasoning_chunk: Callable[[str], None] | None = None,
+        timeout: int | None = None,
+        idle_timeout_s: float | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> _StubLLMResponse:
         response = _StubLLMResponse()
         response.content = "done"
         response.usage_metadata = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        return response
+
+    def chat(self, messages: list[dict[str, Any]], **_: Any) -> _StubLLMResponse:
+        return _StubLLMResponse()
+
+
+class _StubLLMSuccess:
+    """LLM stub that records calls and returns a final answer."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any] | None = None,
+        on_text_chunk: Callable[[str], None] | None = None,
+        on_reasoning_chunk: Callable[[str], None] | None = None,
+        timeout: int | None = None,
+        idle_timeout_s: float | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> _StubLLMResponse:
+        self.calls += 1
+        response = _StubLLMResponse()
+        response.content = "done"
         return response
 
     def chat(self, messages: list[dict[str, Any]], **_: Any) -> _StubLLMResponse:
@@ -89,6 +118,8 @@ class _StubLLMCancelMidStream:
         tools: list[Any] | None = None,
         on_text_chunk: Callable[[str], None] | None = None,
         on_reasoning_chunk: Callable[[str], None] | None = None,
+        timeout: int | None = None,
+        idle_timeout_s: float | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> _StubLLMResponse:
         # Set _cancelled on the bound agent so the next loop iteration check
@@ -123,14 +154,18 @@ def _build_agent(llm: Any, max_iter: int = 3, tmp_run_dir: Path | None = None) -
 def test_empty_model_response_returns_specific_reason(
     tmp_path: Path,
 ) -> None:
-    """Empty no-tool provider output is distinct from exhausting iterations."""
+    """Two consecutive empty no-tool outputs fail with the specific reason.
+
+    The first empty completion is retried with a nudge; the run fails on the
+    second consecutive empty response, and the reason names that iteration.
+    """
     agent = _build_agent(_StubLLMNoFinal(), max_iter=3, tmp_run_dir=tmp_path / "run")
 
     result = agent.run(user_message="anything")
 
     assert result["status"] == "failed"
     assert result["reason"].startswith("empty_model_response")
-    assert "iteration 1" in result["reason"]
+    assert "iteration 2" in result["reason"]
     assert result["iterations"] >= 1
     assert result["max_iterations"] == 3
 
@@ -152,6 +187,24 @@ def test_cancelled_terminal_returns_reason(tmp_path: Path) -> None:
     assert result["max_iterations"] == 3
 
 
+def test_cancel_before_first_run_is_not_cleared(tmp_path: Path) -> None:
+    """A cancellation accepted while queued must stop before the LLM call."""
+    llm = _StubLLMSuccess()
+    agent = _build_agent(llm, max_iter=1, tmp_run_dir=tmp_path / "run")
+
+    agent.cancel()
+    cancelled = agent.run(user_message="stale request")
+
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["reason"] == "cancelled by user"
+    assert llm.calls == 0
+
+    reused = agent.run(user_message="new request")
+
+    assert reused["status"] == "success"
+    assert llm.calls == 1
+
+
 class _StubLLMCancelWithToolCalls:
     """LLM stub that cancels mid-stream while returning a tool-calling response.
 
@@ -168,6 +221,8 @@ class _StubLLMCancelWithToolCalls:
         tools: list[Any] | None = None,
         on_text_chunk: Callable[[str], None] | None = None,
         on_reasoning_chunk: Callable[[str], None] | None = None,
+        timeout: int | None = None,
+        idle_timeout_s: float | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> _StubLLMResponse:
         self._agent_ref[0]._cancel_event.set()
@@ -217,7 +272,7 @@ def test_session_service_renders_meaningful_error_from_result(tmp_path: Path) ->
 
     assert ui_error != "unknown"
     assert "empty_model_response" in ui_error
-    assert "iteration 1" in ui_error
+    assert "iteration 2" in ui_error
 
 
 def test_usage_metadata_is_persisted_to_run_artifact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -256,6 +311,8 @@ class _StubLLMAlwaysToolCalls:
         tools: list[Any] | None = None,
         on_text_chunk: Callable[[str], None] | None = None,
         on_reasoning_chunk: Callable[[str], None] | None = None,
+        timeout: int | None = None,
+        idle_timeout_s: float | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> _StubLLMResponse:
         resp = _StubLLMResponse()
@@ -283,6 +340,8 @@ class _StubLLMIgnoresForcedTextOnly:
         tools: list[Any] | None = None,
         on_text_chunk: Callable[[str], None] | None = None,
         on_reasoning_chunk: Callable[[str], None] | None = None,
+        timeout: int | None = None,
+        idle_timeout_s: float | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> _StubLLMResponse:
         resp = _StubLLMResponse()
@@ -303,6 +362,8 @@ class _StubLLMStreamFailure:
         tools: list[Any] | None = None,
         on_text_chunk: Callable[[str], None] | None = None,
         on_reasoning_chunk: Callable[[str], None] | None = None,
+        timeout: int | None = None,
+        idle_timeout_s: float | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> _StubLLMResponse:
         raise ProviderStreamError(

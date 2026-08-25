@@ -7,6 +7,7 @@ import json
 import logging
 import time
 from contextlib import suppress
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from src.channels.manager import ChannelManager
 from src.channels.pairing import PAIRING_COMMAND_META_KEY, handle_pairing_command
 from src.config.paths import get_data_dir
 from src.session.models import Message, Session
+from src.session.service import SessionBusyError
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,8 @@ class ChannelRuntime:
         session_map_path: Path | None = None,
         reply_timeout_s: float = 600.0,
         poll_interval_s: float = 0.25,
+        operators: Iterable[str] | None = None,
+        channel_operators: Mapping[str, Iterable[str]] | None = None,
     ) -> None:
         self.bus = bus
         self.session_service = session_service
@@ -49,6 +53,15 @@ class ChannelRuntime:
             reply_timeout_s=reply_timeout_s,
             poll_interval_s=poll_interval_s,
         )
+        # Channel-independent (global) operators may run /pairing on any channel
+        # with cross-channel authority. Per-channel operators may run /pairing
+        # only on their own channel. Both empty by default → IM /pairing is
+        # fail-closed and pairing is managed via the authenticated CLI/REST plane.
+        self._operators: set[str] = {str(o) for o in (operators or ())}
+        self._channel_operators: dict[str, set[str]] = {
+            str(ch): {str(o) for o in ops}
+            for ch, ops in (channel_operators or {}).items()
+        }
         self.session_map_path = session_map_path or (get_data_dir() / "channels" / "sessions.json")
         self._session_map: dict[str, str] = {}
         self._consumer_task: asyncio.Task[None] | None = None
@@ -108,13 +121,44 @@ class ChannelRuntime:
     async def _handle_inbound(self, msg: InboundMessage) -> None:
         try:
             if self._is_pairing_command(msg.content):
-                reply = handle_pairing_command(msg.channel, self._pairing_subcommand_text(msg.content))
+                is_operator, is_global = self._resolve_operator(msg.channel, msg.sender_id)
+                if not is_operator:
+                    logger.warning(
+                        "Rejected /pairing from non-operator %s on %s",
+                        msg.sender_id,
+                        msg.channel,
+                    )
+                    await self.bus.publish_outbound(
+                        OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content=(
+                                "Not authorized: pairing management is restricted to "
+                                "configured operators."
+                            ),
+                            metadata={
+                                PAIRING_COMMAND_META_KEY: True,
+                                "unauthorized": True,
+                                "message_id": msg.metadata.get("message_id"),
+                            },
+                        )
+                    )
+                    return
+                reply = handle_pairing_command(
+                    msg.channel,
+                    self._pairing_subcommand_text(msg.content),
+                    requesting_channel=msg.channel,
+                    is_global_operator=is_global,
+                )
                 await self.bus.publish_outbound(
                     OutboundMessage(
                         channel=msg.channel,
                         chat_id=msg.chat_id,
                         content=reply,
-                        metadata={PAIRING_COMMAND_META_KEY: True},
+                        metadata={
+                            PAIRING_COMMAND_META_KEY: True,
+                            "message_id": msg.metadata.get("message_id"),
+                        },
                     )
                 )
                 return
@@ -130,12 +174,18 @@ class ChannelRuntime:
                         channel=msg.channel,
                         chat_id=msg.chat_id,
                         content=reply,
-                        metadata={"_channel_runtime": True, "session_reset": True},
+                        metadata={
+                            "_channel_runtime": True,
+                            "session_reset": True,
+                            "message_id": msg.metadata.get("message_id"),
+                        },
                     )
                 )
                 return
 
             session_id = self._session_for(msg)
+            if await self._handle_scheduled_confirmation(msg, session_id):
+                return
             result = await self.session_service.send_message(
                 session_id,
                 msg.content,
@@ -143,20 +193,66 @@ class ChannelRuntime:
             )
             attempt_id = result.get("attempt_id") if isinstance(result, dict) else None
             reply = await self._wait_for_reply(session_id, attempt_id)
+            reply_content = reply.content
+            try:
+                from src.scheduled_research.proposals import latest_pending_for_session
+
+                proposal = latest_pending_for_session(session_id)
+            except Exception:  # noqa: BLE001 - confirmation UI must not hide the reply
+                proposal = None
+            if proposal is not None:
+                job = proposal.get("job") or {}
+                schedule = job.get("schedule") or {}
+                delivery = job.get("delivery") or {}
+                action = "create" if proposal.get("operation") == "create" else "cancel"
+                reply_content = (
+                    f"{reply_content}\n\n"
+                    f"[Scheduled research confirmation · {action}]\n"
+                    f"Task: {job.get('title') or job.get('id') or '?'}\n"
+                    f"Schedule: {schedule.get('expression') or '-'} · "
+                    f"{schedule.get('timezone') or 'UTC'}\n"
+                    f"Delivery: {delivery.get('target_label') or 'in-app only'}\n"
+                    'Reply exactly "confirm" (确认) to commit, or "cancel" (取消) '
+                    "to discard."
+                )
             await self.bus.publish_outbound(
                 OutboundMessage(
                     channel=msg.channel,
                     chat_id=msg.chat_id,
-                    content=reply.content,
+                    content=reply_content,
                     metadata={
                         "_channel_runtime": True,
                         "attempt_id": attempt_id,
                         "session_id": session_id,
+                        # QQ (and other platforms) need the originating message id
+                        # to reply as a passive message; without it, replies are
+                        # treated as active messages and rejected for
+                        # non-privileged bots.
+                        "message_id": msg.metadata.get("message_id"),
                     },
                 )
             )
         except asyncio.CancelledError:
             raise
+        except SessionBusyError:
+            # A chat maps to one persistent session, so a second message sent
+            # while the first is still running is ordinary user behaviour, not
+            # a fault. Say so plainly instead of surfacing an exception name.
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=(
+                        "Still working on your previous message — send this again "
+                        "once I reply, or use the reset command to start over."
+                    ),
+                    metadata={
+                        "_channel_runtime": True,
+                        "busy": True,
+                        "message_id": msg.metadata.get("message_id"),
+                    },
+                )
+            )
         except Exception as exc:  # noqa: BLE001 - channel errors must surface to users
             logger.exception("Channel runtime failed for %s:%s", msg.channel, msg.chat_id)
             await self.bus.publish_outbound(
@@ -164,9 +260,64 @@ class ChannelRuntime:
                     channel=msg.channel,
                     chat_id=msg.chat_id,
                     content=f"Channel runtime error: {type(exc).__name__}: {exc}",
-                    metadata={"_channel_runtime": True, "error": True},
+                    metadata={
+                        "_channel_runtime": True,
+                        "error": True,
+                        "message_id": msg.metadata.get("message_id"),
+                    },
                 )
             )
+
+    async def _handle_scheduled_confirmation(
+        self, msg: InboundMessage, session_id: str
+    ) -> bool:
+        """Commit/discard exact IM confirmation replies outside the model.
+
+        Tokens are exact-match by design so the model can never confirm on the
+        user's behalf; both the English and the Chinese spelling are accepted
+        because the 16 IM adapters serve both audiences.
+        """
+        token = msg.content.strip().casefold()
+        is_commit = token in {"确认", "confirm"}
+        if not is_commit and token not in {"取消", "cancel"}:
+            return False
+        try:
+            from src.scheduled_research.proposals import (
+                commit_proposal,
+                discard_proposal,
+                latest_pending_for_session,
+            )
+
+            proposal = latest_pending_for_session(session_id)
+            if proposal is None:
+                return False
+            if is_commit:
+                result = commit_proposal(proposal["proposal_id"])
+                action = (
+                    "created" if proposal.get("operation") == "create" else "cancelled"
+                )
+                content = (
+                    f"✅ Scheduled research job {action}: "
+                    f"{result.get('committed_job_id') or '?'}"
+                )
+            else:
+                discard_proposal(proposal["proposal_id"])
+                content = "Discarded this scheduled research change."
+        except Exception as exc:  # noqa: BLE001 - keep proposal pending for retry
+            content = f"Scheduled research confirmation failed: {exc}"
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=content,
+                metadata={
+                    "_channel_runtime": True,
+                    "scheduled_research_confirmation": True,
+                    "message_id": msg.metadata.get("message_id"),
+                },
+            )
+        )
+        return True
 
     def _session_for(self, msg: InboundMessage) -> str:
         key = msg.session_key
@@ -231,6 +382,48 @@ class ChannelRuntime:
         if removed is not None:
             self._save_session_map()
         return removed
+
+    def _resolve_operator(self, channel: str, sender_id: str | None) -> tuple[bool, bool]:
+        """Resolve pairing authorization for a sender.
+
+        Args:
+            channel: The channel the command arrived on.
+            sender_id: The inbound message sender id.
+
+        Returns:
+            ``(is_operator, is_global_operator)``. ``is_operator`` is ``True``
+            for global operators or per-channel operators of ``channel``;
+            ``is_global_operator`` is ``True`` only for channel-independent
+            operators, who may act cross-channel with full request details.
+        """
+        sid = str(sender_id)
+        is_global = sid in self._operators
+        is_channel = sid in self._channel_operators.get(channel, set())
+        return (is_global or is_channel, is_global)
+
+    @staticmethod
+    def operators_from_config(
+        config: Mapping[str, Any] | None,
+    ) -> tuple[set[str], dict[str, set[str]]]:
+        """Extract global and per-channel operators from a channels config dict.
+
+        Args:
+            config: The channels config mapping (as produced by
+                ``ChannelsConfig.model_dump``). Top-level ``operators`` are
+                global; a per-channel section's own ``operators`` list is
+                channel-scoped.
+
+        Returns:
+            ``(global_operators, channel_operators)``.
+        """
+        if not config:
+            return set(), {}
+        global_ops = {str(o) for o in (config.get("operators") or ())}
+        channel_ops: dict[str, set[str]] = {}
+        for key, value in config.items():
+            if isinstance(value, Mapping) and value.get("operators"):
+                channel_ops[str(key)] = {str(o) for o in value["operators"]}
+        return global_ops, channel_ops
 
     @staticmethod
     def _is_pairing_command(content: str) -> bool:

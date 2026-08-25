@@ -7,9 +7,8 @@ import { calcMA, calcBOLL, calcMACD, calcRSI, calcKDJ, calcEMA } from "@/lib/ind
 import { getChartTheme } from "@/lib/chart-theme";
 import { abbreviateNum } from "@/lib/formatters";
 import { echarts, CHART_GROUP, connectCharts } from "@/lib/echarts";
-import { useDarkMode } from "@/hooks/useDarkMode";
-import type { ChartIndicatorInput } from "@/lib/chart-indicators";
-import { resolveChartIndicators } from "@/lib/chart-indicators";
+import { escapeHtml } from "@/lib/escapeHtml";
+import { useThemeDark } from "@/lib/theme-store";
 
 type Sub = "vol" | "macd" | "rsi" | "kdj";
 type Range = "1M" | "3M" | "6M" | "1Y" | "ALL";
@@ -42,7 +41,7 @@ export function CandlestickChart({ data, markers, indicators, height = 500 }: Pr
   const [range, setRange] = useState<Range>("ALL");
   const [overlays, setOverlays] = useState<Set<Overlay>>(new Set(["ma5", "ma20"]));
   const [showMenu, setShowMenu] = useState(false);
-  const { dark } = useDarkMode();
+  const dark = useThemeDark();
 
   const toggleOverlay = useCallback((id: Overlay) => {
     setOverlays(prev => {
@@ -90,9 +89,21 @@ export function CandlestickChart({ data, markers, indicators, height = 500 }: Pr
     connectCharts();
     chartRef.current = chart;
 
-    const ro = new ResizeObserver(() => chart.resize());
+    let resizeFrame: number | null = null;
+    const ro = new ResizeObserver(() => {
+      if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
+      resizeFrame = requestAnimationFrame(() => {
+        resizeFrame = null;
+        chart.resize();
+      });
+    });
     ro.observe(containerRef.current);
-    return () => { ro.disconnect(); chart.dispose(); chartRef.current = null; };
+    return () => {
+      ro.disconnect();
+      if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
+      chart.dispose();
+      chartRef.current = null;
+    };
   }, [data.length === 0, dark]); // only re-init when going empty↔non-empty or theme changes
 
   // Update chart options — setOption on existing instance, no dispose
@@ -136,11 +147,16 @@ export function CandlestickChart({ data, markers, indicators, height = 500 }: Pr
       legendNames.push("BOLL");
     }
 
-    // Trade markers
+    // Trade markers (name renders as markPoint tooltip HTML, so every
+    // artifact-derived field is escaped before interpolation)
     const marks = (markers || []).map(m => ({
       coord: [m.time, m.price],
       value: m.side === "BUY" ? "B" : "S",
-      name: [`${m.side} @ ${m.price}`, m.qty ? `Qty: ${m.qty}` : "", m.reason || ""].filter(Boolean).join("\n"),
+      name: [
+        `${escapeHtml(m.side)} @ ${escapeHtml(String(m.price))}`,
+        m.qty ? `Qty: ${escapeHtml(String(m.qty))}` : "",
+        escapeHtml(m.reason || ""),
+      ].filter(Boolean).join("\n"),
       itemStyle: { color: m.side === "BUY" ? t.upColor : t.downColor },
       label: { color: "#fff", fontSize: 10, fontWeight: "bold" as const },
     }));

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import socket
+import itertools
+import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import ModuleType
@@ -29,6 +31,19 @@ PROFILE_DEFAULT_PORTS = {
     "paper": 7497,
     "live-readonly": 7496,
 }
+
+# TWS market-data tiers. Type 1 (live) requires a paid market-data subscription
+# for the instrument; without one TWS answers error 354 and never sends a tick.
+# Types 3/4 fall back to the free 15-minute delayed feed, so they are the safe
+# default for a research/backtest connector.
+MARKET_DATA_TYPES = {
+    1: "live",
+    2: "frozen",
+    3: "delayed",
+    4: "delayed-frozen",
+}
+
+DEFAULT_MARKET_DATA_TYPE = 3
 
 
 class IBKRDependencyError(RuntimeError):
@@ -55,6 +70,9 @@ class IBKRLocalConfig:
         account: Optional account code to filter requests.
         timeout: Connection timeout in seconds.
         readonly: Always passed as true when the SDK supports it.
+        market_data_type: TWS market-data tier (1 live, 2 frozen, 3 delayed,
+            4 delayed-frozen). Defaults to delayed so quotes work without a
+            paid market-data subscription.
     """
 
     host: str = "127.0.0.1"
@@ -64,6 +82,7 @@ class IBKRLocalConfig:
     account: str | None = None
     timeout: float = 8.0
     readonly: bool = True
+    market_data_type: int = DEFAULT_MARKET_DATA_TYPE
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None = None) -> "IBKRLocalConfig":
@@ -88,6 +107,9 @@ class IBKRLocalConfig:
             account=_clean_optional_str(payload.get("account")),
             timeout=float(payload.get("timeout") or 8.0),
             readonly=bool(payload.get("readonly", True)),
+            market_data_type=_clean_market_data_type(
+                payload.get("market_data_type", payload.get("marketDataType"))
+            ),
         )
 
     def with_overrides(
@@ -98,9 +120,12 @@ class IBKRLocalConfig:
         client_id: int | None = None,
         profile: str | None = None,
         account: str | None = None,
+        market_data_type: int | None = None,
     ) -> "IBKRLocalConfig":
         """Return a copy with CLI/tool overrides applied."""
         payload = asdict(self)
+        if market_data_type is not None:
+            payload["market_data_type"] = market_data_type
         if profile is not None:
             payload["profile"] = profile
             if port is None:
@@ -239,7 +264,7 @@ def tcp_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
 def get_account_snapshot(config: IBKRLocalConfig | None = None) -> dict[str, Any]:
     """Fetch account codes and account summary values."""
     cfg = config or load_config()
-    ib = _connect(cfg)
+    ib = _pool.acquire(cfg)
     try:
         accounts = _managed_accounts(ib)
         summary = [_account_value_to_dict(item) for item in _account_summary(ib, cfg.account)]
@@ -252,13 +277,13 @@ def get_account_snapshot(config: IBKRLocalConfig | None = None) -> dict[str, Any
             "summary": summary,
         }
     finally:
-        _disconnect(ib)
+        _pool.release()
 
 
 def get_positions(config: IBKRLocalConfig | None = None) -> dict[str, Any]:
     """Fetch current IBKR positions."""
     cfg = config or load_config()
-    ib = _connect(cfg)
+    ib = _pool.acquire(cfg)
     try:
         accounts = _managed_accounts(ib)
         _assert_profile(cfg, accounts)
@@ -283,13 +308,13 @@ def get_positions(config: IBKRLocalConfig | None = None) -> dict[str, Any]:
             )
         return {"status": "ok", "profile": cfg.profile, "positions": rows}
     finally:
-        _disconnect(ib)
+        _pool.release()
 
 
 def get_open_orders(config: IBKRLocalConfig | None = None, *, include_executions: bool = False) -> dict[str, Any]:
     """Fetch open orders and optionally recent executions."""
     cfg = config or load_config()
-    ib = _connect(cfg)
+    ib = _pool.acquire(cfg)
     try:
         accounts = _managed_accounts(ib)
         _assert_profile(cfg, accounts)
@@ -302,7 +327,94 @@ def get_open_orders(config: IBKRLocalConfig | None = None, *, include_executions
             result["executions"] = [_execution_to_dict(item) for item in _executions(ib)]
         return result
     finally:
-        _disconnect(ib)
+        _pool.release()
+
+
+
+
+def _tick_has_data(ticker: Any) -> bool:
+    """Return True if the ticker has received at least one real price field.
+
+    ib_async tickers start with None and populate to either a float or
+    ``float('nan')`` (when no trade has occurred in the current session).
+    This function rejects both None and NaN so polling continues
+    until actual market data arrives.
+    """
+    import math
+
+    for field in ("bid", "ask", "last"):
+        value = _obj_get(ticker, field)
+        if value is not None and not (isinstance(value, float) and math.isnan(value)):
+            return True
+    return False
+
+
+def _apply_market_data_type(ib: Any, config: IBKRLocalConfig) -> str | None:
+    """Select the TWS market-data tier before requesting prices.
+
+    TWS defaults to live data (type 1). An account without a market-data
+    subscription for the instrument then gets error 354 and the ticker never
+    fills, so the caller silently receives null prices after the full poll
+    timeout. Setting type 3/4 falls back to the free delayed feed instead.
+
+    Applying the tier is best-effort — an SDK build without
+    ``reqMarketDataType`` must not fail an otherwise valid read — but the
+    failure is never silent. The caller reports the requested and the applied
+    tier separately: a quote served on TWS's own default tier is byte-identical
+    to one served on the tier we asked for, so labelling an unapplied request
+    as applied sends the user to debug a subscription that is not the problem.
+
+    Args:
+        ib: Connected ``ib_async`` client, or a stub in tests.
+        config: Connector config carrying the requested tier.
+
+    Returns:
+        ``None`` when the tier was applied, otherwise a short reason why not.
+    """
+    fn = getattr(ib, "reqMarketDataType", None)
+    if fn is None:
+        return "the connected ib_async build does not expose reqMarketDataType"
+    try:
+        fn(int(config.market_data_type))
+    except Exception as exc:  # noqa: BLE001 - never fail a read over a tier hint
+        return f"reqMarketDataType({config.market_data_type}) failed: {exc}"
+    return None
+
+
+def _unapplied_tier_warning(tier: str, reason: str) -> str:
+    """Build the warning shown when TWS served a read on an unlabelled tier."""
+    return (
+        f"The '{tier}' market-data tier was NOT applied ({reason}). TWS served this "
+        "request on whichever tier it already had selected, which defaults to live "
+        "— treat these prices as unlabelled."
+    )
+
+
+def _wait_for_tick(ib: Any, ticker: Any, *, timeout: float = 5.0, poll_interval: float = 0.1) -> bool:
+    """Pump the ib_async event loop until the snapshot ticker fills.
+
+    ``reqMktData(..., snapshot=True)`` returns immediately but the ticker
+    fields (bid, ask, last, ...) only populate after the event loop
+    processes the incoming tick.  This helper calls ``ib.sleep()`` in
+    short increments, checking ``_tick_has_data`` on each cycle, and
+    exits as soon as real market data arrives.
+
+    Uses ``ib.sleep()`` (not ``waitOnUpdate``) because ``ib.sleep``
+    reliably processes all pending socket messages on each call, while
+    ``waitOnUpdate`` can return True for unrelated messages, causing
+    premature exit with NaN fields.
+
+    Returns:
+        True if real market data arrived before the deadline, False on timeout.
+    """
+    import time as _time
+
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if _tick_has_data(ticker):
+            return True
+        _sleep(ib, poll_interval)
+    return _tick_has_data(ticker)
 
 
 def get_quote(
@@ -315,23 +427,23 @@ def get_quote(
 ) -> dict[str, Any]:
     """Fetch a top-of-book quote snapshot."""
     cfg = config or load_config()
-    ib = _connect(cfg)
+    ib = _pool.acquire(cfg)
     try:
         accounts = _managed_accounts(ib)
         _assert_profile(cfg, accounts)
         contract = _make_contract(symbol, exchange=exchange, currency=currency, sec_type=sec_type)
         _qualify_contract(ib, contract)
-        ticker = ib.reqMktData(contract, "", False, False)
-        _sleep(ib, 2.0)
-        try:
-            ib.cancelMktData(contract)
-        except Exception:
-            pass
-        return {
-            "status": "ok",
+        tier_unapplied = _apply_market_data_type(ib, cfg)
+        ticker = ib.reqMktData(contract, "", True, False)
+        received = _wait_for_tick(ib, ticker)
+        tier = MARKET_DATA_TYPES.get(cfg.market_data_type, str(cfg.market_data_type))
+        result = {
+            "status": "ok" if received else "no_data",
             "symbol": symbol.upper(),
             "exchange": exchange,
             "currency": currency,
+            "market_data_type_requested": tier,
+            "market_data_type_applied": None if tier_unapplied else tier,
             "quote": {
                 "bid": _obj_get(ticker, "bid"),
                 "ask": _obj_get(ticker, "ask"),
@@ -341,8 +453,25 @@ def get_quote(
                 "time": str(_obj_get(ticker, "time", "")),
             },
         }
+        if tier_unapplied:
+            result["warning"] = _unapplied_tier_warning(tier, tier_unapplied)
+        if not received:
+            result["error"] = (
+                f"No market data arrived for {symbol.upper()}. "
+                + (
+                    f"The '{tier}' tier was not applied, so TWS most likely used its "
+                    "live tier, which needs a market-data subscription for this "
+                    "instrument. "
+                    if tier_unapplied
+                    else f"The '{tier}' tier was applied, so a missing market-data "
+                    "subscription is an unlikely cause. "
+                )
+                + "Other causes: the market is closed (try market_data_type 2 or 4 "
+                "for frozen last-known prices), or the symbol/exchange pair is wrong."
+            )
+        return result
     finally:
-        _disconnect(ib)
+        _pool.release()
 
 
 def get_historical_bars(
@@ -359,12 +488,13 @@ def get_historical_bars(
 ) -> dict[str, Any]:
     """Fetch historical bars from local TWS / IB Gateway."""
     cfg = config or load_config()
-    ib = _connect(cfg)
+    ib = _pool.acquire(cfg)
     try:
         accounts = _managed_accounts(ib)
         _assert_profile(cfg, accounts)
         contract = _make_contract(symbol, exchange=exchange, currency=currency, sec_type=sec_type)
         _qualify_contract(ib, contract)
+        tier_unapplied = _apply_market_data_type(ib, cfg)
         bars = ib.reqHistoricalData(
             contract,
             endDateTime="",
@@ -374,46 +504,99 @@ def get_historical_bars(
             useRTH=use_rth,
             formatDate=1,
         )
-        return {
+        tier = MARKET_DATA_TYPES.get(cfg.market_data_type, str(cfg.market_data_type))
+        result = {
             "status": "ok",
             "symbol": symbol.upper(),
             "duration": duration,
             "bar_size": bar_size,
+            "market_data_type_requested": tier,
+            "market_data_type_applied": None if tier_unapplied else tier,
             "bars": [_bar_to_dict(bar) for bar in bars],
         }
+        if tier_unapplied:
+            result["warning"] = _unapplied_tier_warning(tier, tier_unapplied)
+        return result
     finally:
-        _disconnect(ib)
+        _pool.release()
+
+import itertools
+
+class _TwsPool:
+    """Thread-local IB connection pool with per-thread reference counting.
+
+    Each worker thread gets its own ``ib_async.IB`` socket with a unique
+    client ID.  The connection is lazily created and reused across
+    multiple tool calls within the same thread; it is disconnected only
+    when the refcount drops to zero (balanced acquire/release).
+
+    This avoids client-ID collisions in the agent's parallel tool
+    executor while respecting ``ib_async``'s single-thread-per-socket
+    design — no socket is shared across threads.
+    """
+
+    _counter = itertools.count(1)
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._local = threading.local()
+
+    @staticmethod
+    def _new_client_id(base: int) -> int:
+        return base + next(_TwsPool._counter)
+
+    def acquire(self, config: IBKRLocalConfig) -> Any:
+        refcount = getattr(self._local, "refcount", 0)
+        if refcount > 0:
+            self._local.refcount = refcount + 1
+            return self._local.ib
+
+        if not tcp_port_open(config.host, config.port):
+            raise IBKRConnectionError(
+                f"No TWS / IB Gateway socket is listening at {config.host}:{config.port}. "
+                "Open TWS or IB Gateway, log in, and enable API socket clients."
+            )
+        module = _require_ib_async()
+        ib = module.IB()
+        unique_id = self._new_client_id(config.client_id)
+        try:
+            ib.connect(
+                config.host,
+                config.port,
+                clientId=unique_id,
+                timeout=config.timeout,
+                readonly=config.readonly,
+                account=config.account or "",
+            )
+        except TypeError:
+            ib.connect(config.host, config.port, clientId=unique_id, timeout=config.timeout)
+        except Exception as exc:
+            raise IBKRConnectionError(
+                f"Could not connect to TWS / IB Gateway at {config.host}:{config.port}: {exc}"
+            ) from exc
+        self._local.ib = ib
+        self._local.refcount = 1
+        return ib
+
+    def release(self) -> None:
+        refcount = getattr(self._local, "refcount", 0)
+        if refcount <= 0:
+            return
+        refcount -= 1
+        if refcount > 0:
+            self._local.refcount = refcount
+            return
+        self._local.refcount = 0
+        ib = getattr(self._local, "ib", None)
+        if ib is not None:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+            self._local.ib = None
 
 
-def _connect(config: IBKRLocalConfig):
-    if not tcp_port_open(config.host, config.port):
-        raise IBKRConnectionError(
-            f"No TWS / IB Gateway socket is listening at {config.host}:{config.port}. "
-            "Open TWS or IB Gateway, log in, and enable API socket clients."
-        )
-    module = _require_ib_async()
-    ib = module.IB()
-    try:
-        ib.connect(
-            config.host,
-            config.port,
-            clientId=config.client_id,
-            timeout=config.timeout,
-            readonly=config.readonly,
-            account=config.account or "",
-        )
-    except TypeError:
-        ib.connect(config.host, config.port, clientId=config.client_id, timeout=config.timeout)
-    except Exception as exc:
-        raise IBKRConnectionError(f"Could not connect to TWS / IB Gateway at {config.host}:{config.port}: {exc}") from exc
-    return ib
-
-
-def _disconnect(ib: Any) -> None:
-    try:
-        ib.disconnect()
-    except Exception:
-        pass
+_pool = _TwsPool()
 
 
 def _require_ib_async() -> ModuleType:
@@ -469,10 +652,16 @@ def _make_contract(symbol: str, *, exchange: str, currency: str, sec_type: str) 
 
 
 def _qualify_contract(ib: Any, contract: Any) -> None:
+    """Qualify the contract, populating conId and exchange fields.
+
+    Raises IBKRConnectionError if qualification fails.
+    """
     try:
         ib.qualifyContracts(contract)
-    except Exception:
-        pass
+    except Exception as exc:
+        raise IBKRConnectionError(
+            f"Failed to qualify contract {contract}: {exc}"
+        ) from exc
 
 
 def _sleep(ib: Any, seconds: float) -> None:
@@ -505,6 +694,28 @@ def _obj_get(obj: Any, name: str, default: Any = None) -> Any:
     if isinstance(obj, Mapping):
         return obj.get(name, default)
     return getattr(obj, name, default)
+
+
+def _clean_market_data_type(value: Any) -> int:
+    """Normalize a market-data tier, accepting either the code or its name."""
+    if value is None or value == "":
+        return DEFAULT_MARKET_DATA_TYPE
+    if isinstance(value, str):
+        text = value.strip().lower()
+        for code, name in MARKET_DATA_TYPES.items():
+            if text == name:
+                return code
+        try:
+            value = int(text)
+        except ValueError as exc:
+            raise ValueError(
+                f"market_data_type must be one of {sorted(MARKET_DATA_TYPES)} "
+                f"or {sorted(MARKET_DATA_TYPES.values())}"
+            ) from exc
+    code = int(value)
+    if code not in MARKET_DATA_TYPES:
+        raise ValueError(f"market_data_type must be one of {sorted(MARKET_DATA_TYPES)}")
+    return code
 
 
 def _clean_optional_str(value: Any) -> str | None:

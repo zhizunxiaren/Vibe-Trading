@@ -9,6 +9,15 @@
     "api_key_required": true
   },
   {
+    "name": "requesty",
+    "label": "Requesty",
+    "api_key_env": "REQUESTY_API_KEY",
+    "base_url_env": "REQUESTY_BASE_URL",
+    "default_model": "openai/gpt-4o-mini",
+    "default_base_url": "https://router.requesty.ai/v1",
+    "api_key_required": true
+  },
+  {
     "name": "openai",
     "label": "OpenAI",
     "api_key_env": "OPENAI_API_KEY",
@@ -18,11 +27,20 @@
     "api_key_required": true
   },
   {
+    "name": "anthropic",
+    "label": "Anthropic / Messages API Proxy",
+    "api_key_env": "ANTHROPIC_API_KEY",
+    "base_url_env": "ANTHROPIC_BASE_URL",
+    "default_model": "claude-sonnet-4-6",
+    "default_base_url": "https://api.anthropic.com",
+    "api_key_required": true
+  },
+  {
     "name": "openai-codex",
     "label": "OpenAI Codex (ChatGPT OAuth)",
     "api_key_env": null,
     "base_url_env": "OPENAI_CODEX_BASE_URL",
-    "default_model": "openai-codex/gpt-5.3-codex",
+    "default_model": "openai-codex/gpt-5.4",
     "default_base_url": "https://chatgpt.com/backend-api/codex/responses",
     "api_key_required": false,
     "auth_type": "oauth",
@@ -35,6 +53,33 @@
     "base_url_env": "DEEPSEEK_BASE_URL",
     "default_model": "deepseek-v4-pro",
     "default_base_url": "https://api.deepseek.com/v1",
+    "api_key_required": true
+  },
+  {
+    "name": "siliconflow-cn",
+    "label": "SiliconFlow (CN)",
+    "api_key_env": "SILICONFLOW_API_KEY",
+    "base_url_env": "SILICONFLOW_BASE_URL",
+    "default_model": "deepseek-ai/DeepSeek-V3.1-Terminus",
+    "default_base_url": "https://api.siliconflow.cn/v1",
+    "api_key_required": true
+  },
+  {
+    "name": "siliconflow-global",
+    "label": "SiliconFlow (Global)",
+    "api_key_env": "SILICONFLOW_GLOBAL_API_KEY",
+    "base_url_env": "SILICONFLOW_GLOBAL_BASE_URL",
+    "default_model": "deepseek-ai/DeepSeek-V3.1-Terminus",
+    "default_base_url": "https://api.siliconflow.com/v1",
+    "api_key_required": true
+  },
+  {
+    "name": "nvidia",
+    "label": "NVIDIA NIM",
+    "api_key_env": "NVIDIA_API_KEY",
+    "base_url_env": "NVIDIA_BASE_URL",
+    "default_model": "nvidia/nemotron-3-ultra-550b-a55b",
+    "default_base_url": "https://integrate.api.nvidia.com/v1",
     "api_key_required": true
   },
   {
@@ -53,6 +98,15 @@
     "base_url_env": "GROQ_BASE_URL",
     "default_model": "meta-llama/llama-4-maverick-17b-128e-instruct",
     "default_base_url": "https://api.groq.com/openai/v1",
+    "api_key_required": true
+  },
+  {
+    "name": "novita",
+    "label": "Novita AI",
+    "api_key_env": "NOVITA_API_KEY",
+    "base_url_env": "NOVITA_BASE_URL",
+    "default_model": "moonshotai/kimi-k3",
+    "default_base_url": "https://api.novita.ai/openai",
     "api_key_required": true
   },
   {
@@ -101,12 +155,25 @@
     "api_key_required": true
   },
   {
+    "name": "kimi-coding",
+    "label": "Kimi for Coding (subscription plan)",
+    "api_key_env": "KIMI_CODING_API_KEY",
+    "base_url_env": "KIMI_CODING_BASE_URL",
+    "default_model": "kimi-for-coding",
+    "default_base_url": "https://api.kimi.com/coding/v1",
+    "api_key_required": true
+  },
+  {
     "name": "minimax",
     "label": "MiniMax",
     "api_key_env": "MINIMAX_API_KEY",
     "base_url_env": "MINIMAX_BASE_URL",
     "default_model": "MiniMax-M3",
     "default_base_url": "https://api.minimax.io/v1",
+    "base_url_options": [
+      "https://api.minimax.io/v1",
+      "https://api.minimaxi.com/v1"
+    ],
     "api_key_required": true
   },
   {
@@ -119,12 +186,30 @@
     "api_key_required": true
   },
   {
+    "name": "spark",
+    "label": "iFlytek Spark",
+    "api_key_env": "SPARK_API_KEY",
+    "base_url_env": "SPARK_BASE_URL",
+    "default_model": "4.0Ultra",
+    "default_base_url": "https://spark-api-open.xf-yun.com/v1",
+    "api_key_required": true
+  },
+  {
     "name": "zai",
     "label": "Z.ai",
     "api_key_env": "ZAI_API_KEY",
     "base_url_env": "ZAI_BASE_URL",
     "default_model": "glm-5.1",
     "default_base_url": "https://api.z.ai/api/coding/paas/v4",
+    "api_key_required": true
+  },
+  {
+    "name": "modelscope",
+    "label": "ModelScope",
+    "api_key_env": "MODELSCOPE_API_KEY",
+    "base_url_env": "MODELSCOPE_BASE_URL",
+    "default_model": "Qwen/Qwen3.5-27B",
+    "default_base_url": "https://api-inference.modelscope.cn/v1",
     "api_key_required": true
   },
   {
@@ -135,5 +220,16 @@
     "default_model": "qwen2.5:32b",
     "default_base_url": "http://localhost:11434",
     "api_key_required": false
+  },
+  {
+    "name": "copilot",
+    "label": "GitHub Copilot SDK",
+    "api_key_env": "COPILOT_GITHUB_TOKEN",
+    "base_url_env": "COPILOT_BASE_URL",
+    "default_model": "claude-sonnet-5",
+    "default_base_url": "https://api.githubcopilot.com",
+    "api_key_required": false,
+    "auth_type": "gh_cli",
+    "login_command": "gh auth login"
   }
 ]

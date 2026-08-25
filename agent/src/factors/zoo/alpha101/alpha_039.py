@@ -43,7 +43,7 @@ __alpha_meta__ = {
     'columns_required': ['close', 'volume'],
     'extras_required': [],
     'requires_sector': False,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 250,
@@ -61,7 +61,7 @@ def compute(panel: dict) -> pd.DataFrame:
     close = panel["close"]
     volume = panel["volume"]
     adv20 = ts_mean(volume, 20)
-    returns = close.pct_change()
+    returns = close.pct_change(fill_method=None)
     # Helper aliases (local closures keep the file standalone & purity-safe).
     rolling_sum = _rolling_sum
     out = (-1.0 * rank(delta(close, 7) * (1.0 - rank(decay_linear(safe_div(volume, adv20), 9))))) * (1.0 + rank(rolling_sum(returns, 250)))

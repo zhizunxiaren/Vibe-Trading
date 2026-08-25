@@ -143,6 +143,9 @@ class _StubChatLLM:
     def chat(self, messages, tools=None, timeout=None):  # pragma: no cover — fallback path
         return self.stream_chat(messages, tools=tools)
 
+    def close(self) -> None:
+        """No-op: the stub owns no HTTP client."""
+
 
 def _stub_llm_factory(responses: list[LLMResponse]):
     """Build a callable that reads as ``ChatLLM(model_name=...)`` would.
@@ -480,6 +483,9 @@ def test_tool_call_events_carry_mcp_metadata_and_redact_sensitive_arguments(
     assert call_data["remote_tool"] == "search"
     assert result_data["server"] == "kb"
     assert result_data["remote_tool"] == "search"
+    assert call_data["call_id"] == "tc-1"
+    assert result_data["call_id"] == "tc-1"
+    assert result_data["status"] == "ok"
 
     # R-10: redaction is applied to known sensitive keys.
     assert call_data["arguments"]["api_key"] == "[redacted]"
@@ -565,6 +571,8 @@ def test_remote_tool_transport_failure_does_not_crash_worker(tmp_path: Path) -> 
     # decide what to do next. ``stream_chat`` was called twice: once to
     # produce the tool call and once to produce the final text.
     assert len(llm_factory.stub.tool_defs_seen) >= 2  # type: ignore[attr-defined]
+    tool_results = [event for event in events if event.type == "tool_result"]
+    assert tool_results and tool_results[0].data["status"] == "error"
 
 
 # --------------------------------------------------------------------------- #

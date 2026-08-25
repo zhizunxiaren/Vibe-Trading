@@ -43,7 +43,7 @@ __alpha_meta__ = {
     'columns_required': ['low', 'close', 'volume'],
     'extras_required': [],
     'requires_sector': False,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 240,
@@ -69,7 +69,7 @@ def compute(panel: dict) -> pd.DataFrame:
     low = panel["low"]
     volume = panel["volume"]
 
-    returns = close.pct_change()
+    returns = close.pct_change(fill_method=None)
     # Helper aliases (local closures keep the file standalone & purity-safe).
     rolling_sum = _rolling_sum
     delay = _delay

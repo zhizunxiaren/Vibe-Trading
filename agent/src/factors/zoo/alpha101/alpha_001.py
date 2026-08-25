@@ -43,7 +43,7 @@ __alpha_meta__ = {
     'columns_required': ['close'],
     'extras_required': [],
     'requires_sector': False,
-    'universe': ['equity_us'],
+    'universe': ['equity_us', 'equity_in', 'equity_kr'],
     'frequency': ['1D'],
     'decay_horizon': 5,
     'min_warmup_bars': 25,
@@ -56,7 +56,7 @@ def compute(panel: dict) -> pd.DataFrame:
     close = panel["close"]
 
 
-    returns = close.pct_change()
+    returns = close.pct_change(fill_method=None)
     # Helper aliases (local closures keep the file standalone & purity-safe).
     cond = (returns < 0).astype(float)
     x = ts_std(returns, 20) * cond + close * (1.0 - cond)

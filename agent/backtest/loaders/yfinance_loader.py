@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from typing import Dict, List, Optional, Union
 
 import pandas as pd
 import yfinance as yf
+
+logger = logging.getLogger(__name__)
 
 from backtest.loaders.base import (
     loader_cache_get,
@@ -33,6 +36,15 @@ _INTERVAL_MAP = {
     "1D": "1d",
     "1H": "1h",
     "4H": "1h",
+    "4h": "1h",  # yfinance has no 4h; match project ``4H`` → ``1h``
+    "1W": "1wk",
+    "1w": "1wk",
+    "1M": "1mo",
+    # Minute tokens stay lowercase; do not fold ``1M`` (month) via ``.lower()``.
+    "1m": "1m",
+    "5m": "5m",
+    "15m": "15m",
+    "30m": "30m",
 }
 
 
@@ -40,7 +52,8 @@ def _to_yfinance_symbol(code: str) -> str:
     """Convert project symbols into yfinance symbols.
 
     Args:
-        code: Project symbol, for example ``AAPL.US`` or ``700.HK``.
+        code: Project symbol, for example ``AAPL.US``, ``700.HK``, or
+            ``TD.TO``.
 
     Returns:
         yfinance-compatible symbol.
@@ -57,6 +70,9 @@ def _to_yfinance_symbol(code: str) -> str:
         return upper[:-5] + "-USD"
     if upper.endswith("-USDC"):
         return upper[:-5] + "-USD"
+    # India NSE/BSE (RELIANCE.NS, 500325.BO), Korea KRX (005930.KS,
+    # 247540.KQ), Canada TSX/TSXV (TD.TO, PNG.V), and Vietnam HOSE (VIC.VN):
+    # yfinance carries these suffixes as-is.
     return upper
 
 
@@ -189,7 +205,12 @@ def _normalize_frame(frame: pd.DataFrame, requested_interval: str) -> pd.DataFra
     normalized = normalized.dropna(subset=["open", "high", "low", "close"])
     normalized = validate_ohlc(normalized)
 
-    if requested_interval == "4H" and not normalized.empty:
+    # ``requested_interval`` reaches here with whatever case the caller used
+    # (``_INTERVAL_MAP`` accepts both ``4H`` and ``4h``). A case-sensitive
+    # check here let lowercase ``4h`` fetch hourly data via
+    # ``_to_yfinance_interval`` but skip this resample, silently returning
+    # native 1h bars mislabeled as 4H.
+    if str(requested_interval).strip().upper() == "4H" and not normalized.empty:
         normalized = normalized.resample("4h").agg(
             {
                 "open": "first",
@@ -207,7 +228,22 @@ def _normalize_frame(frame: pd.DataFrame, requested_interval: str) -> pd.DataFra
 
 @register
 class DataLoader:
-    """Fetch HK/US equity bars from Yahoo Finance via yfinance."""
+    """Fetch global-equity and crypto bars from Yahoo Finance via yfinance."""
+
+    name = "yfinance"
+    markets = {
+        "us_equity", "hk_equity", "india_equity", "kr_equity", "ca_equity",
+        "vietnam_equity", "crypto",
+    }
+    # yfinance volume is single shares for US/HK equities
+    # (HKUDS/Vibe-Trading#1062; HK verified 2026-08-11, 00700.HK ratio 1.00
+    # vs tencent/eastmoney). Crypto base-asset units stay undeclared.
+    volume_units = {"us_equity": "shares", "hk_equity": "shares"}
+    requires_auth = False
+
+    def is_available(self) -> bool:
+        """Always available (free public data, no auth)."""
+        return True
 
     name = "yfinance"
     markets = {"us_equity", "hk_equity", "crypto"}
@@ -229,13 +265,15 @@ class DataLoader:
         codes: List[str],
         start_date: str,
         end_date: str,
-        fields: Optional[List[str]] = None,
+        *,
         interval: str = "1D",
+        fields: Optional[List[str]] = None,
     ) -> Dict[str, pd.DataFrame]:
         """Fetch OHLCV history keyed by the original project symbols.
 
         Args:
-            codes: Project symbols such as ``AAPL.US`` and ``700.HK``.
+            codes: Project symbols such as ``AAPL.US``, ``700.HK``, and
+                ``TD.TO``.
             start_date: Start date in ``YYYY-MM-DD`` format.
             end_date: End date in ``YYYY-MM-DD`` format.
             fields: Ignored for yfinance; included for interface compatibility.
@@ -284,7 +322,7 @@ class DataLoader:
         try:
             bulk_data = _download_history(pending, start_date, yf_end_date, yf_interval)
         except Exception as exc:
-            print(f"[WARN] yfinance bulk download failed for {pending}: {exc}")
+            logger.warning("yfinance bulk download failed for %s: %s", pending, exc)
             bulk_data = pd.DataFrame()
 
         for symbol in pending:
@@ -295,7 +333,7 @@ class DataLoader:
 
                 normalized = _normalize_frame(symbol_frame, requested_interval)
                 if normalized.empty:
-                    print(f"[WARN] yfinance returned no usable data for {symbol}")
+                    logger.warning("yfinance returned no usable data for %s", symbol)
                     continue
 
                 loader_cache_put(
@@ -310,7 +348,7 @@ class DataLoader:
                 for original_code in symbol_groups[symbol]:
                     results[original_code] = normalized.copy()
             except Exception as exc:
-                print(f"[WARN] Failed to fetch data for {symbol}: {exc}")
+                logger.warning("Failed to fetch data for %s: %s", symbol, exc)
                 continue
 
         return results

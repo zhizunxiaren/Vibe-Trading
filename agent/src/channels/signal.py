@@ -72,6 +72,20 @@ def _sig_strip_cell(s: str) -> str:
     return s.strip()
 
 
+def _sig_split_row(line: str) -> list[str]:
+    """Split a markdown table row, keeping empty leading/trailing cells.
+
+    ``str.strip("|")`` would also drop empty edge cells (``||Name|`` → ``Name``,
+    ``|a|b||`` → ``a|b``), so only peel the row's bounding pipes.
+    """
+    parts = line.strip().split("|")
+    if parts and parts[0] == "":
+        parts = parts[1:]
+    if parts and parts[-1] == "":
+        parts = parts[:-1]
+    return [_sig_strip_cell(c) for c in parts]
+
+
 def _sig_render_table(table_lines: list[str]) -> str:
     """Render a markdown pipe-table as fixed-width plain text."""
 
@@ -81,7 +95,7 @@ def _sig_render_table(table_lines: list[str]) -> str:
     rows: list[list[str]] = []
     has_sep = False
     for line in table_lines:
-        cells = [_sig_strip_cell(c) for c in line.strip().strip("|").split("|")]
+        cells = _sig_split_row(line)
         if all(re.match(r"^:?-+:?$", c) for c in cells if c):
             has_sep = True
             continue
@@ -234,27 +248,25 @@ def _partition_styles(
 ) -> list[list[str]]:
     """Partition Signal textStyle ranges across message chunks.
 
-    ``split_message`` slices ``plain_text`` into pieces (optionally trimming
-    whitespace at the boundaries), but the style ranges produced by
-    ``_markdown_to_signal`` are expressed in UTF-16 offsets relative to the
-    full ``plain_text``. This redistributes them per chunk with offsets
-    rebased to each chunk's start. Ranges that span a boundary are split
-    across the chunks they touch; ranges that fall entirely in trimmed
-    whitespace are dropped.
+    ``split_message`` slices ``plain_text`` into pieces and drops at most one
+    leading ``\\n`` or space at each cut (indent on the next line is kept).
+    Style ranges from ``_markdown_to_signal`` use UTF-16 offsets into the full
+    ``plain_text``; this rebases them per chunk. Ranges that land only on the
+    dropped separator are omitted.
     """
     if not chunks:
         return []
     if not text_styles:
         return [[] for _ in chunks]
 
-    # Locate each chunk's UTF-16 start in plain_text. split_message lstrips at
-    # boundaries (but not before the first chunk), so we skip whitespace
-    # between chunks to mirror that.
+    # Mirror split_message: after chunk 0, skip one separator char if present
+    # (split_message unconditionally drops at most one leading \n or space).
     chunk_ranges: list[tuple[int, int]] = []
     cursor = 0  # Python codepoint cursor in plain_text
     for i, chunk in enumerate(chunks):
-        if i > 0:
-            while cursor < len(plain_text) and plain_text[cursor].isspace():
+        if i > 0 and cursor < len(plain_text):
+            ch = plain_text[cursor]
+            if ch == "\n" or ch == " ":
                 cursor += 1
         utf16_start = _utf16_len(plain_text[:cursor])
         utf16_end = utf16_start + _utf16_len(chunk)
@@ -849,6 +861,24 @@ class SignalChannel(BaseChannel):
             )
 
             is_command = bool(message_text and message_text.strip().startswith("/"))
+            is_control_plane = is_command and message_text.strip().lower().startswith("/pairing")
+            if is_control_plane:
+                # Control-plane commands (/pairing) must never be authorized by
+                # group membership alone: require the sender to pass the
+                # per-sender allowlist, otherwise any member of an allowed group
+                # could drive pairing takeover. The runtime operator gate is the
+                # authoritative check; this just avoids even publishing an
+                # unauthorized control-plane command. Ordinary commands
+                # (/new, /reset) keep their existing group behavior — no
+                # asymmetry vs other channels.
+                if not self.is_allowed(sender_id):
+                    self.logger.info(
+                        "Ignoring group control-plane command from unauthorized sender {} in {}",
+                        sender_id,
+                        chat_id,
+                    )
+                    return False, chat_id
+                return True, chat_id
             if not is_command and not self._should_respond_in_group(message_text, mentions):
                 self.logger.info(
                     "Ignoring group message (require_mention: {})",

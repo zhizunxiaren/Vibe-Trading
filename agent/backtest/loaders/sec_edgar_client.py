@@ -25,7 +25,6 @@ shape. The ticker->CIK table is fetched once per process and memoized.
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from typing import Any, Dict, Optional
 
@@ -44,6 +43,10 @@ _MIN_INTERVAL_DEFAULT = 0.12
 _MIN_INTERVAL_ENV = "VIBE_TRADING_SEC_MIN_INTERVAL"
 
 _TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+
+# Symbol suffixes that denote a market rather than a share class, so they can be
+# stripped before a ticker lookup.
+_MARKET_SUFFIXES = frozenset({"US"})
 _SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 _COMPANY_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 
@@ -64,7 +67,9 @@ def _min_interval() -> float:
 
 def _user_agent() -> str:
     """Return the compliant contact UA, honoring the ``VIBE_TRADING_SEC_UA`` override."""
-    override = os.getenv(_UA_ENV)
+    from src.config.accessor import get_env_config
+
+    override = get_env_config().data.vibe_trading_sec_ua
     if override and override.strip():
         return override.strip()
     return _DEFAULT_SEC_UA
@@ -173,7 +178,21 @@ def cik_for(ticker: str) -> Optional[str]:
     """
     if not ticker or not ticker.strip():
         return None
-    return _ticker_map().get(ticker.strip().upper())
+    table = _ticker_map()
+    candidate = ticker.strip().upper()
+    if candidate in table:
+        return table[candidate]
+    # ``AAPL.US`` is this project's US symbol convention while the SEC table
+    # carries the bare ticker. Only a known market suffix may be stripped — a
+    # trailing ``.B`` is a share class, not a market.
+    head, _, tail = candidate.rpartition(".")
+    if head and tail in _MARKET_SUFFIXES:
+        candidate = head
+        if candidate in table:
+            return table[candidate]
+    # The SEC table writes share classes with a dash (``BRK-B``, ``MOG-A``) and
+    # contains no dots at all; users and vendors commonly write a dot.
+    return table.get(candidate.replace(".", "-"))
 
 
 def get_submissions(cik: str | int) -> Dict[str, Any]:

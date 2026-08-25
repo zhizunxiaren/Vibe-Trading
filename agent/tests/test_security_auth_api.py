@@ -22,12 +22,22 @@ def _local_client() -> TestClient:
 
 
 @pytest.fixture(autouse=True)
-def clear_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Start every auth test from dev-mode auth."""
+def clear_api_key(monkeypatch: pytest.MonkeyPatch):
+    """Start every auth test from dev-mode auth.
+
+    The cached ``EnvConfig`` singleton is reset on both sides of the test so a
+    case that sets ``API_AUTH_KEY`` / ``VIBE_TRADING_TRUST_DOCKER_LOOPBACK``
+    cannot leak a stale config into the next one.
+    """
+    from src.config.accessor import reset_env_config
+
     monkeypatch.delenv("API_AUTH_KEY", raising=False)
     monkeypatch.delenv("VIBE_TRADING_TRUST_DOCKER_LOOPBACK", raising=False)
     monkeypatch.delenv("VIBE_TRADING_ENABLE_SHELL_TOOLS", raising=False)
     monkeypatch.setattr(api_server, "_API_KEY", "")
+    reset_env_config()
+    yield
+    reset_env_config()
 
 
 def test_remote_write_requires_api_key_when_key_unset() -> None:
@@ -65,9 +75,18 @@ def test_local_dev_write_allowed_when_key_unset() -> None:
     assert response.status_code in {201, 501}
 
 
+def test_remote_capability_inventory_requires_api_key_when_key_unset() -> None:
+    client = _remote_client()
+
+    for path in ("/skills", "/swarm/presets", "/openapi.json"):
+        assert client.get(path).status_code == 403, path
+
+
 def test_docker_gateway_dev_write_allowed_only_with_compose_trust_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from src.config.accessor import reset_env_config
+
     request = SimpleNamespace(client=SimpleNamespace(host="172.18.0.1"))
     monkeypatch.setattr(
         api_server,
@@ -78,8 +97,28 @@ def test_docker_gateway_dev_write_allowed_only_with_compose_trust_flag(
     assert not api_server._is_local_client(request)
 
     monkeypatch.setenv("VIBE_TRADING_TRUST_DOCKER_LOOPBACK", "1")
+    reset_env_config()
 
     assert api_server._is_local_client(request)
+
+
+def test_default_docker_gateway_browser_flow_remains_zero_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The compose gateway trust reaches a sensitive route without a key."""
+    from src.config.accessor import reset_env_config
+
+    monkeypatch.setenv("VIBE_TRADING_TRUST_DOCKER_LOOPBACK", "1")
+    monkeypatch.setattr(
+        api_server,
+        "_default_gateway_ips",
+        lambda: {ipaddress.IPv4Address("172.18.0.1")},
+    )
+    reset_env_config()
+
+    client = TestClient(api_server.app, client=("172.18.0.1", 50000))
+    response = client.post("/sessions", json={})
+    assert response.status_code in {201, 501}
 
 
 def test_docker_network_peer_is_not_local_even_with_compose_trust_flag(
@@ -108,6 +147,9 @@ def test_configured_api_key_required_for_sensitive_reads(
         "/sessions",
         "/sessions/abcdef012345/goal",
         "/swarm/runs",
+        "/skills",
+        "/swarm/presets",
+        "/openapi.json",
     ]:
         response = client.get(path)
         assert response.status_code == 401, path
@@ -119,27 +161,29 @@ def test_configured_api_key_accepts_bearer_for_sensitive_reads(
     monkeypatch.setenv("API_AUTH_KEY", "secret")
     monkeypatch.setattr(api_server, "_API_KEY", "secret")
 
-    response = _remote_client().get(
-        "/runs",
-        headers={"Authorization": "Bearer secret"},
-    )
-
-    assert response.status_code == 200
+    client = _remote_client()
+    for path in ("/runs", "/skills", "/swarm/presets", "/openapi.json"):
+        response = client.get(path, headers={"Authorization": "Bearer secret"})
+        assert response.status_code == 200, path
 
 
-def test_loopback_bypasses_auth_even_when_api_key_configured(
+def test_loopback_requires_auth_when_api_key_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Loopback clients remain trusted for non-settings reads."""
+    """GHSA-7wgj: a configured key gates EVERY peer, loopback included."""
     monkeypatch.setenv("API_AUTH_KEY", "secret")
     monkeypatch.setattr(api_server, "_API_KEY", "secret")
 
     local = _local_client()
     remote = _remote_client()
 
-    # Loopback: no bearer needed → should succeed
+    # Loopback without bearer: no longer bypasses the configured key → rejected
     local_response = local.get("/runs")
-    assert local_response.status_code == 200
+    assert local_response.status_code == 401
+
+    # Loopback with bearer: accepted (this is the frontend's authenticated path)
+    local_bearer = local.get("/runs", headers={"Authorization": "Bearer secret"})
+    assert local_bearer.status_code == 200
 
     # Remote without bearer: still rejected
     remote_response = remote.get("/runs")
@@ -148,6 +192,35 @@ def test_loopback_bypasses_auth_even_when_api_key_configured(
     # Remote with bearer: accepted
     remote_bearer = remote.get("/runs", headers={"Authorization": "Bearer secret"})
     assert remote_bearer.status_code == 200
+
+
+def test_interactive_docs_are_loopback_only_in_keyless_dev_mode() -> None:
+    """Default docs work locally without exposing the schema to remote peers."""
+    local = _local_client()
+    remote = _remote_client()
+
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        assert local.get(path).status_code == 200, path
+        assert remote.get(path).status_code == 403, path
+
+
+def test_keyed_deployment_disables_viewers_but_allows_bearer_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured key never creates a browser docs bootstrap deadlock."""
+    from src.config.accessor import reset_env_config
+
+    monkeypatch.setenv("API_AUTH_KEY", "secret")
+    monkeypatch.setattr(api_server, "_API_KEY", "secret")
+    reset_env_config()
+    bearer = {"Authorization": "Bearer secret"}
+
+    for client in (_local_client(), _remote_client()):
+        for path in ("/docs", "/redoc"):
+            assert client.get(path).status_code == 404, path
+            assert client.get(path, headers=bearer).status_code == 404, path
+        assert client.get("/openapi.json").status_code == 401
+        assert client.get("/openapi.json", headers=bearer).status_code == 200
 
 
 def _llm_settings_payload(base_url: str = "https://api.openai.com/v1") -> dict[str, object]:
@@ -349,14 +422,30 @@ def test_configured_api_key_required_for_session_event_stream(
     assert response.status_code == 401
 
 
-def test_session_event_stream_accepts_query_token_for_browser_eventsource(
+def test_session_event_stream_rejects_long_lived_api_key_query(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """VT-003: the long-lived key is no longer accepted in the SSE query string."""
     monkeypatch.setenv("API_AUTH_KEY", "secret")
     monkeypatch.setattr(api_server, "_API_KEY", "secret")
 
     response = _remote_client().get("/sessions/missing/events?api_key=secret")
 
+    assert response.status_code == 401
+
+
+def test_session_event_stream_accepts_single_use_ticket_for_browser_eventsource(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """VT-003: a header-minted single-use ticket authenticates the EventSource."""
+    monkeypatch.setenv("API_AUTH_KEY", "secret")
+    monkeypatch.setattr(api_server, "_API_KEY", "secret")
+
+    ticket = api_server._mint_sse_ticket()
+    response = _remote_client().get(f"/sessions/missing/events?ticket={ticket}")
+
+    # Auth passed (the 404/501 comes from the missing session / disabled runtime,
+    # not from the auth layer).
     assert response.status_code in {404, 501}
 
 

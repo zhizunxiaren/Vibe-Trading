@@ -55,6 +55,76 @@ _DEFAULT_COLUMNS = {
     "volume": "volume",
 }
 
+# Map the project's bar intervals (see ``backtest.runner._VALID_INTERVALS``) to
+# pandas offset aliases used for resampling. All entries are fixed-duration so
+# ``pd.Timedelta`` of the alias is well defined.
+_RESAMPLE_RULES = {
+    "1m": "1min",
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1H": "1h",
+    "1h": "1h",
+    "4H": "4h",
+    "4h": "4h",
+    "1D": "1D",
+    "1d": "1D",
+}
+
+_OHLCV_AGG = {
+    "open": "first",
+    "high": "max",
+    "low": "min",
+    "close": "last",
+    "volume": "sum",
+}
+
+
+def _resample_to_interval(df: pd.DataFrame, interval: str, symbol: str) -> pd.DataFrame:
+    """Resample an OHLCV frame to the requested bar ``interval``.
+
+    Local files can hold any native granularity, so a requested interval the
+    file does not already match must be honored explicitly. Previously
+    ``interval`` was passed only to the cache key, so requesting e.g. ``4H``
+    against hourly data silently returned the file's native bars.
+
+    Coarser-than-source requests are downsampled with the standard OHLCV
+    aggregation. A finer-than-source request cannot be fabricated from a file,
+    so the source bars are returned unchanged with a warning. Requests that
+    already match the source granularity are returned unchanged.
+    """
+    rule = _RESAMPLE_RULES.get(interval)
+    if df.empty:
+        return df
+    if rule is None:
+        logger.warning(
+            "local loader: unsupported interval %r for %s; returning source bars",
+            interval,
+            symbol,
+        )
+        return df
+
+    target = pd.Timedelta(rule)
+    if len(df.index) >= 2:
+        source = df.index.to_series().diff().dropna().median()
+        if pd.notna(source):
+            if target < source:
+                logger.warning(
+                    "local loader: cannot upsample %s source bars to %s for %s; "
+                    "returning source bars",
+                    source,
+                    interval,
+                    symbol,
+                )
+                return df
+            if target == source:
+                return df
+
+    resampled = df.resample(rule).agg(_OHLCV_AGG)
+    resampled = resampled.dropna(subset=["open", "high", "low", "close"])
+    resampled.index.name = df.index.name
+    return resampled
+
 
 def _load_config() -> dict[str, Any] | None:
     if not _CONFIG_PATH.exists():
@@ -85,14 +155,14 @@ def _normalize_columns(
         return None
 
     if date_fmt:
-        df["trade_date"] = pd.to_datetime(df[date_col], format=date_fmt, errors="coerce")
+        parsed_dates = pd.to_datetime(
+            df[date_col], format=date_fmt, errors="coerce", utc=True
+        )
     else:
-        df["trade_date"] = pd.to_datetime(df[date_col], errors="coerce")
-    # Drop any timezone so the tz-naive date-range filter in ``_fetch_one`` never
-    # raises "Invalid comparison between tz-aware and tz-naive" (which was caught
-    # and swallowed into a silently empty result for tz-aware parquet/CSV inputs).
-    if getattr(df["trade_date"].dt, "tz", None) is not None:
-        df["trade_date"] = df["trade_date"].dt.tz_localize(None)
+        parsed_dates = pd.to_datetime(df[date_col], errors="coerce", utc=True)
+    # Normalize every input to the loader's UTC-naive index contract. Parsing
+    # as UTC first also handles files that span daylight-saving offset changes.
+    df["trade_date"] = parsed_dates.dt.tz_convert(None)
     df = df.dropna(subset=["trade_date"])
     df = df.set_index("trade_date").sort_index()
 
@@ -215,7 +285,7 @@ class DataLoader:
                     start_date=start_date,
                     end_date=end_date,
                     fields=None,
-                    fetch=lambda c=clean: self._fetch_one(c, start_date, end_date),
+                    fetch=lambda c=clean: self._fetch_one(c, start_date, end_date, interval),
                 )
                 if df is not None and not df.empty:
                     result[clean] = df
@@ -225,7 +295,7 @@ class DataLoader:
         return result
 
     def _fetch_one(
-        self, symbol: str, start_date: str, end_date: str,
+        self, symbol: str, start_date: str, end_date: str, interval: str = "1D",
     ) -> pd.DataFrame | None:
         entry = self._source_by_symbol.get(symbol)
         if entry is None:
@@ -270,8 +340,14 @@ class DataLoader:
             return None
 
         start = pd.Timestamp(start_date)
-        end = pd.Timestamp(end_date)
+        # Treat ``end_date`` as inclusive of the whole day so intraday bars on
+        # the end day survive the filter (a bare midnight bound dropped them,
+        # which would defeat any sub-daily ``interval``).
+        end = pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
         df = df[(df.index >= start) & (df.index <= end)]
+        if df.empty:
+            return None
+        df = _resample_to_interval(df, interval, symbol)
         if df.empty:
             return None
         return df

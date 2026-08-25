@@ -12,6 +12,10 @@ v2 enhancements over v1:
 
 Signal interface: OptionsSignalEngine.generate(data_map) returns a list of trade instructions.
 Artifacts: equity.csv, metrics.csv, trades.csv, greeks.csv.
+
+Black-Scholes price and Greeks come from ``src.quantlib.options``. What stays
+here is the engine's own volatility surface -- historical vol, the smile, and
+the per-leg vol every pricing site must agree on.
 """
 
 import json
@@ -21,94 +25,8 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
 
-
-# --- Black-Scholes pricing ---
-
-
-def bs_price(S: float, K: float, T: float, r: float, sigma: float,
-             option_type: str = "call") -> float:
-    """Black-Scholes European option pricing.
-
-    Args:
-        S: Underlying spot price.
-        K: Strike price.
-        T: Time to expiry in years.
-        r: Risk-free rate (annualised).
-        sigma: Annualised volatility.
-        option_type: Option type, "call" or "put".
-
-    Returns:
-        Theoretical option price.
-
-    Example:
-        >>> round(bs_price(100, 100, 1.0, 0.05, 0.2, "call"), 2)
-        10.45
-    """
-    if T <= 0 or sigma <= 0:
-        # Expired: return intrinsic value
-        if option_type == "call":
-            return max(S - K, 0.0)
-        return max(K - S, 0.0)
-
-    d1 = (np.log(S / K) + (r + sigma ** 2 / 2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-
-    if option_type == "call":
-        return float(S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2))
-    return float(K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1))
-
-
-# --- Greeks ---
-
-
-def bs_greeks(S: float, K: float, T: float, r: float, sigma: float,
-              option_type: str = "call") -> Dict[str, float]:
-    """Calculate Black-Scholes Greeks.
-
-    Args:
-        S: Underlying spot price.
-        K: Strike price.
-        T: Time to expiry in years.
-        r: Risk-free rate (annualised).
-        sigma: Annualised volatility.
-        option_type: Option type, "call" or "put".
-
-    Returns:
-        Dict containing delta, gamma, theta, vega.
-    """
-    if T <= 0 or sigma <= 0:
-        intrinsic_call = 1.0 if S > K else 0.0
-        delta = intrinsic_call if option_type == "call" else intrinsic_call - 1.0
-        return {"delta": delta, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
-
-    sqrt_T = np.sqrt(T)
-    d1 = (np.log(S / K) + (r + sigma ** 2 / 2) * T) / (sigma * sqrt_T)
-    d2 = d1 - sigma * sqrt_T
-    nd1_pdf = float(norm.pdf(d1))
-
-    # Delta
-    if option_type == "call":
-        delta = float(norm.cdf(d1))
-    else:
-        delta = float(norm.cdf(d1) - 1.0)
-
-    # Gamma (same for call and put)
-    gamma = float(nd1_pdf / (S * sigma * sqrt_T))
-
-    # Theta (daily)
-    theta_common = -(S * nd1_pdf * sigma) / (2 * sqrt_T)
-    if option_type == "call":
-        theta = theta_common - r * K * np.exp(-r * T) * norm.cdf(d2)
-    else:
-        theta = theta_common + r * K * np.exp(-r * T) * norm.cdf(-d2)
-    theta = float(theta / 365.0)  # convert to daily
-
-    # Vega (per 1% change in volatility)
-    vega = float(S * nd1_pdf * sqrt_T / 100.0)
-
-    return {"delta": delta, "gamma": gamma, "theta": theta, "vega": vega}
+from src.quantlib.options import bs_greeks, bs_price, normalise_option_type
 
 
 # --- Historical volatility ---
@@ -155,6 +73,31 @@ def iv_smile_adjustment(S: float, K: float, base_iv: float,
     return max(adj, 0.01)
 
 
+def leg_iv(S: float, K: float, base_iv: float, skew: float, curvature: float) -> float:
+    """Return the implied vol a single leg is priced at.
+
+    Every site that prices a leg must go through this — opening, marking to
+    market, Greeks, and the American continuation value. Opening a leg on the
+    smile and marking it at flat at-the-money vol books a fictitious profit the
+    instant the position exists: on a 30-day 10%-OTM call at ``skew=-0.15`` the
+    gap is +16.7% of premium, and +93.0% at 20% OTM, which then contaminates
+    Sharpe, Calmar and drawdown.
+
+    Args:
+        S: Spot price.
+        K: Strike price.
+        base_iv: At-the-money implied volatility.
+        skew: Slope of the smile; ``0`` with ``curvature`` disables the smile.
+        curvature: Curvature of the smile.
+
+    Returns:
+        The leg's implied volatility.
+    """
+    if skew == 0 and curvature == 0:
+        return base_iv
+    return iv_smile_adjustment(S, K, base_iv, skew, curvature)
+
+
 # --- Option positions ---
 
 
@@ -162,19 +105,24 @@ class OptionPosition:
     """A single option leg position.
 
     Attributes:
-        option_type: "call" or "put".
+        option_type: "call" or "put", folded to lower case on construction so
+            that settlement here and pricing in ``src.quantlib.options`` cannot
+            disagree about a leg typed ``"Call"``.
         strike: Strike price.
         expiry: Expiry date.
         qty: Quantity (positive = long, negative = short).
         entry_price: Theoretical option price at entry.
         entry_date: Entry date string.
         underlying_code: Underlying instrument code.
+
+    Raises:
+        ValueError: If ``option_type`` is neither call nor put.
     """
 
     def __init__(self, option_type: str, strike: float, expiry: str,
                  qty: int, entry_price: float, entry_date: str,
                  underlying_code: str):
-        self.option_type = option_type
+        self.option_type = normalise_option_type(option_type)
         self.strike = strike
         self.expiry = pd.Timestamp(expiry)
         self.qty = qty
@@ -327,7 +275,10 @@ def run_options_backtest(
                 if T_ex <= 0:
                     continue
                 intrinsic = pos.intrinsic_value(spot)
-                continuation = bs_price(spot, pos.strike, T_ex, risk_free_rate, iv_val_ex, pos.option_type)
+                # The continuation value must use the same vol the leg is
+                # marked at, or early exercise triggers off a mispriced hold.
+                iv_ex = leg_iv(spot, pos.strike, iv_val_ex, iv_skew, iv_curvature)
+                continuation = bs_price(spot, pos.strike, T_ex, risk_free_rate, iv_ex, pos.option_type)
                 if intrinsic > 0 and intrinsic > continuation * 1.02:
                     # Early exercise is optimal
                     settlement = intrinsic * pos.qty * contract_multiplier
@@ -384,7 +335,10 @@ def run_options_backtest(
             iv_val = ivs.get(underlying, 0.3)
 
             for leg in legs:
-                leg_type = leg.get("type", "call")
+                # Fold before it is priced, matched and recorded: config comes
+                # from the user, and a raw "Call" would price as a call and
+                # settle as a put.
+                leg_type = normalise_option_type(leg.get("type", "call"))
                 strike = leg.get("strike", spot)
                 expiry = leg.get("expiry", "")
                 qty = leg.get("qty", 1)
@@ -392,12 +346,7 @@ def run_options_backtest(
                 expiry_ts = pd.Timestamp(expiry)
                 T = max((expiry_ts - ts).days / 365.0, 0.001)
 
-                # Apply IV smile adjustment (v2) if configured
-                adj_iv = iv_val
-                if iv_skew != 0 or iv_curvature != 0:
-                    adj_iv = iv_smile_adjustment(spot, strike, iv_val, iv_skew, iv_curvature)
-
-                # Black-Scholes price (with smile-adjusted IV if enabled)
+                adj_iv = leg_iv(spot, strike, iv_val, iv_skew, iv_curvature)
                 opt_price = bs_price(spot, strike, T, risk_free_rate, adj_iv, leg_type)
 
                 if action == "open":
@@ -432,12 +381,26 @@ def run_options_backtest(
                     })
 
                 elif action == "close":
-                    # Close: find matching position
+                    # Close: find matching position, honoring a partial-close qty.
                     matched = _find_matching_position(
                         positions, underlying, leg_type, strike, expiry)
                     if matched:
-                        pnl = (opt_price - matched.entry_price) * matched.qty * contract_multiplier
-                        abs_close = opt_price * abs(matched.qty) * contract_multiplier
+                        # An explicit leg ``qty`` closes only that many contracts
+                        # (clamped to the open size); a close leg with no ``qty``
+                        # closes the whole lot (legacy behavior). Cash/PnL and the
+                        # remaining position all scale to the amount actually closed
+                        # so a partial close no longer flattens the lot (#577).
+                        requested = leg.get("qty")
+                        full_mag = abs(matched.qty)
+                        close_mag = full_mag if requested is None else min(abs(requested), full_mag)
+                        if close_mag <= 0:
+                            continue
+                        sign = 1 if matched.qty > 0 else -1
+                        closed_qty = sign * close_mag
+                        remaining_qty = matched.qty - closed_qty
+
+                        pnl = (opt_price - matched.entry_price) * closed_qty * contract_multiplier
+                        abs_close = opt_price * close_mag * contract_multiplier
                         if matched.qty > 0:
                             # Long close: sell to recover
                             cash += abs_close * (1 - commission)
@@ -453,11 +416,24 @@ def run_options_backtest(
                             "expiry": expiry,
                             "side": "close",
                             "price": round(opt_price, 4),
-                            "qty": matched.qty,
+                            "qty": closed_qty,
                             "pnl": round(pnl, 4),
                             "entry_date": matched.entry_date,
                         })
-                        positions.remove(matched)
+                        if abs(remaining_qty) < 1e-9:
+                            positions.remove(matched)
+                        else:
+                            # Reduce the open lot to its remainder instead of
+                            # removing it (new object; positions stay immutable).
+                            positions[positions.index(matched)] = OptionPosition(
+                                option_type=matched.option_type,
+                                strike=matched.strike,
+                                expiry=matched.expiry,
+                                qty=remaining_qty,
+                                entry_price=matched.entry_price,
+                                entry_date=matched.entry_date,
+                                underlying_code=matched.underlying_code,
+                            )
 
         # 4. Compute portfolio mark-to-market value and Greeks
         portfolio_value = cash
@@ -465,20 +441,24 @@ def run_options_backtest(
         total_gamma = 0.0
         total_theta = 0.0
         total_vega = 0.0
+        total_rho = 0.0
 
         for pos in positions:
             spot = spot_prices.get(pos.underlying_code, 0.0)
             iv_val = ivs.get(pos.underlying_code, 0.3)
             T = pos.time_to_expiry(ts)
 
-            mark_price = bs_price(spot, pos.strike, T, risk_free_rate, iv_val, pos.option_type)
+            mark_iv = leg_iv(spot, pos.strike, iv_val, iv_skew, iv_curvature)
+
+            mark_price = bs_price(spot, pos.strike, T, risk_free_rate, mark_iv, pos.option_type)
             portfolio_value += mark_price * pos.qty * contract_multiplier
 
-            greeks = bs_greeks(spot, pos.strike, T, risk_free_rate, iv_val, pos.option_type)
+            greeks = bs_greeks(spot, pos.strike, T, risk_free_rate, mark_iv, pos.option_type)
             total_delta += greeks["delta"] * pos.qty * contract_multiplier
             total_gamma += greeks["gamma"] * pos.qty * contract_multiplier
             total_theta += greeks["theta"] * pos.qty * contract_multiplier
             total_vega += greeks["vega"] * pos.qty * contract_multiplier
+            total_rho += greeks["rho"] * pos.qty * contract_multiplier
 
         equity_records.append({
             "timestamp": date_str,
@@ -493,6 +473,7 @@ def run_options_backtest(
             "gamma": round(total_gamma, 6),
             "theta": round(total_theta, 6),
             "vega": round(total_vega, 6),
+            "rho": round(total_rho, 6),
             "num_positions": len(positions),
         })
 
@@ -532,7 +513,7 @@ def run_options_backtest(
         warnings=config.get("content_filter_warnings") or None,
     )
 
-    print(json.dumps(metrics, indent=2))
+    print(json.dumps(metrics, indent=2, allow_nan=False))
     return metrics
 
 
@@ -551,7 +532,9 @@ def _find_matching_position(
     Args:
         positions: Current open positions.
         underlying: Underlying instrument code.
-        option_type: Option type.
+        option_type: Option type, already folded by ``normalise_option_type``;
+            ``OptionPosition`` folds its own, so both sides compare in lower
+            case.
         strike: Strike price.
         expiry: Expiry date string.
 
@@ -585,34 +568,148 @@ def _calc_options_metrics(
     Returns:
         Metrics dictionary.
     """
+    warnings: List[str] = []
     n = len(equity)
+    equity_vals = pd.to_numeric(equity, errors="coerce").astype(float)
+    path_is_finite = bool(n and np.isfinite(equity_vals.to_numpy()).all())
+
+    final_raw: float | None = None
+    final_value: float | None = None
+    if n:
+        terminal = float(equity_vals.iloc[-1])
+        if np.isfinite(terminal):
+            final_raw = terminal
+            final_value = round(terminal, 2)
+        else:
+            warnings.append(
+                "Final equity is non-finite; final and return metrics are undefined."
+            )
+    else:
+        warnings.append(
+            "No equity observations were produced; equity metrics are undefined."
+        )
+
+    valid_initial_cash = np.isfinite(initial_cash) and initial_cash > 0
+    total_ret: float | None = None
+    if final_raw is not None and valid_initial_cash:
+        total_ret = final_raw / float(initial_cash) - 1
+    elif final_raw is not None:
+        warnings.append(
+            "Total return is undefined because initial cash is not positive and finite."
+        )
+
+    ann_ret: float | None = None
     if n < 2:
-        return {
-            "final_value": initial_cash, "total_return": 0, "annual_return": 0,
-            "max_drawdown": 0, "sharpe": 0, "calmar": 0, "sortino": 0,
-            "trade_count": len(trades), "win_rate": 0, "profit_loss_ratio": 0,
-        }
+        warnings.append("Annual return requires at least two equity observations.")
+    elif total_ret is None:
+        warnings.append(
+            "Annual return is undefined because total return is unavailable."
+        )
+    elif final_raw is not None and final_raw < 0:
+        warnings.append("Annual return is undefined when final equity is negative.")
+    elif bars_per_year <= 0:
+        warnings.append(
+            "Annual return is undefined because bars_per_year is not positive."
+        )
+    else:
+        growth = final_raw / float(initial_cash)
+        # Explosive paths (e.g. 1m bars) can OverflowError before isfinite.
+        try:
+            candidate = float(growth ** (bars_per_year / (n - 1)) - 1)
+        except OverflowError:
+            candidate = float("inf")
+        if np.isfinite(candidate):
+            ann_ret = candidate
+        else:
+            warnings.append("Annual return is non-finite for this equity path.")
 
-    equity_vals = equity.astype(float)
-    returns = equity_vals.pct_change().fillna(0.0)
+    returns: pd.Series | None = None
+    if n >= 2 and path_is_finite:
+        candidate_returns = equity_vals.pct_change(fill_method=None).iloc[1:]
+        if np.isfinite(candidate_returns.to_numpy()).all():
+            returns = candidate_returns
+        else:
+            warnings.append(
+                "Risk ratios are undefined because equity returns are non-finite."
+            )
+    elif n >= 2:
+        warnings.append(
+            "Path-dependent metrics are undefined because equity contains non-finite values."
+        )
 
-    total_ret = float(equity_vals.iloc[-1] / initial_cash - 1)
-    ann_ret = float((1 + total_ret) ** (bars_per_year / max(n, 1)) - 1)
+    max_dd: float | None = None
+    if path_is_finite:
+        peak = equity_vals.cummax()
+        if bool((peak > 0).all()):
+            dd = (equity_vals - peak) / peak
+            max_dd = float(dd.min())
+        else:
+            warnings.append(
+                "Maximum drawdown is undefined because peak equity is not positive."
+            )
 
-    vol = float(returns.std())
-    sharpe = float(returns.mean() / (vol + 1e-10) * np.sqrt(bars_per_year))
+    sharpe: float | None = None
+    if returns is not None and len(returns) > 1 and bars_per_year > 0:
+        vol = float(returns.std())
+        if np.isfinite(vol) and vol > 1e-12:
+            sharpe = float(returns.mean() / vol * np.sqrt(bars_per_year))
+        else:
+            warnings.append(
+                "Sharpe ratio is undefined because return volatility is zero."
+            )
+    elif bars_per_year <= 0:
+        warnings.append("Sharpe ratio requires a positive bars_per_year value.")
+    else:
+        warnings.append("Sharpe ratio requires at least two finite returns.")
 
-    peak = equity_vals.cummax()
-    dd = (equity_vals - peak) / peak.replace(0, 1)
-    max_dd = float(dd.min())
-    calmar = ann_ret / abs(max_dd) if abs(max_dd) > 1e-10 else 0.0
+    calmar: float | None = None
+    if ann_ret is not None and max_dd is not None and abs(max_dd) > 1e-12:
+        calmar = ann_ret / abs(max_dd)
+    else:
+        warnings.append(
+            "Calmar ratio requires a defined annual return and a nonzero drawdown."
+        )
 
-    downside = returns[returns < 0]
-    downside_std = float(downside.std()) if len(downside) > 1 else 1e-10
-    sortino = float(returns.mean() / (downside_std + 1e-10) * np.sqrt(bars_per_year))
+    sortino: float | None = None
+    if returns is not None and bars_per_year > 0:
+        downside = returns[returns < 0]
+        if len(downside) > 1:
+            downside_std = float(downside.std())
+            if np.isfinite(downside_std) and downside_std > 1e-12:
+                sortino = float(returns.mean() / downside_std * np.sqrt(bars_per_year))
+        if sortino is None:
+            warnings.append(
+                "Sortino ratio requires at least two varying downside returns."
+            )
+    elif bars_per_year <= 0:
+        warnings.append("Sortino ratio requires a positive bars_per_year value.")
+    else:
+        warnings.append("Sortino ratio requires finite returns.")
 
     # Trade statistics
-    closed_pnl = [t["pnl"] for t in trades if t.get("pnl", 0) != 0]
+    closed_pnl: List[float] = []
+    ignored_pnl_records = 0
+    for t in trades:
+        raw_pnl = t.get("pnl")
+        if raw_pnl is None:
+            ignored_pnl_records += 1
+            continue
+        try:
+            val = float(raw_pnl)
+        except (TypeError, ValueError):
+            ignored_pnl_records += 1
+            continue
+        if not np.isfinite(val):
+            ignored_pnl_records += 1
+            continue
+        if val != 0:
+            closed_pnl.append(val)
+    if ignored_pnl_records:
+        warnings.append(
+            f"Ignored PnL for {ignored_pnl_records} trade records "
+            "(missing or non-numeric pnl); win rate and profit/loss ratio "
+            "are computed from the remaining trades only."
+        )
     wins = [p for p in closed_pnl if p > 0]
     losses = [p for p in closed_pnl if p < 0]
     win_rate = len(wins) / len(closed_pnl) if closed_pnl else 0.0
@@ -621,14 +718,15 @@ def _calc_options_metrics(
     pl_ratio = avg_win / avg_loss if avg_loss > 1e-10 else 0.0
 
     return {
-        "final_value": round(float(equity_vals.iloc[-1]), 2),
-        "total_return": round(total_ret, 6),
-        "annual_return": round(ann_ret, 6),
-        "max_drawdown": round(max_dd, 6),
-        "sharpe": round(sharpe, 4),
-        "calmar": round(calmar, 4),
-        "sortino": round(sortino, 4),
+        "final_value": final_value,
+        "total_return": round(total_ret, 6) if total_ret is not None else None,
+        "annual_return": round(ann_ret, 6) if ann_ret is not None else None,
+        "max_drawdown": round(max_dd, 6) if max_dd is not None else None,
+        "sharpe": round(sharpe, 4) if sharpe is not None else None,
+        "calmar": round(calmar, 4) if calmar is not None else None,
+        "sortino": round(sortino, 4) if sortino is not None else None,
         "trade_count": len(trades),
         "win_rate": round(win_rate, 4),
         "profit_loss_ratio": round(pl_ratio, 4),
+        "warnings": warnings,
     }

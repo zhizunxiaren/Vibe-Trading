@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from src.config.accessor import get_env_config
+
 HYPOTHESIS_STATUSES = (
     "exploring",
     "testing",
@@ -34,7 +36,7 @@ def default_hypotheses_path() -> Path:
         Env override path when ``VIBE_TRADING_HYPOTHESES_PATH`` is set,
         otherwise ``~/.vibe-trading/hypotheses.json``.
     """
-    override = os.environ.get(_ENV_PATH, "").strip()
+    override = get_env_config().paths.vibe_trading_hypotheses_path.strip()
     if override:
         return Path(override).expanduser()
     return Path.home() / ".vibe-trading" / "hypotheses.json"
@@ -240,26 +242,39 @@ class HypothesisRegistry:
 
         Raises:
             KeyError: If the hypothesis does not exist.
-            ValueError: If status is unknown.
+            ValueError: If a required field is blank or status is unknown.
         """
+        normalized_title = title.strip() if title is not None else None
+        if title is not None and not normalized_title:
+            raise ValueError("title is required")
+        normalized_thesis = thesis.strip() if thesis is not None else None
+        if thesis is not None and not normalized_thesis:
+            raise ValueError("thesis is required")
+        normalized_status = _validate_status(status) if status is not None else None
+        normalized_universe = universe.strip() if universe is not None else None
+        normalized_signal_definition = signal_definition.strip() if signal_definition is not None else None
+        normalized_data_sources = _coerce_str_list(data_sources) if data_sources is not None else None
+        normalized_skills = _coerce_str_list(skills) if skills is not None else None
+        normalized_invalidation_notes = invalidation_notes.strip() if invalidation_notes is not None else None
+
         records = self.list()
         hyp = self._find_required(records, hypothesis_id)
-        if title is not None:
-            hyp.title = title.strip()
-        if thesis is not None:
-            hyp.thesis = thesis.strip()
-        if status is not None:
-            hyp.status = _validate_status(status)
-        if universe is not None:
-            hyp.universe = universe.strip()
-        if signal_definition is not None:
-            hyp.signal_definition = signal_definition.strip()
-        if data_sources is not None:
-            hyp.data_sources = _coerce_str_list(data_sources)
-        if skills is not None:
-            hyp.skills = _coerce_str_list(skills)
-        if invalidation_notes is not None:
-            hyp.invalidation_notes = invalidation_notes.strip()
+        if normalized_title is not None:
+            hyp.title = normalized_title
+        if normalized_thesis is not None:
+            hyp.thesis = normalized_thesis
+        if normalized_status is not None:
+            hyp.status = normalized_status
+        if normalized_universe is not None:
+            hyp.universe = normalized_universe
+        if normalized_signal_definition is not None:
+            hyp.signal_definition = normalized_signal_definition
+        if normalized_data_sources is not None:
+            hyp.data_sources = normalized_data_sources
+        if normalized_skills is not None:
+            hyp.skills = normalized_skills
+        if normalized_invalidation_notes is not None:
+            hyp.invalidation_notes = normalized_invalidation_notes
         hyp.updated_at = _utc_now()
         self._save(records)
         return hyp
@@ -271,6 +286,7 @@ class HypothesisRegistry:
         run_card_path: str = "",
         backtest_run_dir: str = "",
         metrics: dict[str, Any] | None = None,
+        validation: dict[str, Any] | None = None,
         notes: str = "",
     ) -> Hypothesis:
         """Link a run card or backtest artifact to a hypothesis.
@@ -280,6 +296,9 @@ class HypothesisRegistry:
             run_card_path: Optional path to a run_card.json.
             backtest_run_dir: Optional backtest run directory.
             metrics: Optional metrics summary.
+            validation: Optional walk-forward/Monte-Carlo/bootstrap robustness
+                results, as written by write_run_card's top-level
+                "validation" key (a sibling of "metrics", not nested in it).
             notes: Optional human note about the link.
 
         Returns:
@@ -293,13 +312,16 @@ class HypothesisRegistry:
             raise ValueError("run_card_path or backtest_run_dir is required")
         records = self.list()
         hyp = self._find_required(records, hypothesis_id)
-        hyp.run_cards.append({
+        run_card_record: dict[str, Any] = {
             "run_card_path": run_card_path,
             "backtest_run_dir": backtest_run_dir,
             "metrics": metrics or {},
             "notes": notes,
             "linked_at": _utc_now(),
-        })
+        }
+        if validation is not None:
+            run_card_record["validation"] = validation
+        hyp.run_cards.append(run_card_record)
         hyp.updated_at = _utc_now()
         self._save(records)
         return hyp

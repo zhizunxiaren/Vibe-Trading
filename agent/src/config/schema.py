@@ -226,7 +226,7 @@ ROBINHOOD_MCP_SERVER_SEED: dict[str, object] = {
 # config must pin an explicit tool allowlist plus pass the live order gate.
 IBKR_MCP_SERVER_SEED: dict[str, object] = {
     "type": "streamableHttp",
-    "url": "https://api.ibkr.com/v1/api/mcp",
+    "url": "https://api.ibkr.com/v1/api/mcp-public",
     "auth": {
         "type": "oauth",
         "scopes": ["mcp.read"],
@@ -426,6 +426,15 @@ class MCPServerConfigOverride(ConfigBase):
     enabled_tools: list[str] | None = None
 
 
+class DeliveryTargetConfig(ConfigBase):
+    """Operator-owned reusable destination for scheduled delivery."""
+
+    label: str = Field(min_length=1, max_length=128)
+    channel: str = Field(min_length=1, max_length=64)
+    target: str = Field(min_length=1, max_length=512)
+    enabled: bool = True
+
+
 class ChannelsConfig(ConfigBase):
     """Top-level IM channel config.
 
@@ -439,6 +448,15 @@ class ChannelsConfig(ConfigBase):
     send_progress: bool = True
     send_tool_hints: bool = False
     send_max_retries: int = Field(default=2, ge=1, le=10)
+    reply_timeout_s: float = Field(default=600.0, ge=1.0, le=86400.0)
+    # Channel-independent operator allowlist. Sender IDs listed here may run
+    # ``/pairing`` control-plane commands from any IM channel with cross-channel
+    # authority. Empty by default (fail closed): with no operators configured,
+    # IM ``/pairing`` is rejected and pairing is managed only through the
+    # authenticated CLI/REST admin plane. Per-channel operators (channel-scoped
+    # authority) live under each channel section's own ``operators`` list.
+    operators: list[str] = Field(default_factory=list)
+    delivery_targets: dict[str, DeliveryTargetConfig] = Field(default_factory=dict)
 
 
 class AgentConfig(ConfigBase):

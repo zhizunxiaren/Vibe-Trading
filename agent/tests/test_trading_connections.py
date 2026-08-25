@@ -9,7 +9,7 @@ import pytest
 
 from src.trading import profiles, service
 from src.tools import build_registry
-from src.tools.trading_connector_tool import TradingSelectConnectionTool
+from src.tools.trading_connector_tool import TradingPlaceOrderTool, TradingSelectConnectionTool
 
 pytestmark = pytest.mark.unit
 
@@ -50,14 +50,48 @@ def test_remote_call_requires_cached_oauth(monkeypatch: pytest.MonkeyPatch) -> N
     assert "connector authorize robinhood-live-mcp" in result["error"]
 
 
-def test_ibkr_official_profile_does_not_advertise_unknown_generic_reads() -> None:
-    """IBKR official MCP stays honest until stable remote tool names are known."""
+def test_ibkr_official_profile_advertises_verified_portfolio_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real-account-verified IBKR tools back the shared read interface."""
     profile = profiles.profile_by_id("ibkr-live-official-mcp-readonly")
+    calls: list[tuple[str, dict]] = []
+    server = SimpleNamespace(
+        url="https://api.ibkr.com/v1/api/mcp-public",
+        enabled_tools=["get_account_summary", "get_account_positions"],
+        auth=SimpleNamespace(cache_dir="/tmp/vibe-token"),
+    )
 
-    assert profile.capabilities == ("mcp.read.discovery",)
-    result = service.get_account(profile.id)
-    assert result["status"] == "error"
-    assert "does not support" in result["error"]
+    class _Adapter:
+        def __init__(self, server_name, server_config):  # noqa: ANN001
+            assert server_name == "ibkr"
+            assert server_config is server
+
+        def call_tool(self, remote_name, arguments):  # noqa: ANN001
+            calls.append((remote_name, dict(arguments)))
+            return {
+                "status": "ok",
+                "structured_content": (
+                    {"currency": "USD", "net_liquidation": 100}
+                    if remote_name == "get_account_summary"
+                    else {"positions": []}
+                ),
+            }
+
+    monkeypatch.setattr(
+        "src.config.loader.load_agent_config",
+        lambda: SimpleNamespace(mcp_servers={"ibkr": server}),
+    )
+    monkeypatch.setattr("src.live.registry.has_cached_oauth_token", lambda *_: True)
+    monkeypatch.setattr("src.tools.mcp.MCPServerAdapter", _Adapter)
+
+    assert profile.capabilities == ("account.read", "positions.read")
+    assert service.get_account(profile.id)["summary"][0]["tag"] == "NetLiquidation"
+    assert service.get_positions(profile.id)["positions"] == []
+    assert calls == [
+        ("get_account_summary", {}),
+        ("get_account_positions", {}),
+    ]
 
 
 def test_connector_profile_id_for_broker_prefers_live_remote_mcp() -> None:
@@ -80,6 +114,45 @@ def test_select_connection_tool_returns_canonical_profile_id(
     assert payload["status"] == "ok"
     assert payload["selected_profile"] == "ibkr-paper-local"
     assert profiles.load_selected_profile_id() == "ibkr-paper-local"
+
+
+def test_place_order_tool_treats_zero_unused_sizing_field_as_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LLM-filled zero quantity/notional fields must not violate sizing XOR."""
+    calls: list[dict] = []
+
+    def fake_place_order(symbol, connection, **kwargs):  # noqa: ANN001
+        calls.append({"symbol": symbol, "connection": connection, **kwargs})
+        return {"status": "ok", "echo": kwargs}
+
+    monkeypatch.setattr("src.tools.trading_connector_tool.place_order", fake_place_order)
+
+    quantity_result = json.loads(
+        TradingPlaceOrderTool().execute(
+            symbol="NVDA",
+            connection="alpaca-paper-trade",
+            side="buy",
+            quantity=2,
+            notional=0,
+        )
+    )
+    notional_result = json.loads(
+        TradingPlaceOrderTool().execute(
+            symbol="NVDA",
+            connection="alpaca-paper-trade",
+            side="buy",
+            quantity=0,
+            notional=50,
+        )
+    )
+
+    assert quantity_result["status"] == "ok"
+    assert notional_result["status"] == "ok"
+    assert calls[0]["quantity"] == 2.0
+    assert calls[0]["notional"] is None
+    assert calls[1]["quantity"] is None
+    assert calls[1]["notional"] == 50.0
 
 
 def test_live_broker_mcp_wrappers_are_hidden_from_agent_registry(monkeypatch: pytest.MonkeyPatch) -> None:

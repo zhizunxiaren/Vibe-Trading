@@ -9,23 +9,38 @@ import logging
 import os
 import re
 import threading
+import webbrowser
+from collections.abc import AsyncGenerator, Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass
 from typing import Any, Awaitable, Callable, Coroutine, Iterable, Protocol, TypeVar
+from urllib.parse import urlparse
 
+import httpx
 from fastmcp.client import Client
 from fastmcp.client.auth import OAuth
+from fastmcp.client.auth.oauth import ClientNotFoundError
 from fastmcp.client.client import CallToolResult
-from fastmcp.client.transports.http import StreamableHttpTransport
-from fastmcp.client.transports.sse import SSETransport
-from fastmcp.client.transports.stdio import StdioTransport
+try:
+    from fastmcp.client.transports.http import StreamableHttpTransport
+    from fastmcp.client.transports.sse import SSETransport
+    from fastmcp.client.transports.stdio import StdioTransport
+except ModuleNotFoundError:
+    from fastmcp.client.transports import (
+        SSETransport,
+        StdioTransport,
+        StreamableHttpTransport,
+    )
 from fastmcp.exceptions import McpError, ToolError
 from key_value.aio.stores.filetree import FileTreeStore, FileTreeV1KeySanitizationStrategy
 from mcp import types as mcp_types
+from mcp.shared.auth import OAuthMetadata
+from pydantic_core import PydanticSerializationError, to_jsonable_python
 
 from src.agent.tools import BaseTool
 from src.config.schema import (
     ROBINHOOD_AGENT_CONFIG_PATH,
+    MCPOAuthConfig,
     MCPServerConfig,
     live_broker_key_for_entry,
     robinhood_readonly_enabled_tools,
@@ -49,6 +64,193 @@ _TRANSIENT_ERROR_TOKENS = (
 )
 
 ResultT = TypeVar("ResultT")
+
+_MCP_SPECS_CACHE: dict[tuple[str, ...], list["MCPRemoteToolSpec"]] = {}
+_MCP_SPECS_LOCK = threading.Lock()
+
+
+def _fingerprint(text: str) -> str:
+    """One-way fingerprint for a cache-key component that may carry secrets."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _fingerprint_auth(auth: MCPOAuthConfig | None) -> str:
+    """Fingerprint an MCP server's OAuth config, never storing it raw.
+
+    ``MCPOAuthConfig.client_secret`` is a real credential, so the whole
+    config is hashed as one unit rather than spread across raw tuple
+    elements.
+    """
+    if auth is None:
+        return _fingerprint("")
+    canonical = "|".join(
+        [
+            auth.type,
+            str(sorted(auth.scopes)),
+            auth.client_name,
+            auth.cache_dir,
+            str(auth.callback_port),
+            auth.client_id or "",
+            auth.client_secret or "",
+            auth.client_metadata_url or "",
+        ]
+    )
+    return _fingerprint(canonical)
+
+
+class _GuardedOAuth(OAuth):
+    """FastMCP OAuth that can refuse to start a browser-based authorization flow.
+
+    Non-interactive callers (background pollers, API request handlers, scheduled
+    jobs) must never have a browser window opened on the host on their behalf.
+    Constructing this provider with ``allow_interactive=False`` turns the
+    browser step into a loud ``RuntimeError`` so the caller can tell the user to
+    run the explicit connect/reconnect step instead. With
+    ``allow_interactive=True`` the provider behaves exactly like
+    :class:`fastmcp.client.auth.OAuth`.
+    """
+
+    def __init__(self, *args: Any, allow_interactive: bool = True, **kwargs: Any) -> None:
+        """Initialize the OAuth provider.
+
+        Args:
+            *args: Positional arguments forwarded to ``fastmcp``'s ``OAuth``.
+            allow_interactive: When False, ``redirect_handler`` raises instead of
+                opening a browser for user consent.
+            **kwargs: Keyword arguments forwarded to ``fastmcp``'s ``OAuth``.
+        """
+        self._allow_interactive = allow_interactive
+        super().__init__(*args, **kwargs)
+
+    async def redirect_handler(self, authorization_url: str) -> None:
+        """Hand the authorization URL to the user's browser, or refuse to.
+
+        Args:
+            authorization_url: Authorization endpoint URL built by the OAuth
+                client for user consent.
+
+        Returns:
+            None.
+
+        Raises:
+            RuntimeError: If this provider was built with
+                ``allow_interactive=False``.
+        """
+        if not self._allow_interactive:
+            raise RuntimeError(
+                "OAuth authorization required; run the interactive connect/reconnect step"
+            )
+        await super().redirect_handler(authorization_url)
+
+
+class _IBKROAuth(_GuardedOAuth):
+    """Add the browser headers required by IBKR's OAuth WAF."""
+
+    async def _refresh_token(self) -> httpx.Request:
+        if self.context.oauth_metadata is None:
+            self.context.oauth_metadata = OAuthMetadata(
+                issuer="https://api.ibkr.com",
+                authorization_endpoint="https://api.ibkr.com/oauth2/authorize",
+                token_endpoint="https://api.ibkr.com/oauth2/api/v1/token",
+                registration_endpoint="https://api.ibkr.com/oauth2/register",
+            )
+        return await super()._refresh_token()
+
+    async def _initialize(self) -> None:
+        await super()._initialize()
+        client_info = self.context.client_info
+        registered_redirects = {
+            str(uri) for uri in (getattr(client_info, "redirect_uris", None) or [])
+        }
+        current_redirect = str(self.context.client_metadata.redirect_uris[0])
+        if (
+            client_info is not None
+            and self._static_client_info is None
+            and registered_redirects
+            and current_redirect not in registered_redirects
+        ):
+            await self.token_storage_adapter.clear()
+            self.context.client_info = None
+            self.context.current_tokens = None
+            self.context.token_expiry_time = None
+
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        flow = super().async_auth_flow(request)
+        response = None
+        try:
+            while True:
+                try:
+                    oauth_request = await flow.asend(response)
+                except StopAsyncIteration:
+                    break
+                if oauth_request.url.host == "api.ibkr.com":
+                    oauth_request.headers["User-Agent"] = "Mozilla/5.0"
+                    if not oauth_request.url.path.startswith("/v1/api/mcp"):
+                        oauth_request.headers["Accept"] = "application/json"
+                    if oauth_request.url.path == "/oauth2/register":
+                        oauth_request.headers["Origin"] = "https://api.ibkr.com"
+                response = yield oauth_request
+        finally:
+            await flow.aclose()
+
+    async def redirect_handler(self, authorization_url: str) -> None:
+        if not self._allow_interactive:
+            await super().redirect_handler(authorization_url)
+            return
+        async with self.httpx_client_factory() as client:
+            response = await client.get(
+                authorization_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "application/json",
+                },
+                follow_redirects=False,
+            )
+        if response.status_code == 400:
+            raise ClientNotFoundError(
+                "OAuth client not found - cached credentials may be stale"
+            )
+        if response.status_code not in (200, 301, 302, 303, 307, 308):
+            raise RuntimeError(
+                f"Unexpected authorization response: {response.status_code}"
+            )
+        webbrowser.open(authorization_url)
+
+
+def _make_cache_key(server_name: str, server_config: "MCPServerConfig") -> tuple[str, ...]:
+    """Build a content-based cache key for MCP tool discovery results.
+
+    Every field that can change the tool specs a server returns must
+    participate in cache identity (mirrors the enabled_tools fix this cache
+    key already went through once). ``url``, ``headers``, and ``auth`` are
+    fingerprinted rather than stored raw: a URL can carry a credential in
+    its query string, a header can carry a static bearer token, and
+    ``auth`` can carry an OAuth client secret. None of those should sit as
+    plaintext in a process-wide in-memory cache key.
+    """
+    return (
+        server_name,
+        str(server_config.type),
+        server_config.command,
+        str(server_config.args or []),
+        str(sorted((server_config.env or {}).items())),
+        str(sorted(server_config.enabled_tools or [])),
+        _fingerprint(server_config.url or ""),
+        _fingerprint(str(sorted((server_config.headers or {}).items()))),
+        _fingerprint_auth(server_config.auth),
+    )
+
+
+def invalidate_mcp_specs_cache() -> None:
+    """Clear the MCP tool discovery cache.
+
+    Called by SwarmRuntime at the start of each run to ensure fresh
+    discovery when operator config may have changed between runs.
+    """
+    with _MCP_SPECS_LOCK:
+        _MCP_SPECS_CACHE.clear()
 
 
 class AsyncMCPClient(Protocol):
@@ -138,6 +340,24 @@ def build_mcp_tool_wrappers(
         Exception: Propagates discovery failures so callers can decide whether
             to warn, skip, or abort.
     """
+    # --- Cache lookup (thread-safe) ---
+    # Skip cache when a custom client_factory is provided (test injection).
+    cache_key: tuple[str, ...] | None = None
+    if client_factory is None:
+        cache_key = _make_cache_key(server_name, server_config)
+        with _MCP_SPECS_LOCK:
+            cached_specs = _MCP_SPECS_CACHE.get(cache_key)
+        if cached_specs is not None:
+            adapter = MCPServerAdapter(
+                server_name,
+                server_config,
+                local_server_name=local_server_name,
+                client_factory=client_factory,
+                max_list_tools_attempts=max_list_tools_attempts,
+            )
+            return [MCPRemoteTool(adapter=adapter, spec=spec) for spec in cached_specs]
+
+    # --- Original logic (cache miss) ---
     adapter = MCPServerAdapter(
         server_name,
         server_config,
@@ -145,7 +365,14 @@ def build_mcp_tool_wrappers(
         client_factory=client_factory,
         max_list_tools_attempts=max_list_tools_attempts,
     )
-    return [MCPRemoteTool(adapter=adapter, spec=spec) for spec in adapter.discover_tools()]
+    specs = adapter.discover_tools()
+
+    # Store in cache (only for production path, not test injection)
+    if cache_key is not None:
+        with _MCP_SPECS_LOCK:
+            _MCP_SPECS_CACHE[cache_key] = specs
+
+    return [MCPRemoteTool(adapter=adapter, spec=spec) for spec in specs]
 
 
 def make_mcp_tool_name(server_name: str, tool_name: str) -> str:
@@ -320,6 +547,7 @@ class MCPServerAdapter:
         local_server_name: str | None = None,
         client_factory: ClientFactory | None = None,
         max_list_tools_attempts: int = 2,
+        interactive_oauth: bool = True,
     ) -> None:
         """Initialize the MCP server adapter.
 
@@ -333,12 +561,16 @@ class MCPServerAdapter:
                 Defaults to 2 (one transient retry). The authorize bootstrap
                 sets this to 1 so a retry cannot start a second OAuth callback
                 server and orphan an in-progress sign-in.
+            interactive_oauth: When False, an OAuth flow that needs fresh user
+                consent raises instead of opening a browser on the host. Callers
+                that run without a user in front of them pass False.
         """
         self.server_name = server_name
         self.local_server_name = local_server_name or server_name
         self.server_config = server_config
         self._client_factory = client_factory or self._build_client
         self._list_tools_attempts = max(1, max_list_tools_attempts)
+        self._interactive_oauth = interactive_oauth
 
     def discover_tools(self) -> list[MCPRemoteToolSpec]:
         """Discover enabled tools from the remote MCP server.
@@ -349,7 +581,18 @@ class MCPServerAdapter:
         Raises:
             Exception: Propagates discovery failures after retry exhaustion.
         """
-        tools = _run_sync(self._list_tools)
+        try:
+            tools = _run_sync(self._list_tools)
+        except httpx.HTTPStatusError as exc:
+            # Same reason as _http_error_body: discovery propagates raw, so the
+            # traceback the user sees would otherwise carry no server detail.
+            if body := _http_error_body(exc):
+                raise httpx.HTTPStatusError(
+                    f"{exc} - server said: {body}",
+                    request=exc.request,
+                    response=exc.response,
+                ) from exc
+            raise
         seen_names: dict[str, str] = {}
         specs: list[MCPRemoteToolSpec] = []
 
@@ -440,19 +683,41 @@ class MCPServerAdapter:
             auth = None
             if self.server_config.auth is not None:
                 oauth_config = self.server_config.auth
+                # fastmcp's OAuth pre-flights the authorization URL with a
+                # client built by `httpx_client_factory`; httpx defaults that to
+                # a 5 s deadline, which is short for a consent endpoint. Reuse
+                # the server's configured init_timeout instead.
+                oauth_http_timeout = (
+                    self.server_config.init_timeout
+                    if self.server_config.init_timeout is not None
+                    else max(self.server_config.tool_timeout, 30.0)
+                )
                 # `mcp_url` is intentionally omitted — StreamableHttpTransport
                 # calls `auth._bind(self.url)` so the URL fills in from the
                 # transport. Token cache is persistent (FileTreeStore), so the
                 # channel stays authorized across CLI invocations and refresh is
                 # handled inside the MCP lib's OAuthClientProvider.
-                auth = OAuth(
+                is_ibkr = urlparse(self.server_config.url).hostname == "api.ibkr.com"
+                oauth_type = _IBKROAuth if is_ibkr else _GuardedOAuth
+                auth = oauth_type(
                     scopes=list(oauth_config.scopes) or None,
                     client_name=oauth_config.client_name,
                     token_storage=_build_token_store(oauth_config.cache_dir),
-                    callback_port=oauth_config.callback_port,
+                    additional_client_metadata=(
+                        {"token_endpoint_auth_method": "none"} if is_ibkr else None
+                    ),
+                    callback_port=(
+                        oauth_config.callback_port
+                        or (8765 if is_ibkr else None)
+                    ),
                     client_id=oauth_config.client_id,
                     client_secret=oauth_config.client_secret,
                     client_metadata_url=oauth_config.client_metadata_url,
+                    httpx_client_factory=lambda: httpx.AsyncClient(
+                        timeout=oauth_http_timeout,
+                        trust_env=True,
+                    ),
+                    allow_interactive=self._interactive_oauth,
                 )
             transport = StreamableHttpTransport(
                 url=self.server_config.url,
@@ -913,16 +1178,75 @@ def _normalize_call_tool_result(result: CallToolResult) -> dict[str, Any]:
         }
 
     payload: dict[str, Any] = {"status": "ok"}
-    if result.data is not None:
-        payload["data"] = _make_jsonable(result.data)
     if result.structured_content is not None:
-        payload["structured_content"] = _make_jsonable(result.structured_content)
+        # ``structured_content`` is the canonical JSON value received over
+        # MCP. FastMCP's ``data`` is a convenience view hydrated from that
+        # value into dataclasses, datetime objects, UUIDs, and other Python
+        # types. Prefer the wire value whenever hydration made ``data`` cease
+        # to be natively JSON-serializable; serializing the hydrated copy is
+        # both redundant and the source of #922's false circular-reference
+        # failure.
+        structured = result.structured_content
+        payload["data"] = _select_result_data(result, structured)
+        payload["structured_content"] = structured
+    elif result.data is not None:
+        # Compatibility fallback for injected/legacy clients that provide a
+        # parsed value without standard MCP structured content.
+        payload["data"] = _make_jsonable(result.data)
     if result.content:
         payload["content"] = [_make_jsonable(block) for block in result.content]
         text = _extract_text_content(result.content)
         if text:
             payload["text"] = text
     return payload
+
+
+def _select_result_data(result: CallToolResult, structured: dict[str, Any]) -> Any:
+    """Choose a JSON-safe local ``data`` view for a structured MCP result.
+
+    FastMCP unwraps primitive return values from ``{"result": value}`` and
+    exposes the unwrapped value through ``CallToolResult.data``. Mirror only
+    that wire-format convention; otherwise use the canonical structured JSON
+    instead of re-serializing FastMCP's hydrated Python copy.
+
+    Args:
+        result: Parsed FastMCP result.
+        structured: Canonical structured JSON received over MCP.
+
+    Returns:
+        JSON-compatible value for the local ``data`` field.
+    """
+    if _is_wrapped_fastmcp_result(result, structured):
+        return structured["result"]
+
+    return structured
+
+
+def _is_wrapped_fastmcp_result(
+    result: CallToolResult,
+    structured: dict[str, Any],
+) -> bool:
+    """Detect FastMCP's wrapper for non-object tool return values.
+
+    Modern FastMCP marks the wrapper in result metadata. FastMCP 2.14, the
+    project's minimum supported version, only exposed the marker through the
+    output schema. The narrow fallback below handles its hydrated non-object
+    values without mistaking an ordinary object-schema dataclass for a wrapper.
+    """
+    if set(structured) != {"result"}:
+        return False
+
+    fastmcp_meta = (result.meta or {}).get("fastmcp")
+    if isinstance(fastmcp_meta, dict) and fastmcp_meta.get("wrap_result") is True:
+        return True
+
+    data = result.data
+    return (
+        data is not None
+        and not isinstance(data, Mapping)
+        and not (is_dataclass(data) and not isinstance(data, type))
+        and not callable(getattr(data, "model_dump", None))
+    )
 
 
 def _extract_result_error(result: CallToolResult) -> str:
@@ -1001,6 +1325,41 @@ def _message_looks_transient(message: str) -> bool:
     return any(token in lowered for token in _TRANSIENT_ERROR_TOKENS)
 
 
+#: Cap on the remote error body echoed back to the user. Enough for a JSON
+#: error envelope, short enough that a stray HTML page does not fill the log.
+_HTTP_ERROR_BODY_LIMIT = 300
+
+
+def _http_error_body(exc: BaseException) -> str:
+    """Return the response body of an HTTP status error, if there is one.
+
+    ``httpx.HTTPStatusError`` stringifies to the status and URL only, so the
+    server's own explanation is dropped — which turns an auth rejection into an
+    unreadable "Client error 400". IBKR, for one, answers a token it will not
+    accept with ``{"error":"Status failed 500","statusCode":400}`` and a 400,
+    while an unauthenticated request gets a 401 (issue #1126); without the body
+    those two are indistinguishable to the user.
+
+    Args:
+        exc: Exception that may carry an HTTP response.
+
+    Returns:
+        The trimmed body, or ``""`` when there is none to report.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return ""
+    try:
+        body = (response.text or "").strip()
+    except Exception:  # noqa: BLE001 - a body we cannot read is not reportable
+        return ""
+    if not body:
+        return ""
+    if len(body) > _HTTP_ERROR_BODY_LIMIT:
+        body = body[:_HTTP_ERROR_BODY_LIMIT] + "..."
+    return " ".join(body.split())
+
+
 def _format_exception_message(exc: Exception) -> str:
     """Render an exception into a user-facing error string.
 
@@ -1012,25 +1371,42 @@ def _format_exception_message(exc: Exception) -> str:
     """
     if isinstance(exc, McpError) and getattr(exc, "error", None) is not None:
         return getattr(exc.error, "message", str(exc))
-    return str(exc) or type(exc).__name__
+    message = str(exc) or type(exc).__name__
+    if isinstance(exc, httpx.HTTPStatusError) and (body := _http_error_body(exc)):
+        return f"{message} - server said: {body}"
+    return message
 
 
 def _make_jsonable(value: Any) -> Any:
-    """Convert FastMCP response payloads into JSON-serializable objects.
+    """Convert a fallback MCP value with Pydantic's JSON serializer.
+
+    FastMCP uses the same public ``pydantic_core`` primitive when producing
+    structured tool results. Normal structured responses bypass this helper;
+    it exists for content blocks and legacy/data-only client results.
 
     Args:
         value: Arbitrary response value.
 
     Returns:
         JSON-serializable equivalent.
+
+    Raises:
+        TypeError: If the value is cyclic or unsupported. The error reports
+            only type names, never the value or the underlying exception text.
     """
-    if hasattr(value, "model_dump"):
-        return value.model_dump(mode="json", by_alias=True, exclude_none=True)
-    if isinstance(value, list):
-        return [_make_jsonable(item) for item in value]
-    if isinstance(value, dict):
-        return {str(key): _make_jsonable(item) for key, item in value.items()}
-    return value
+    try:
+        return to_jsonable_python(value, by_alias=True, exclude_none=True)
+    except (PydanticSerializationError, TypeError, ValueError, UnicodeDecodeError) as exc:
+        raise TypeError(
+            f"Unable to serialize MCP result type {_qualified_type_name(value)}: "
+            f"{type(exc).__name__}"
+        ) from None
+
+
+def _qualified_type_name(value: Any) -> str:
+    """Return a stable type name without calling the value's representation."""
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}"
 
 
 def _json_default(value: Any) -> Any:
@@ -1041,6 +1417,9 @@ def _json_default(value: Any) -> Any:
 
     Returns:
         JSON-serializable representation.
+
+    Raises:
+        TypeError: If the value has no safe serialization contract.
     """
     return _make_jsonable(value)
 
@@ -1066,6 +1445,7 @@ __all__ = [
     "MCPServerAdapter",
     "build_mcp_tool_wrappers",
     "format_mcp_server_name_collision_warning",
+    "invalidate_mcp_specs_cache",
     "make_mcp_tool_name",
     "normalize_mcp_tool_schema",
     "resolve_mcp_server_tool_name_segments",

@@ -29,10 +29,12 @@ from src.trading.connectors.dhan.classification import DHAN_TOOL_CLASS
 from src.trading.connectors.futu.classification import FUTU_TOOL_CLASS
 from src.trading.connectors.ibkr.classification import IBKR_TOOL_CLASS
 from src.trading.connectors.longbridge.classification import LONGBRIDGE_TOOL_CLASS
+from src.trading.connectors.mt5.classification import MT5_TOOL_CLASS
 from src.trading.connectors.okx.classification import OKX_TOOL_CLASS
 from src.trading.connectors.robinhood.classification import ROBINHOOD_TOOL_CLASS
 from src.trading.connectors.shoonya.classification import SHOONYA_TOOL_CLASS
 from src.trading.connectors.tiger.classification import TIGER_TOOL_CLASS
+from src.trading.connectors.etoro.classification import ETORO_TOOL_CLASS
 from src.trading.connectors.trading212.classification import TRADING212_TOOL_CLASS
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,8 @@ _BROKER_CURATED_MAPS = {
     "dhan": DHAN_TOOL_CLASS,
     "shoonya": SHOONYA_TOOL_CLASS,
     "trading212": TRADING212_TOOL_CLASS,
+    "mt5": MT5_TOOL_CLASS,
+    "etoro": ETORO_TOOL_CLASS,
 }
 
 

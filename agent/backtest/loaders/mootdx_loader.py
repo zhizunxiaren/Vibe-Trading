@@ -69,6 +69,11 @@ class DataLoader:
 
     name = "mootdx"
     markets = {"a_share"}
+    # Tongdaxin K-line convention is board lots (HKUDS/Vibe-Trading#1062).
+    # Tentative declaration: TDX quote servers were unreachable from the
+    # audit environment; the cross-source consistency test pins this at
+    # runtime where TDX access exists.
+    volume_units = {"a_share": "lots"}
     requires_auth = False
 
     def __init__(self) -> None:
@@ -191,9 +196,10 @@ class DataLoader:
             if first_dt <= start_ts:
                 break
         else:
-            logger.warning(
-                "mootdx: %s %s pagination hit cap (%d pages) without reaching %s",
-                symbol, freq, _MAX_PAGES, start_date,
+            raise ValueError(
+                "incomplete mootdx history: "
+                f"{symbol} frequency={freq} hit {_MAX_PAGES} pages "
+                f"without reaching {start_date}"
             )
         if not chunks:
             return None
