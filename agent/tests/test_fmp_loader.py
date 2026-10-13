@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from backtest.loaders import fmp_loader as fl
+from tests.loader_contract import assert_loader_contract
 from backtest.loaders.fmp_loader import DataLoader, _fmp_symbol, _parse_historical
 
 
@@ -77,6 +78,7 @@ class TestParseHistorical:
         assert list(df.index) == [pd.Timestamp("2024-01-03"), pd.Timestamp("2024-01-04")]
         assert list(df.columns) == ["open", "high", "low", "close", "volume"]
         assert df.index.name == "trade_date"
+        assert_loader_contract(df, context="canonical frame")
         assert df["close"].iloc[0] == 1.5
         for col in df.columns:
             assert df[col].dtype == float
@@ -109,6 +111,159 @@ class TestParseHistorical:
         ]
         assert _parse_historical(_body("AAPL", bars)) is None
 
+    @pytest.mark.parametrize("missing", [None, "absent"])
+    def test_missing_adjusted_close_does_not_mix_raw_prices(self, missing):
+        second = {"date": "2024-01-04", "open": 100, "high": 102, "low": 99, "close": 100, "volume": 1000}
+        if missing is None:
+            second["adjClose"] = None
+        bars = [
+            {"date": "2024-01-03", "open": 100, "high": 102, "low": 99, "close": 100, "adjClose": 50, "volume": 1000},
+            second,
+        ]
+
+        df = _parse_historical(_body("AAPL", bars))
+
+        assert df is not None
+        assert list(df["close"]) == [50.0]
+
+    @pytest.mark.parametrize("unusable", ["0", "", "abc", 20000])
+    def test_unusable_adjusted_close_does_not_mix_raw_prices(self, unusable):
+        bars = [
+            {
+                "date": "2024-01-03", "open": 100, "high": 102, "low": 99,
+                "close": 100, "adjClose": 50, "volume": 1000,
+            },
+            {
+                "date": "2024-01-04", "open": 100, "high": 102, "low": 99,
+                "close": 100, "adjClose": unusable, "volume": 1000,
+            },
+        ]
+
+        df = _parse_historical(_body("AAPL", bars))
+
+        assert df is not None
+        # An adjustment that cannot be computed is not a reason to fall back to
+        # the raw basis: that mixes two price scales in one series.
+        assert list(df["close"]) == [50.0]
+
+    def test_a_response_with_no_usable_adjustment_stays_one_raw_basis(self):
+        bars = [
+            {
+                "date": "2024-01-03", "open": 100, "high": 102, "low": 99,
+                "close": 100, "adjClose": "", "volume": 1000,
+            },
+            {
+                "date": "2024-01-04", "open": 101, "high": 103, "low": 100,
+                "close": 101, "adjClose": "0", "volume": 1000,
+            },
+        ]
+
+        df = _parse_historical(_body("AAPL", bars))
+
+        assert df is not None
+        # Nothing to adjust against: the whole series stays on the raw basis
+        # rather than the response being discarded.
+        assert list(df["close"]) == [100.0, 101.0]
+        # The static source table stamps fmp split_dividend; an all-raw
+        # response must override that on the frame so frame_caliber reports
+        # the basis actually served.
+        assert df.attrs["adjustment"] == "raw"
+
+    def test_an_adjusted_response_stamps_the_adjusted_basis(self):
+        bars = [
+            {
+                "date": "2024-01-03", "open": 100, "high": 102, "low": 99,
+                "close": 100, "adjClose": 50, "volume": 1000,
+            },
+        ]
+
+        df = _parse_historical(_body("AAPL", bars))
+
+        assert df is not None
+        # Both bases carry an explicit stamp; the provenance table must never
+        # fall back to the static source default for a served frame.
+        assert df.attrs["adjustment"] == "split_dividend"
+
+    def test_a_bar_without_a_usable_date_is_dropped(self):
+        """A bar that cannot be placed in time is not a bar.
+
+        The date cell becomes the frame index, so a null one used to enter the
+        frame as ``NaT`` rather than being discarded.
+        """
+        bars = [
+            {"date": "2024-01-03", "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100.0},
+            {"date": None, "open": 9.0, "high": 9.0, "low": 9.0, "close": 9.0, "volume": 100.0},
+        ]
+
+        df = _parse_historical(_body("AAPL", bars))
+
+        assert df is not None
+        assert list(df["close"]) == [1.5]
+
+    def test_a_dropped_bar_is_reported_not_truncated_in_silence(self, caplog):
+        """A long-history symbol can lose old bars to the 0.01-100x factor window."""
+        bars = [
+            # A 1997-style bar: a 600x cumulative split factor puts adjClose/close
+            # far below the 0.01 floor, so it cannot join an adjusted series.
+            {
+                "date": "1997-05-15", "open": 1.0, "high": 1.5, "low": 0.9,
+                "close": 1.2, "adjClose": 0.002, "volume": 1000,
+            },
+            {
+                "date": "2024-01-03", "open": 100, "high": 102, "low": 99,
+                "close": 100, "adjClose": 50, "volume": 1000,
+            },
+        ]
+
+        with caplog.at_level("WARNING", logger="backtest.loaders.fmp_loader"):
+            df = _parse_historical(_body("AAPL", bars))
+
+        assert df is not None
+        assert list(df["close"]) == [50.0]
+        assert "dropped 1 of 2" in caplog.text
+
+    def test_a_bar_that_cannot_be_emitted_does_not_set_the_adjusted_basis(self):
+        """A computable factor on an incomplete bar must not claim the basis.
+
+        Such a bar is dropped either way; what it must not do is drag its
+        unadjusted siblings down with it, which turned a usable raw series
+        into no series at all.
+        """
+        bars = [
+            {
+                "date": "2024-01-03", "open": None, "high": 102, "low": 99,
+                "close": 100, "adjClose": 50, "volume": 1000,
+            },
+            {
+                "date": "2024-01-04", "open": 101, "high": 103, "low": 100,
+                "close": 101, "volume": 1000,
+            },
+        ]
+
+        df = _parse_historical(_body("AAPL", bars))
+
+        assert df is not None
+        assert list(df["close"]) == [101.0]
+
+    def test_an_infinite_price_is_never_scaled_into_the_series(self):
+        """A non-finite leg is not a price, so the bar cannot be adjusted."""
+        bars = [
+            {
+                "date": "2024-01-03", "open": float("inf"), "high": 102, "low": 99,
+                "close": 100, "adjClose": 50, "volume": 1000,
+            },
+            {
+                "date": "2024-01-04", "open": 100, "high": 102, "low": 99,
+                "close": 100, "adjClose": 50, "volume": 1000,
+            },
+        ]
+
+        df = _parse_historical(_body("AAPL", bars))
+
+        assert df is not None
+        assert len(df) == 1
+        assert list(df["close"]) == [50.0]
+
 
 class TestFetch:
     """End-to-end fetch with the HTTP layer mocked."""
@@ -119,17 +274,18 @@ class TestFetch:
             out = DataLoader().fetch(["AAPL.US"], "2024-01-01", "2024-01-31")
         assert set(out) == {"AAPL.US"}
         assert len(out["AAPL.US"]) == 2
-        # .US suffix stripped in the request URL.
+        # .US suffix stripped; Stable endpoint uses ?symbol= query param.
         url = mock_get.call_args[0][0]
-        assert url.endswith("/AAPL")
+        assert url == "https://financialmodelingprep.com/stable/historical-price-eod/full"
         params = mock_get.call_args.kwargs["params"]
-        assert params == {"from": "2024-01-01", "to": "2024-01-31", "apikey": "secret"}
+        assert params == {"symbol": "AAPL", "from": "2024-01-01", "to": "2024-01-31", "apikey": "secret"}
 
     def test_one_failing_symbol_does_not_abort_batch(self, monkeypatch):
         monkeypatch.setenv("FMP_API_KEY", "secret")
 
         def _side(url, **kwargs):
-            if url.endswith("/BAD"):
+            params = kwargs.get("params", {})
+            if params.get("symbol") == "BAD":
                 raise RuntimeError("boom")
             return _body("AAPL", _AAPL_BARS)
 

@@ -4,10 +4,14 @@ import asyncio
 import datetime as dt
 import inspect
 import json
+import os
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import mcp_server
+import pytest
+
 from src.tools.alpha_bench_tool import AlphaBenchTool
 from src.tools.alpha_zoo_tool import AlphaZooTool
 from src.tools import alpha_bench_tool as alpha_bench_module
@@ -88,6 +92,7 @@ def test_alpha_bench_forwards_selection(monkeypatch) -> None:
                 "universe": "sp500",
                 "period": "2018-2025",
                 "top": 10,
+                "horizon": 1,
                 "zoo": "alpha101",
                 "output_dir": str(output_dir.resolve()),
             },
@@ -183,6 +188,50 @@ def test_alpha_bench_rejects_unbounded_top(monkeypatch) -> None:
     assert registry.calls == []
 
 
+def test_alpha_bench_forwards_horizon(monkeypatch) -> None:
+    registry = _RecordingRegistry()
+    monkeypatch.setattr(mcp_server, "_get_registry", lambda: registry)
+
+    _ALPHA_BENCH(
+        universe="sp500",
+        period="2018-2025",
+        zoo="fundamental",
+        horizon=21,
+    )
+
+    assert registry.calls == [
+        (
+            "alpha_bench",
+            {
+                "universe": "sp500",
+                "period": "2018-2025",
+                "top": 20,
+                "horizon": 21,
+                "zoo": "fundamental",
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize("bad", [0, -1, 253, 21.5, "21", True])
+def test_alpha_bench_rejects_invalid_horizon(monkeypatch, bad) -> None:
+    registry = _RecordingRegistry()
+    monkeypatch.setattr(mcp_server, "_get_registry", lambda: registry)
+
+    result = json.loads(
+        _ALPHA_BENCH(
+            universe="sp500",
+            period="2018-2025",
+            zoo="alpha101",
+            horizon=bad,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "between 1 and 252" in result["error"]
+    assert registry.calls == []
+
+
 def test_alpha_bench_rejects_output_outside_allowed_roots(monkeypatch) -> None:
     registry = _RecordingRegistry()
     monkeypatch.setattr(mcp_server, "_get_registry", lambda: registry)
@@ -201,10 +250,13 @@ def test_alpha_bench_rejects_output_outside_allowed_roots(monkeypatch) -> None:
     assert registry.calls == []
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="symlink creation requires privileges unavailable on Windows"
+)
 def test_alpha_bench_does_not_follow_preexisting_report_symlink(monkeypatch, tmp_path: Path) -> None:
     class _BenchRegistry:
         def get(self, alpha_id: str) -> object:
-            return object()
+            return SimpleNamespace(meta=None)
 
     class _FixedDateTime:
         @classmethod
@@ -223,7 +275,7 @@ def test_alpha_bench_does_not_follow_preexisting_report_symlink(monkeypatch, tmp
     monkeypatch.setattr(alpha_bench_module, "datetime", _FixedDateTime)
     monkeypatch.setattr(alpha_bench_module.secrets, "token_hex", lambda length: "fixed")
     monkeypatch.setattr(alpha_bench_module, "_load_universe_panel", lambda *args, **kwargs: {})
-    monkeypatch.setattr(alpha_bench_module, "_compute_forward_returns", lambda panel: {})
+    monkeypatch.setattr(alpha_bench_module, "_compute_forward_returns", lambda panel, horizon=1: {})
     monkeypatch.setattr(
         alpha_bench_module,
         "_bench_one_alpha",

@@ -16,10 +16,11 @@ from src.tools.redaction import redact_text
 
 _PUBLIC_METADATA_MAX_LENGTH = 128
 _REDACTED_METADATA = "[redacted]"
-_REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "max"})
+_REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
 _PUBLIC_PROVIDERS = frozenset(
     {
         "anthropic",
+        "claude-cli",
         "dashscope",
         "deepseek",
         "gemini",
@@ -38,11 +39,11 @@ _PUBLIC_PROVIDERS = frozenset(
         "openai",
         "openai-codex",
         "openai_codex",
+        "opencode",
         "opencode-go",
         "opencode-zen",
         "openrouter",
         "qwen",
-        "requesty",
         "siliconflow-cn",
         "siliconflow-global",
         "spark",

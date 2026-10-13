@@ -18,7 +18,7 @@ from typing import Any, Callable
 from src.agent.context import ContextBuilder
 from src.agent.progress import HeartbeatTimer
 from src.agent.skills import SkillsLoader
-from src.agent.tools import ToolRegistry
+from src.agent.tools import BaseTool, ToolRegistry
 from src.config.limits import truncate_tool_result
 from src.config.schema import AgentConfig
 from src.providers.chat import ChatLLM, LLMResponse, ProviderStreamError
@@ -35,7 +35,7 @@ from src.swarm.models import (
 )
 from src.tools import build_swarm_registry
 from src.tools.mcp import MCPRemoteTool
-from src.tools.redaction import is_sensitive_arg, redact_payload, redact_tool_result
+from src.tools.redaction import redact_payload, redact_tool_result
 
 logger = logging.getLogger(__name__)
 
@@ -74,8 +74,47 @@ def _stream_retry_delay_s() -> float:
     return get_env_config().swarm.swarm_stream_retry_delay_s
 
 
+def _stream_retry_max_delay_s() -> float:
+    """Resolve the cap for the escalating stream-retry delay, robust to garbage.
+
+    Returns:
+        Upper bound in seconds for both the escalated exponential delay and a
+        provider-suggested ``Retry-After``. Configurable via
+        ``SWARM_STREAM_RETRY_MAX_DELAY_S``; a non-numeric value fails config
+        validation, mirroring the other swarm delay knobs.
+    """
+    from src.config.accessor import get_env_config
+
+    return get_env_config().swarm.swarm_stream_retry_max_delay_s
+
+
+def _escalated_stream_retry_delay_s(streak: int) -> float:
+    """Return the capped exponential delay for the one-based failure streak.
+
+    Doubles per consecutive retryable failure (1.0s, 2.0s, 4.0s, ...) so a
+    sustained provider outage backs off instead of burning the retry budget
+    at a constant cadence. The exponent is clamped at 62 (mirroring
+    ``src/swarm/runtime.py``'s worker-level backoff) and the result is capped
+    at ``_STREAM_RETRY_MAX_DELAY_S`` so a long outage never exceeds the
+    configured ceiling.
+
+    Args:
+        streak: Number of consecutive retryable stream failures including the
+            current one; values below 1 are treated as 1.
+
+    Returns:
+        Seconds to sleep before the stream retry, never negative.
+    """
+    ceiling = min(
+        _STREAM_RETRY_DELAY_S * (2 ** min(max(streak, 1) - 1, 62)),
+        _STREAM_RETRY_MAX_DELAY_S,
+    )
+    return max(ceiling, 0.0)
+
+
 _HEARTBEAT_INTERVAL_S = _heartbeat_interval_s()
 _STREAM_RETRY_DELAY_S = _stream_retry_delay_s()
+_STREAM_RETRY_MAX_DELAY_S = _stream_retry_max_delay_s()
 _MAX_TOKEN_ESTIMATE = 60_000
 
 
@@ -345,8 +384,8 @@ def build_worker_prompt(
     return "\n\n".join(prompt_parts)
 
 
-def agent_artifact_dir(run_dir: Path, agent_id: str) -> Path:
-    """Return the canonical artifacts directory for one agent within a run.
+def agent_artifact_dir(run_dir: Path, agent_id: str, task_id: str) -> Path:
+    """Return the canonical artifacts directory for one task within a run.
 
     The single source of truth for this path — shared with the retry loop
     in ``runtime.py`` so the two can never compute it differently and drift
@@ -355,41 +394,57 @@ def agent_artifact_dir(run_dir: Path, agent_id: str) -> Path:
     for ``mkdir``; validating the shared constructor protects both directory
     creation and recursive cleanup from the same path escape.
 
+    Keyed by ``(agent_id, task_id)`` rather than ``agent_id`` alone: a preset
+    where one agent handles multiple tasks (sequentially or, across workers,
+    concurrently) must not have those tasks share a directory. Sharing meant
+    a later task's read of the directory could pick up an earlier task's
+    still-there files, and clearing the shared directory before a later task
+    could delete an earlier, concurrently-running task's in-flight output.
+    A directory scoped to one task never has either problem, and earlier
+    tasks' artifacts simply stay in place under their own task_id once the
+    agent moves on, instead of being deleted.
+
     Args:
         run_dir: Root directory for the swarm run.
         agent_id: Single safe path segment identifying the agent.
+        task_id: Single safe path segment identifying the task.
 
     Raises:
-        ValueError: If ``agent_id`` is not a single safe path segment or the
-            resolved artifact directory is not exactly one level below the
-            resolved ``run_dir/artifacts`` directory.
+        ValueError: If ``agent_id`` or ``task_id`` is not a single safe path
+            segment, or the resolved artifact directory is not exactly two
+            levels below the resolved ``run_dir/artifacts`` directory.
     """
     artifact_root = run_dir / "artifacts"
-    if (
-        not isinstance(agent_id, str)
-        or not agent_id
-        or agent_id in {".", ".."}
-        or "/" in agent_id
-        or "\\" in agent_id
-    ):
-        raise ValueError(
-            f"Invalid swarm agent id {agent_id!r}: expected one safe path segment"
-        )
 
-    artifact_dir = artifact_root / agent_id
+    def _check(label: str, value: str) -> None:
+        if (
+            not isinstance(value, str)
+            or not value
+            or value in {".", ".."}
+            or "/" in value
+            or "\\" in value
+        ):
+            raise ValueError(
+                f"Invalid swarm {label} {value!r}: expected one safe path segment"
+            )
+
+    _check("agent id", agent_id)
+    _check("task id", task_id)
+
+    artifact_dir = artifact_root / agent_id / task_id
     resolved_root = artifact_root.resolve()
     resolved_dir = artifact_dir.resolve()
     try:
         relative = resolved_dir.relative_to(resolved_root)
     except ValueError as exc:
         raise ValueError(
-            f"Invalid swarm agent id {agent_id!r}: artifact path escapes "
-            "the run artifacts directory"
+            f"Invalid swarm agent/task id {agent_id!r}/{task_id!r}: artifact "
+            "path escapes the run artifacts directory"
         ) from exc
-    if len(relative.parts) != 1:
+    if relative.parts != (agent_id, task_id):
         raise ValueError(
-            f"Invalid swarm agent id {agent_id!r}: artifact path must be "
-            "one level below the run artifacts directory"
+            f"Invalid swarm agent/task id {agent_id!r}/{task_id!r}: artifact "
+            "path must preserve its agent and task below the run artifacts directory"
         )
     return artifact_dir
 
@@ -500,7 +555,7 @@ def _run_worker_impl(
       2. Build system prompt with role + upstream summaries + filtered skills
       3. Resolve task.prompt_template with user_vars
       4. Run ReAct loop (for iteration in range(max_iterations))
-      5. Write summary to artifacts/{agent_id}/summary.md
+      5. Write summary to artifacts/{agent_id}/{task_id}/summary.md
       6. Return WorkerResult
 
     Args:
@@ -540,11 +595,16 @@ def _run_worker_impl(
     _emit(event_callback, "worker_started", agent_id, task_id)
 
     # 1. Build per-worker tool registry — local pool plus any operator-
-    #    surfaced MCP tools, projected onto the agent's whitelist.
+    #    surfaced MCP tools, projected onto the agent's whitelist. The
+    #    documented ``skills:`` boundary is enforced at runtime by rebuilding
+    #    ``load_skill`` with the allowlist baked in; an empty ``skills`` list
+    #    means unrestricted, matching the prompt-side filter semantics
+    #    (``_filter_skill_descriptions`` treats empty as include-all).
     registry = build_swarm_registry(
         agent_spec.tools,
         agent_config=agent_config,
         include_shell_tools=include_shell_tools,
+        skill_allowlist=agent_spec.skills or None,
     )
 
     # 2. Build system prompt with filtered skills
@@ -579,7 +639,7 @@ def _run_worker_impl(
     ]
 
     # 6. ReAct loop
-    artifact_dir = agent_artifact_dir(run_dir, agent_id)
+    artifact_dir = agent_artifact_dir(run_dir, agent_id, task_id)
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     t0 = time.monotonic()
@@ -596,6 +656,7 @@ def _run_worker_impl(
     data_tool_calls = 0
     content_filter_count = 0
     consecutive_content_filter_count = 0
+    stream_failure_streak = 0
 
     for iteration in range(max_iterations):
         # Microcompact: clear old tool results to prevent token bloat
@@ -612,12 +673,11 @@ def _run_worker_impl(
             summary = _best_summary(messages, last_assistant_content) or f"Worker timed out after {elapsed:.0f}s ({iteration} iterations)"
             summary = _resolve_summary(artifact_dir, summary)
             _emit(event_callback, "worker_timeout", agent_id, task_id, {"elapsed": elapsed})
-            _write_summary(artifact_dir, summary)
-            _persist_messages(artifact_dir, messages)
+            _finalize_run(artifact_dir, summary, messages)
             return WorkerResult(
                 status="timeout",
                 summary=summary,
-                artifact_paths=_collect_artifacts(artifact_dir),
+                artifact_paths=_collect_artifacts(run_dir, artifact_dir),
                 iterations=iteration,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
@@ -632,12 +692,11 @@ def _run_worker_impl(
             cancelled_summary = last_assistant_content or f"Cancelled after {iteration} iterations"
             summary = _resolve_summary(artifact_dir, cancelled_summary)
             _emit(event_callback, "worker_cancelled", agent_id, task_id, {"iterations": iteration})
-            _write_summary(artifact_dir, summary)
-            _persist_messages(artifact_dir, messages)
+            _finalize_run(artifact_dir, summary, messages)
             return WorkerResult(
                 status="cancelled",
                 summary=summary,
-                artifact_paths=_collect_artifacts(artifact_dir),
+                artifact_paths=_collect_artifacts(run_dir, artifact_dir),
                 iterations=iteration,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
@@ -652,11 +711,11 @@ def _run_worker_impl(
             summary = last_assistant_content or f"Worker context too large (~{token_estimate} tokens, {iteration} iterations)"
             summary = _resolve_summary(artifact_dir, summary)
             _emit(event_callback, "worker_token_limit", agent_id, task_id, {"tokens": token_estimate})
-            _write_summary(artifact_dir, summary)
+            _finalize_run(artifact_dir, summary, messages)
             return WorkerResult(
                 status="token_limit",
                 summary=summary,
-                artifact_paths=_collect_artifacts(artifact_dir),
+                artifact_paths=_collect_artifacts(run_dir, artifact_dir),
                 iterations=iteration,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
@@ -750,24 +809,46 @@ def _run_worker_impl(
             # absorbed by ChatLLM's silent non-streaming fallback; it now
             # surfaces as ProviderStreamError, so retry the stream exactly
             # once before taking the existing failure path. Deterministic
-            # 4xx errors skip the retry and fail immediately.
+            # 4xx errors skip the retry and fail immediately. The delay
+            # escalates across consecutive retryable failures, honoring the
+            # provider's Retry-After header (bounded by the configured cap)
+            # when present. A successful retry does not reset the streak —
+            # only a clean first-attempt success does.
             try:
                 response = _stream_once()
             except ProviderStreamError as stream_exc:
                 if not stream_exc.retryable:
                     raise
+                stream_failure_streak += 1
+                retry_delay_s = (
+                    min(stream_exc.retry_after_s, _STREAM_RETRY_MAX_DELAY_S)
+                    if stream_exc.retry_after_s is not None
+                    else _escalated_stream_retry_delay_s(stream_failure_streak)
+                )
                 logger.warning(
                     "Provider stream failed for agent=%s task=%s iteration=%d "
-                    "(provider=%s model=%s); retrying once: %s",
+                    "(provider=%s model=%s); retrying once in %.2fs: %s",
                     agent_id,
                     task_id,
                     iteration,
                     stream_exc.provider,
                     stream_exc.model,
+                    retry_delay_s,
                     stream_exc,
                 )
-                time.sleep(_STREAM_RETRY_DELAY_S)
-                response = _stream_once()
+                # Wait on the cancel event, not time.sleep: the delay now
+                # escalates to the configured cap (30s by default) and a
+                # provider Retry-After can ask for that much on the first
+                # failure. A blocking sleep would hold a cancelled worker
+                # for the whole delay before the check below sees the flag.
+                if cancel_event is not None:
+                    cancel_event.wait(retry_delay_s)
+                else:
+                    time.sleep(retry_delay_s)
+                if cancel_event is None or not cancel_event.is_set():
+                    response = _stream_once()
+            else:
+                stream_failure_streak = 0
 
             # Cancelled mid-stream: discard this turn's partial response and
             # stop now, without executing any of its tool calls — mirrors
@@ -776,12 +857,11 @@ def _run_worker_impl(
                 cancelled_summary = last_assistant_content or f"Cancelled after {iteration} iterations"
                 summary = _resolve_summary(artifact_dir, cancelled_summary)
                 _emit(event_callback, "worker_cancelled", agent_id, task_id, {"iterations": iteration})
-                _write_summary(artifact_dir, summary)
-                _persist_messages(artifact_dir, messages)
+                _finalize_run(artifact_dir, summary, messages)
                 return WorkerResult(
                     status="cancelled",
                     summary=summary,
-                    artifact_paths=_collect_artifacts(artifact_dir),
+                    artifact_paths=_collect_artifacts(run_dir, artifact_dir),
                     iterations=iteration,
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
@@ -796,7 +876,7 @@ def _run_worker_impl(
             return WorkerResult(
                 status="failed",
                 summary=_resolve_summary(artifact_dir, last_assistant_content or ""),
-                artifact_paths=_collect_artifacts(artifact_dir),
+                artifact_paths=_collect_artifacts(run_dir, artifact_dir),
                 iterations=iteration,
                 error=error_msg,
                 input_tokens=total_input_tokens,
@@ -829,11 +909,11 @@ def _run_worker_impl(
                     {"count": content_filter_count},
                 )
                 summary = _resolve_summary(artifact_dir, last_assistant_content or "")
-                _write_summary(artifact_dir, summary)
+                _finalize_run(artifact_dir, summary, messages)
                 return WorkerResult(
                     status="failed",
                     summary=summary,
-                    artifact_paths=_collect_artifacts(artifact_dir),
+                    artifact_paths=_collect_artifacts(run_dir, artifact_dir),
                     iterations=iteration + 1,
                     error=(
                         f"content_filter_circuit_breaker: "
@@ -865,7 +945,7 @@ def _run_worker_impl(
         if not response.has_tool_calls:
             summary = response.content or last_assistant_content or "(no summary)"
             summary = _resolve_summary(artifact_dir, summary)
-            _write_summary(artifact_dir, summary)
+            _finalize_run(artifact_dir, summary, messages)
             reason = _classify_deliverable(
                 summary,
                 is_data_agent=_is_data_agent(agent_spec),
@@ -878,7 +958,7 @@ def _run_worker_impl(
                 return WorkerResult(
                     status="incomplete",
                     summary=summary,
-                    artifact_paths=_collect_artifacts(artifact_dir),
+                    artifact_paths=_collect_artifacts(run_dir, artifact_dir),
                     iterations=iteration + 1,
                     error=f"output contract not met: {reason}",
                     input_tokens=total_input_tokens,
@@ -891,7 +971,7 @@ def _run_worker_impl(
             return WorkerResult(
                 status="completed",
                 summary=summary,
-                artifact_paths=_collect_artifacts(artifact_dir),
+                artifact_paths=_collect_artifacts(run_dir, artifact_dir),
                 iterations=iteration + 1,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
@@ -920,7 +1000,9 @@ def _run_worker_impl(
                  **mcp_meta},
             )
             tc_start = time.monotonic()
-            args = {**tc.arguments, "run_dir": str(artifact_dir)}
+            args, run_dir_refusal = _tool_arguments(
+                registry.get(tc.name), tc.arguments, artifact_dir
+            )
 
             # Wrap tool execution in a heartbeat so the events.jsonl tail has a
             # fresh timestamp every few seconds. The stale-run reaper relies on
@@ -940,7 +1022,13 @@ def _run_worker_impl(
                 interval=_HEARTBEAT_INTERVAL_S,
                 emit=_on_heartbeat,
             ):
-                result = registry.execute(tc.name, args)
+                if run_dir_refusal is not None:
+                    result = json.dumps(
+                        {"status": "error", "error": run_dir_refusal},
+                        ensure_ascii=False,
+                    )
+                else:
+                    result = registry.execute(tc.name, args)
             result_is_error = _is_error_result(result)
             if tc.name != "load_skill" and not result_is_error:
                 data_tool_calls += 1
@@ -974,8 +1062,7 @@ def _run_worker_impl(
     # Hit iteration limit — use last meaningful content as summary
     summary = _best_summary(messages, last_assistant_content) or f"Worker hit iteration limit ({max_iterations} iterations)"
     summary = _resolve_summary(artifact_dir, summary)
-    _write_summary(artifact_dir, summary)
-    _persist_messages(artifact_dir, messages)
+    _finalize_run(artifact_dir, summary, messages)
     reason = _classify_deliverable(
         summary,
         is_data_agent=_is_data_agent(agent_spec),
@@ -988,7 +1075,7 @@ def _run_worker_impl(
         return WorkerResult(
             status="incomplete",
             summary=summary,
-            artifact_paths=_collect_artifacts(artifact_dir),
+            artifact_paths=_collect_artifacts(run_dir, artifact_dir),
             iterations=max_iterations,
             error=f"hit iteration limit without a valid deliverable: {reason}",
             input_tokens=total_input_tokens,
@@ -999,7 +1086,7 @@ def _run_worker_impl(
     return WorkerResult(
         status="completed",
         summary=summary,
-        artifact_paths=_collect_artifacts(artifact_dir),
+        artifact_paths=_collect_artifacts(run_dir, artifact_dir),
         iterations=max_iterations,
         input_tokens=total_input_tokens,
         output_tokens=total_output_tokens,
@@ -1038,16 +1125,63 @@ def _remote_tool_metadata(registry: ToolRegistry, tool_name: str) -> dict[str, s
     return {"server": spec.server_name, "remote_tool": spec.remote_name}
 
 
+def _tool_arguments(
+    tool: BaseTool | None, arguments: dict[str, Any], artifact_dir: Path
+) -> tuple[dict[str, Any], str | None]:
+    """Confine a worker tool call's ``run_dir`` to the agent's own workspace.
+
+    Returns the arguments to execute with, plus a refusal reason when the
+    model's ``run_dir`` is not usable.
+
+    A tool that does not declare ``run_dir`` is workspace-scoped: the worker
+    supplies one so it reads and writes inside ``artifact_dir`` **and only
+    there** — that value is the confinement root the file tools resolve
+    against, so it is not the model's to choose.
+
+    A tool that *does* declare ``run_dir`` is being pointed at a directory by
+    the model, so that value is honoured within the same boundary: a relative
+    value resolves under the workspace (the filesystem the model's own file
+    tools showed it), an absolute value inside the workspace is taken as-is,
+    and anything resolving outside is refused. Refusing is deliberate — the
+    alternative, silently swapping in the workspace, is what made a real run
+    pass ten paths that were all discarded while the error named no directory.
+    """
+    args = dict(arguments)
+    declared = (getattr(tool, "parameters", None) or {}).get("properties") or {}
+    workspace = artifact_dir.resolve()
+
+    if "run_dir" not in declared:
+        args["run_dir"] = str(artifact_dir)
+        return args, None
+
+    value = str(args.get("run_dir") or "").strip()
+    if not value:
+        args["run_dir"] = str(artifact_dir)
+        return args, None
+
+    supplied = Path(value)
+    resolved = (
+        supplied.resolve()
+        if supplied.is_absolute()
+        else (workspace / supplied).resolve()
+    )
+    if not resolved.is_relative_to(workspace):
+        return args, (
+            f"run_dir {value!r} is outside this agent's workspace. A run_dir "
+            f"must be inside {workspace} — pass a relative path such as "
+            '"runs/<name>" to point at a directory you created there.'
+        )
+    args["run_dir"] = str(resolved)
+    return args, None
+
+
 def _preview_tool_arguments(arguments: dict) -> dict[str, str]:
     """Return a short, redacted argument preview for streamed events."""
     preview: dict[str, str] = {}
-    for key, value in arguments.items():
+    for key, value in redact_payload(arguments).items():
         if key == "run_dir":
             continue
-        if is_sensitive_arg(key):
-            preview[key] = "[redacted]"
-            continue
-        preview[key] = _truncate_preview(redact_payload(value))
+        preview[key] = _truncate_preview(value)
     return preview
 
 
@@ -1194,6 +1328,24 @@ def _resolve_summary(artifact_dir: Path, fallback: str) -> str:
     return fallback
 
 
+def _finalize_run(artifact_dir: Path, summary: str, messages: list[dict]) -> None:
+    """Persist a worker's terminal summary and message log together.
+
+    Both files are written through one call, so a terminal path that reports a
+    summary cannot omit the message log: ``messages.json`` is the only record
+    of the arguments a model asked a tool for, which is what a post-mortem of a
+    bad tool call needs. The LLM-call-failure handler writes neither file and is
+    unchanged.
+
+    Args:
+        artifact_dir: Path to artifacts/{agent_id}/{task_id}/ directory.
+        summary: Final summary text for this worker run.
+        messages: Message history, including tool call arguments.
+    """
+    _write_summary(artifact_dir, summary)
+    _persist_messages(artifact_dir, messages)
+
+
 def _persist_messages(artifact_dir: Path, messages: list[dict]) -> None:
     """Persist messages to disk for post-mortem analysis."""
     try:
@@ -1210,7 +1362,7 @@ def _write_summary(artifact_dir: Path, summary: str) -> None:
     """Write worker summary to artifacts directory.
 
     Args:
-        artifact_dir: Path to artifacts/{agent_id}/ directory.
+        artifact_dir: Path to artifacts/{agent_id}/{task_id}/ directory.
         summary: Summary text to write.
     """
     try:
@@ -1220,11 +1372,12 @@ def _write_summary(artifact_dir: Path, summary: str) -> None:
         logger.warning("Failed to write summary to %s", artifact_dir, exc_info=True)
 
 
-def _collect_artifacts(artifact_dir: Path) -> list[str]:
+def _collect_artifacts(run_dir: Path, artifact_dir: Path) -> list[str]:
     """Collect regular artifacts as deterministic run-relative paths.
 
     Args:
-        artifact_dir: Path to artifacts/{agent_id}/ directory.
+        run_dir: Root directory for the swarm run.
+        artifact_dir: Path to artifacts/{agent_id}/{task_id}/ directory.
 
     Returns:
         Sorted POSIX-style paths relative to the swarm run directory. Symlinks
@@ -1233,7 +1386,7 @@ def _collect_artifacts(artifact_dir: Path) -> list[str]:
     if not artifact_dir.exists():
         return []
 
-    run_dir = artifact_dir.parent.parent.resolve()
+    run_dir = run_dir.resolve()
     artifact_root = artifact_dir.resolve()
     if not artifact_root.is_relative_to(run_dir):
         return []

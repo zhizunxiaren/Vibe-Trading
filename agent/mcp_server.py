@@ -6,10 +6,11 @@ Zero API key required for HK/US/crypto research markets (yfinance, OKX,
 AKShare are free). Trading connector tools are profile-scoped and require the
 selected connector's own local app or OAuth setup.
 
-Surfaces 74 tools: skills, research goals, strategy discovery,
+Surfaces 76 tools: skills, research goals, strategy discovery,
 backtest/factor/options/pattern
 analysis, market data, fundamentals & capital-flow & news & discovery
-(get_fund_flow / get_dragon_tiger / get_northbound_flow / get_margin_trading /
+(get_fund_flow / get_dragon_tiger / get_northbound_flow / get_southbound_flow /
+get_margin_trading /
 get_block_trades / get_shareholder_count / get_lockup_expiry / get_sector_info /
 get_research_reports / get_stock_news / get_sec_filings /
 get_financial_statements / get_options_chain / get_stock_profile /
@@ -254,9 +255,7 @@ class _HostGuardMiddleware:
             if not any(_host_matches(normalized, pattern) for pattern in self.allowed_hosts):
                 from starlette.responses import PlainTextResponse
 
-                await PlainTextResponse("Invalid host header", status_code=400)(
-                    scope, receive, send
-                )
+                await PlainTextResponse("Invalid host header", status_code=400)(scope, receive, send)
                 return
         await self.app(scope, receive, send)
 
@@ -283,9 +282,7 @@ class _OriginGuardMiddleware:
             if not _origin_allowed(origin, self.allowed_hosts):
                 from starlette.responses import PlainTextResponse
 
-                await PlainTextResponse("Origin not allowed", status_code=403)(
-                    scope, receive, send
-                )
+                await PlainTextResponse("Origin not allowed", status_code=403)(scope, receive, send)
                 return
         await self.app(scope, receive, send)
 
@@ -621,9 +618,9 @@ def get_research_goal(session_id: str = "", ctx: Context | None = None) -> str:
 
 @mcp.tool
 def add_goal_evidence(
-    goal_id: str,
-    expected_goal_id: str,
     text: str,
+    goal_id: str = "",
+    expected_goal_id: str = "",
     session_id: str = "",
     criterion_id: str | None = None,
     claim_id: str | None = None,
@@ -649,9 +646,11 @@ def add_goal_evidence(
     """Append traceable evidence to a finance research goal.
 
     Args:
-        goal_id: Goal being mutated.
-        expected_goal_id: Goal id captured before the tool/model turn started.
         text: Evidence note or result summary.
+        goal_id: Optional goal id. Defaults to the current goal for this
+            session.
+        expected_goal_id: Optional stale-write guard captured before the
+            tool/model turn started. Defaults to goal_id.
         session_id: Optional conversation id. Omit it unless the client tracks
             its own sessions; this server then uses one id per process.
         criterion_id: Optional criterion this evidence satisfies.
@@ -660,7 +659,9 @@ def add_goal_evidence(
         tool_call_id: Source tool call id for traceability; it does not verify evidence by itself.
         run_id: Vibe-Trading run id. It verifies evidence only when the run directory exists.
         source_provider: Data/provider name such as yfinance, OKX, tushare.
+            Defaults to "agent_tool" when omitted.
         source_type: Source category such as market_data, document, backtest.
+            Defaults to "tool_note" when omitted.
         source_uri: Optional source URL/path.
         symbol_universe: Symbols covered by the evidence.
         benchmark: Benchmark symbols covered by the evidence.
@@ -677,10 +678,20 @@ def add_goal_evidence(
     try:
         from src.goal import EvidenceInput, StaleGoalError
 
-        evidence = _get_goal_store().append_evidence(
-            session_id=_resolve_session_id(session_id, ctx),
-            goal_id=goal_id.strip(),
-            expected_goal_id=expected_goal_id.strip(),
+        store = _get_goal_store()
+        resolved_session_id = _resolve_session_id(session_id, ctx)
+        resolved_goal_id = goal_id.strip()
+        if not resolved_goal_id:
+            snapshot = store.get_current_snapshot(resolved_session_id)
+            if snapshot is None:
+                return _json_error("no current goal for this session", error_type="not_found")
+            resolved_goal_id = str(snapshot["goal"]["goal_id"])
+        resolved_expected_goal_id = expected_goal_id.strip() or resolved_goal_id
+
+        evidence = store.append_evidence(
+            session_id=resolved_session_id,
+            goal_id=resolved_goal_id,
+            expected_goal_id=resolved_expected_goal_id,
             evidence=EvidenceInput(
                 criterion_id=_blank_to_none(criterion_id),
                 claim_id=_blank_to_none(claim_id),
@@ -688,8 +699,8 @@ def add_goal_evidence(
                 text=text,
                 tool_call_id=_blank_to_none(tool_call_id),
                 run_id=_blank_to_none(run_id),
-                source_provider=_blank_to_none(source_provider),
-                source_type=_blank_to_none(source_type),
+                source_provider=_blank_to_none(source_provider) or "agent_tool",
+                source_type=_blank_to_none(source_type) or "tool_note",
                 source_uri=_blank_to_none(source_uri),
                 symbol_universe=_clean_list(symbol_universe),
                 benchmark=_clean_list(benchmark),
@@ -704,7 +715,7 @@ def add_goal_evidence(
                 contradicts_claim_ids=_clean_list(contradicts_claim_ids),
             ),
         )
-        snapshot = _get_goal_store().get_goal_snapshot(goal_id.strip())
+        snapshot = store.get_goal_snapshot(resolved_goal_id)
         if snapshot is None:
             return _json_error("Goal snapshot could not be reloaded")
         from dataclasses import asdict
@@ -718,9 +729,9 @@ def add_goal_evidence(
 
 @mcp.tool
 def update_research_goal_status(
-    goal_id: str,
-    expected_goal_id: str,
     status: str,
+    goal_id: str = "",
+    expected_goal_id: str = "",
     session_id: str = "",
     audit: _lenient_dict_list_opt = None,
     recap: str | None = None,
@@ -733,9 +744,11 @@ def update_research_goal_status(
     required criterion and verified evidence for satisfied rows.
 
     Args:
-        goal_id: Goal being mutated.
-        expected_goal_id: Goal id captured before the tool/model turn started.
         status: Goal lifecycle status, e.g. complete, cancelled, blocked.
+        goal_id: Optional goal id. Defaults to the current goal for this
+            session.
+        expected_goal_id: Optional stale-write guard captured before the
+            tool/model turn started. Defaults to goal_id.
         session_id: Optional conversation id. Omit it unless the client tracks
             its own sessions; this server then uses one id per process.
         audit: Optional list of criterion audit rows.
@@ -744,15 +757,25 @@ def update_research_goal_status(
     try:
         from src.goal import GoalStatus, StaleGoalError
 
-        updated = _get_goal_store().update_status(
-            session_id=_resolve_session_id(session_id, ctx),
-            goal_id=goal_id.strip(),
-            expected_goal_id=expected_goal_id.strip(),
+        store = _get_goal_store()
+        resolved_session_id = _resolve_session_id(session_id, ctx)
+        resolved_goal_id = goal_id.strip()
+        if not resolved_goal_id:
+            snapshot = store.get_current_snapshot(resolved_session_id)
+            if snapshot is None:
+                return _json_error("no current goal for this session", error_type="not_found")
+            resolved_goal_id = str(snapshot["goal"]["goal_id"])
+        resolved_expected_goal_id = expected_goal_id.strip() or resolved_goal_id
+
+        updated = store.update_status(
+            session_id=resolved_session_id,
+            goal_id=resolved_goal_id,
+            expected_goal_id=resolved_expected_goal_id,
             status=GoalStatus(status),
             audit=_audit_rows_from_payload(audit),
             recap=_blank_to_none(recap),
         )
-        snapshot = _get_goal_store().get_goal_snapshot(updated.goal_id)
+        snapshot = store.get_goal_snapshot(updated.goal_id)
         if snapshot is None:
             return _json_error("Goal snapshot could not be reloaded")
         return _json_ok(goal=snapshot["goal"], snapshot=snapshot)
@@ -1017,6 +1040,12 @@ def backtest(run_dir: str) -> str:
     - "auto": auto-detect based on symbol format (with fallback)
 
     Returns metrics (Sharpe, return, drawdown, etc.) and artifact paths.
+    On success the envelope also carries a structured ``summary``: the full
+    scalar metrics plus structured_metrics and validation, run metadata,
+    an ``equity_preview`` (at most 50 equal-stride points, first and last
+    pinned) and ``artifact_paths`` including per-symbol ohlcv files — read
+    these instead of parsing ``stdout``. Large envelopes omit logs first
+    and reduce preview points; any omitted summary is explicitly reported.
 
     Args:
         run_dir: Path to the run directory containing config.json and code/.
@@ -1100,6 +1129,7 @@ def alpha_bench(
     alpha_id: str | None = None,
     zoo: str | None = None,
     top: int = 20,
+    horizon: int = 1,
     output_dir: str | None = None,
 ) -> str:
     """Benchmark one Alpha Zoo alpha or a complete zoo on a universe.
@@ -1110,6 +1140,10 @@ def alpha_bench(
         alpha_id: Optional single alpha id; mutually exclusive with ``zoo``.
         zoo: Optional zoo id; mutually exclusive with ``alpha_id``.
         top: Number of top-ranked alphas to include in the report.
+        horizon: Forward-return horizon in bars (default 1 = next-bar).
+            ``h > 1`` computes h-bar forward returns and samples IC rows
+            non-overlapping (end-anchored); 21 ≈ monthly, the conventional
+            horizon for fundamental factors. Range 1-252.
         output_dir: Optional directory for the generated HTML report.
     """
     if not alpha_id and not zoo:
@@ -1132,7 +1166,7 @@ def alpha_bench(
     try:
         from datetime import date
 
-        from src.tools.alpha_bench_tool import _parse_period
+        from src.tools.alpha_bench_tool import _MAX_HORIZON, _parse_period
 
         start_raw, end_raw = _parse_period(period)
         start_date = date.fromisoformat(start_raw)
@@ -1161,10 +1195,20 @@ def alpha_bench(
             ensure_ascii=False,
         )
 
+    if isinstance(horizon, bool) or not isinstance(horizon, int) or not 1 <= horizon <= _MAX_HORIZON:
+        return json.dumps(
+            {
+                "status": "error",
+                "error": f"MCP alpha_bench horizon must be an integer between 1 and {_MAX_HORIZON}",
+            },
+            ensure_ascii=False,
+        )
+
     params: dict[str, Any] = {
         "universe": universe,
         "period": period,
         "top": top,
+        "horizon": horizon,
     }
     if alpha_id is not None:
         params["alpha_id"] = alpha_id
@@ -1401,6 +1445,67 @@ def read_file(path: str) -> str:
     return registry.execute("read_file", {"path": path})
 
 
+@mcp.tool
+def read_run_artifact(
+    run_dir: str,
+    artifact: str,
+    format: str = "rows",
+    offset: int = 0,
+    max_rows: int = 1000,
+    columns: _lenient_str_list_opt = None,
+) -> str:
+    """Read a backtest run artifact as structured JSON instead of raw CSV text.
+
+    Artifacts: friendly aliases ``equity``, ``trades``, ``metrics``,
+    ``positions``, ``target_positions`` (CSVs under ``<run_dir>/artifacts/``),
+    ``ohlcv:<CODE>`` (e.g. ``ohlcv:600519.SH``) and ``run_card`` — plus any
+    run_dir-relative ``.csv``/``.json`` path listed in the run's
+    ``run_card.json`` artifacts manifest (e.g. ``artifacts/validation.json``).
+    The manifest is the trust anchor: a relative path it does not list is
+    refused, and a manifest entry pointing outside the run directory is never
+    followed.
+
+    Formats:
+
+    - ``rows``: offset paging over whole records; follow ``next_offset`` until
+      ``truncated`` is false to walk a file losslessly.
+    - ``downsample``: equal-stride sample of at most ``max_rows`` points with
+      the first and last row always pinned — one call feeds a chart.
+    - ``meta``: columns / total_rows / size_bytes, plus the manifest's
+      ``sha256`` and ``manifest_size_bytes`` for a manifest-listed artifact.
+
+    Cells arrive typed (int / float / null / string). Every envelope is
+    serialized within the shared model-result character budget: an oversized
+    page shrinks to whole records with honest ``truncated`` / ``next_offset``
+    metadata rather than cutting mid-JSON. Errors return
+    ``{"ok": false, "error", "hint"}``. Small JSON artifacts return their
+    parsed object; oversized JSON returns size metadata in meta mode and an
+    actionable error otherwise.
+
+    Args:
+        run_dir: Run directory a backtest/tool call returned.
+        artifact: Alias name or manifest-listed relative path (see above);
+            anything else — including path traversal — is refused.
+        format: "rows" (default), "downsample" or "meta".
+        offset: First row index for "rows" mode (default 0).
+        max_rows: Page size [1, 5000] (default 1000); samples retain at least two endpoints.
+        columns: Optional column projection; unknown names are refused with
+            the valid list.
+    """
+    registry = _get_registry()
+    return registry.execute(
+        "read_run_artifact",
+        {
+            "run_dir": run_dir,
+            "artifact": artifact,
+            "format": format,
+            "offset": offset,
+            "max_rows": max_rows,
+            "columns": columns,
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Strategy discovery tools
 # ---------------------------------------------------------------------------
@@ -1526,9 +1631,7 @@ def get_strategy_evidence(strategy_id: str, regime: str | None = None) -> str:
 
 
 @mcp.tool
-def refresh_strategy_evidence(
-    manifest_path: str | None = None, runs: list | None = None
-) -> str:
+def refresh_strategy_evidence(manifest_path: str | None = None, runs: list | None = None) -> str:
     """Rebuild the strategy-discovery evidence cache from backtest run artifacts.
 
     WRITE tool with disposable-cache-only scope: it replaces the facade-owned
@@ -1565,6 +1668,7 @@ def refresh_strategy_evidence(
 def _trading_common_args(
     *,
     connection: str | None = None,
+    connection_id: str | None = None,
     host: str | None = None,
     port: int | None = None,
     client_id: int | None = None,
@@ -1574,6 +1678,8 @@ def _trading_common_args(
     payload: dict[str, Any] = {}
     if connection:
         payload["connection"] = connection
+    if connection_id:
+        payload["connection_id"] = connection_id
     if host:
         payload["host"] = host
     if port is not None:
@@ -1610,6 +1716,7 @@ def trading_select_connection(connection: str) -> str:
 @mcp.tool
 def trading_check(
     connection: str | None = None,
+    connection_id: str | None = None,
     host: str | None = None,
     port: int | None = None,
     client_id: int | None = None,
@@ -1623,6 +1730,7 @@ def trading_check(
 
     Args:
         connection: Optional profile id. Defaults to the selected profile.
+        connection_id: Optional local connection id whose OS-vault credentials are used.
         host: Optional local host override.
         port: Optional local socket port override.
         client_id: Optional local client id override.
@@ -1631,13 +1739,21 @@ def trading_check(
     registry = _get_registry()
     return registry.execute(
         "trading_check",
-        _trading_common_args(connection=connection, host=host, port=port, client_id=client_id, account=account),
+        _trading_common_args(
+            connection=connection,
+            connection_id=connection_id,
+            host=host,
+            port=port,
+            client_id=client_id,
+            account=account,
+        ),
     )
 
 
 @mcp.tool
 def trading_account(
     connection: str | None = None,
+    connection_id: str | None = None,
     host: str | None = None,
     port: int | None = None,
     client_id: int | None = None,
@@ -1647,6 +1763,7 @@ def trading_account(
 
     Args:
         connection: Optional profile id. Defaults to the selected profile.
+        connection_id: Optional local connection id whose OS-vault credentials are used.
         host: Optional local host override.
         port: Optional local socket port override.
         client_id: Optional local client id override.
@@ -1655,13 +1772,21 @@ def trading_account(
     registry = _get_registry()
     return registry.execute(
         "trading_account",
-        _trading_common_args(connection=connection, host=host, port=port, client_id=client_id, account=account),
+        _trading_common_args(
+            connection=connection,
+            connection_id=connection_id,
+            host=host,
+            port=port,
+            client_id=client_id,
+            account=account,
+        ),
     )
 
 
 @mcp.tool
 def trading_positions(
     connection: str | None = None,
+    connection_id: str | None = None,
     host: str | None = None,
     port: int | None = None,
     client_id: int | None = None,
@@ -1671,6 +1796,7 @@ def trading_positions(
 
     Args:
         connection: Optional profile id. Defaults to the selected profile.
+        connection_id: Optional local connection id whose OS-vault credentials are used.
         host: Optional local host override.
         port: Optional local socket port override.
         client_id: Optional local client id override.
@@ -1679,13 +1805,21 @@ def trading_positions(
     registry = _get_registry()
     return registry.execute(
         "trading_positions",
-        _trading_common_args(connection=connection, host=host, port=port, client_id=client_id, account=account),
+        _trading_common_args(
+            connection=connection,
+            connection_id=connection_id,
+            host=host,
+            port=port,
+            client_id=client_id,
+            account=account,
+        ),
     )
 
 
 @mcp.tool
 def trading_orders(
     connection: str | None = None,
+    connection_id: str | None = None,
     host: str | None = None,
     port: int | None = None,
     client_id: int | None = None,
@@ -1704,7 +1838,9 @@ def trading_orders(
         account: Optional account code filter.
         include_executions: Include recent executions when available.
     """
-    params = _trading_common_args(connection=connection, host=host, port=port, client_id=client_id, account=account)
+    params = _trading_common_args(
+        connection=connection, connection_id=connection_id, host=host, port=port, client_id=client_id, account=account
+    )
     params["include_executions"] = include_executions
     registry = _get_registry()
     return registry.execute("trading_orders", params)
@@ -1714,6 +1850,7 @@ def trading_orders(
 def trading_quote(
     symbol: str,
     connection: str | None = None,
+    connection_id: str | None = None,
     host: str | None = None,
     port: int | None = None,
     client_id: int | None = None,
@@ -1735,7 +1872,9 @@ def trading_quote(
         currency: Contract currency, default USD.
         sec_type: Security type, default STK.
     """
-    params = _trading_common_args(connection=connection, host=host, port=port, client_id=client_id, account=account)
+    params = _trading_common_args(
+        connection=connection, connection_id=connection_id, host=host, port=port, client_id=client_id, account=account
+    )
     params.update({"symbol": symbol, "exchange": exchange, "currency": currency, "sec_type": sec_type})
     registry = _get_registry()
     return registry.execute("trading_quote", params)
@@ -1745,6 +1884,7 @@ def trading_quote(
 def trading_history(
     symbol: str,
     connection: str | None = None,
+    connection_id: str | None = None,
     host: str | None = None,
     port: int | None = None,
     client_id: int | None = None,
@@ -1778,7 +1918,9 @@ def trading_history(
         period: Bar interval for SDK connectors (broker_sdk): 1m/5m/1h/1d/1w.
         limit: Number of bars for SDK connectors.
     """
-    params = _trading_common_args(connection=connection, host=host, port=port, client_id=client_id, account=account)
+    params = _trading_common_args(
+        connection=connection, connection_id=connection_id, host=host, port=port, client_id=client_id, account=account
+    )
     params.update(
         {
             "symbol": symbol,
@@ -1862,9 +2004,7 @@ async def run_swarm(
     runtime = SwarmRuntime(store=store, agent_config=agent_config)
 
     try:
-        run = runtime.start_run(
-            preset_name, variables, include_shell_tools=_include_shell_tools
-        )
+        run = runtime.start_run(preset_name, variables, include_shell_tools=_include_shell_tools)
     except FileNotFoundError as exc:
         return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
     except ValueError as exc:
@@ -1932,6 +2072,7 @@ async def run_swarm(
 # Market data tool
 # ---------------------------------------------------------------------------
 
+
 def _detect_source(code: str) -> str:
     return detect_source(code)
 
@@ -1984,7 +2125,7 @@ def get_market_data(
         end_date: End date (YYYY-MM-DD).
         source: Data source. Prefer ``auto``; ``yahoo``/``yfinance`` serve
             Canada, US, and HK equities.
-        interval: Bar size (1m/5m/15m/30m/1H/4H/1D, default "1D").
+        interval: Bar size (1m/5m/15m/30m/1H/4H/1D/1W/1M, default "1D"; 1W and 1M are built from daily bars).
         max_rows: Per-symbol row cap (default 250) so the response stays
             within the MCP token budget. A symbol exceeding it returns an
             even-stride downsample (every step-th bar, last bar pinned)
@@ -1996,6 +2137,15 @@ def get_market_data(
     single shares). Each symbol's ``_provenance.volume_unit`` states the unit
     of the returned rows ("lots" / "shares"; null = source undeclared) — read
     it before interpreting or comparing volume values across symbols/sources.
+
+    Price caliber: which source served a symbol decides what its prices mean
+    (some adjust for splits and dividends, others serve raw quotes). Each
+    symbol's ``_provenance.adjustment`` states the caliber ("raw" / "split" /
+    "split_dividend" / "split_dividend_additive" / "na" / "unknown") — read it
+    before comparing price levels across symbols. Note that
+    ``split_dividend_additive`` (the A-share qfq of Tencent, Eastmoney and AKShare) adjusts dividends by
+    shifting the price level rather than scaling it, so it is not on the same
+    scale as ``split_dividend`` even though both account for dividends.
     """
     registry = _get_registry()
     return registry.execute(
@@ -2145,6 +2295,26 @@ def get_northbound_flow(lookback_days: int = 30) -> str:
 
 
 @mcp.tool
+def get_southbound_flow(lookback_days: int = 30) -> str:
+    """Fetch Southbound (Stock-Connect) net capital flow into Hong Kong equities.
+
+    Returns the latest trading day's net buy plus recent daily history, split
+    into 港股通（沪） and 港股通（深） channels (units: 100M HKD, 亿) from the
+    Eastmoney datacenter — cross-verified against HKEX official daily
+    statistics — falling back to the HKEX official report (latest trading day
+    snapshot) when Eastmoney is unavailable. Southbound is the only
+    Stock-Connect direction whose daily net buy is still officially disclosed
+    (the northbound net ended 2024-08-30; see get_northbound_flow). Read-only,
+    no credentials; HK market only.
+
+    Args:
+        lookback_days: Trailing trading days of daily net-buy history to return.
+    """
+    registry = _get_registry()
+    return registry.execute("get_southbound_flow", {"lookback_days": lookback_days})
+
+
+@mcp.tool
 def get_margin_trading(code: str, days: int = 30) -> str:
     """Fetch an A-share stock's daily margin-trading (融资融券) balances (Eastmoney).
 
@@ -2179,11 +2349,13 @@ def get_block_trades(code: str, days: int = 30) -> str:
 
 @mcp.tool
 def get_shareholder_count(code: str, max_periods: int = 24) -> str:
-    """Fetch mainland A-share quarterly shareholder count (股东户数) (Eastmoney).
+    """Fetch mainland A-share shareholder count history (股东户数) (Eastmoney).
 
-    Returns holder count per report period, quarter-over-quarter change
-    (absolute and percent), and average holding (shares and market value) per
-    account. Markets: China A-shares only (.SH/.SZ/.BJ).
+    Returns holder count per disclosed period, the change against the previous
+    disclosed period (absolute and percent; each row states its own
+    prev_period_end since intervals vary), and average holding (shares and
+    market value) per account on the newest row. Markets: China A-shares only
+    (.SH/.SZ/.BJ).
 
     Args:
         code: A-share symbol in <code>.<exchange> form (SH/SZ/BJ).
@@ -2370,7 +2542,7 @@ def get_options_chain(ticker: str, expiration: int | None = None) -> str:
 
 @mcp.tool
 def get_stock_profile(ticker: str, sections: _lenient_str_list_opt = None) -> str:
-    """Fetch a read-only company profile for a US or HK listing (Yahoo Finance).
+    """Fetch a read-only company profile for a US, HK, or UK (LSE .L) listing (Yahoo Finance).
 
     Returns valuation key statistics, analyst price targets and
     earnings/revenue estimates, institutional and insider ownership, and the
@@ -2378,7 +2550,8 @@ def get_stock_profile(ticker: str, sections: _lenient_str_list_opt = None) -> st
     context, not for OHLCV price bars (use get_market_data).
 
     Args:
-        ticker: US (bare or .US suffix) or HK (zero-padded .HK code) symbol.
+        ticker: US (bare or .US suffix), HK (zero-padded .HK code), or
+            UK (LSE .L, e.g. VOD.L) symbol.
         sections: Profile sections to return, any of: key_stats, financials,
             earnings_trend, institution_ownership, insider_holders,
             recommendation_trend. Defaults to all sections.
@@ -2446,7 +2619,10 @@ def get_macro_series(
         series_id: FRED series identifier (e.g. "CPIAUCSL", "UNRATE").
         start_date: Inclusive window start, YYYY-MM-DD. Omit for full history.
         end_date: Inclusive window end, YYYY-MM-DD. Omit for the latest date.
-        limit: Maximum number of most-recent observations to return.
+        limit: Maximum number of most-recent observations to return (max
+            5000). A series longer than that is capped and says so in the
+            result: truncated, observations_available, and a hint. The shared
+            character budget may return fewer rows; count reports delivered rows.
     """
     params: dict[str, Any] = {"series_id": series_id, "limit": limit}
     if start_date:
@@ -2638,9 +2814,7 @@ def _mirrored_tool_classes() -> list[Any]:
         try:
             classes.append(getattr(import_module(module_path), class_name))
         except Exception:  # noqa: BLE001 - one unavailable module, not four
-            logger.exception(
-                "Tool module %s is unavailable; its MCP tool will be absent", module_path
-            )
+            logger.exception("Tool module %s is unavailable; its MCP tool will be absent", module_path)
     return classes
 
 
@@ -2728,8 +2902,7 @@ def _register_mirrored_tool(tool_cls: Any) -> bool:
     name = getattr(tool_cls, "name", "")
     if getattr(tool_cls, "is_readonly", False) is not True:
         logger.error(
-            "Refusing to expose non-read-only tool %r via MCP; only read-only "
-            "tools are ever surfaced.",
+            "Refusing to expose non-read-only tool %r via MCP; only read-only tools are ever surfaced.",
             name or tool_cls,
         )
         return False
@@ -3217,9 +3390,7 @@ def main():
         default="127.0.0.1",
         help="Network bind host for --transport sse / http (default: 127.0.0.1)",
     )
-    parser.add_argument(
-        "--port", type=int, default=8900, help="SSE/HTTP port (default: 8900)"
-    )
+    parser.add_argument("--port", type=int, default=8900, help="SSE/HTTP port (default: 8900)")
     parser.add_argument(
         "--enable-shell-tools",
         action="store_true",
@@ -3239,9 +3410,7 @@ def main():
 
         _migrate.migrate_legacy_state()
     except Exception:  # pragma: no cover — best-effort
-        logging.getLogger(__name__).warning(
-            "Legacy state migration failed", exc_info=True
-        )
+        logging.getLogger(__name__).warning("Legacy state migration failed", exc_info=True)
 
     _include_shell_tools = _resolve_include_shell_tools(args.enable_shell_tools)
     _registry = None
@@ -3258,9 +3427,7 @@ def main():
 
         from src.config.accessor import get_env_config
 
-        allowed_hosts = _parse_allowed_hosts(
-            get_env_config().api.vibe_trading_mcp_allowed_hosts
-        )
+        allowed_hosts = _parse_allowed_hosts(get_env_config().api.vibe_trading_mcp_allowed_hosts)
         transport = "streamable-http" if args.transport == "http" else "sse"
         app = _build_network_app(transport, allowed_hosts)
         uvicorn.run(app, host=args.host, port=args.port)

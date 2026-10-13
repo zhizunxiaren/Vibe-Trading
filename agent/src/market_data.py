@@ -21,24 +21,42 @@ DEFAULT_MAX_ROWS = 250
 _SOURCE_PATTERNS = [
     (re.compile(r"^local:", re.I), "local"),
     (re.compile(r"^\d{6}\.(SZ|SH|BJ)$", re.I), "tencent"),
-    (re.compile(r"^[A-Z]+\.US$", re.I), "yahoo"),
+    (re.compile(r"^[A-Z0-9&.\-]+\.US$", re.I), "yahoo"),
     (re.compile(r"^\d{3,5}\.HK$", re.I), "tencent"),
     # India: NSE (RELIANCE.NS) / BSE (500325.BO). Tickers may carry '&' and '-'
     # (e.g. M&M.NS, BAJAJ-AUTO.NS). Served by Yahoo's public chart endpoint.
     (re.compile(r"^[A-Z0-9&.\-]+\.(NS|BO)$", re.I), "yahoo"),
     # Canada: Toronto Stock Exchange (TD.TO) / TSX Venture (PNG.V).
     (re.compile(r"^[A-Z0-9&.\-]+\.(TO|V)$", re.I), "yahoo"),
+    # Argentina: BYMA equities and CEDEARs use Yahoo's canonical .BA suffix.
+    (re.compile(r"^[A-Z0-9&.\-]+\.BA$", re.I), "yahoo"),
+    # Brazil: B3 equities, FIIs, ETFs and BDRs use Yahoo's canonical .SA suffix.
+    (re.compile(r"^[A-Z0-9]+\.SA$", re.I), "yahoo"),
+    # UK: London Stock Exchange (VOD.L, SHEL.L). Yahoo serves the suffix
+    # verbatim; without this they fell through to the tushare default and were
+    # routed to China-market loaders that cannot resolve them.
+    (re.compile(r"^[A-Z0-9&.\-]+\.L$", re.I), "yahoo"),
     # Yahoo futures (GC=F, CL=F) and forex (EURUSD=X) suffix conventions —
     # served verbatim by Yahoo's public chart endpoint (#718). Without these,
     # such symbols fell through to the ``tushare`` default and were routed to
     # China-market loaders that cannot resolve them.
     (re.compile(r"^[A-Z0-9]+=F$", re.I), "yahoo"),
     (re.compile(r"^[A-Z]+=X$", re.I), "yahoo"),
+    # Yahoo index symbols (^SPX, ^GSPC, ^FTSE, ^VIX, ...) — served verbatim,
+    # same convention as =F/=X. Without this they fell to the tushare default.
+    (re.compile(r"^\^[A-Za-z0-9.\-]+$", re.I), "yahoo"),
     # Korea: KOSPI (005930.KS) / KOSDAQ (247540.KQ), 6-digit codes. Served by
     # pykrx (KRX public data, no auth); registry falls back to Yahoo/yfinance.
     (re.compile(r"^\d{6}\.(KS|KQ)$", re.I), "pykrx"),
     (re.compile(r"^[A-Z]+-USDT$", re.I), "okx"),
     (re.compile(r"^[A-Z]+/USDT$", re.I), "ccxt"),
+    # Iran: Nobitex IRT-quoted crypto pairs (BTCIRT / BTC-IRT). Toman-
+    # denominated public UDF endpoint, no auth; explicit-source only (not in
+    # the crypto fallback chain — non-IRT pairs would never resolve there).
+    (re.compile(r"^[A-Z]+[-/]?IRT$", re.I), "nobitex"),
+    # Iran: Wallex TMN-quoted crypto pairs (USDTTMN / USDT-TMN). Public UDF
+    # endpoint, no auth; explicit-source only like nobitex.
+    (re.compile(r"^[A-Z]+[-/]?TMN$", re.I), "wallex"),
     # Forex pairs and metals (EUR/USD, XAU/USD, EURUSD.FX). mt5 is the head of
     # the forex chain and degrades to akshare/yfinance via the registry when no
     # local MT5 terminal is attached. The 3-letter quote cannot collide with
@@ -50,10 +68,29 @@ _SOURCE_PATTERNS = [
 
 def detect_source(code: str) -> str:
     """Infer the best loader source for a normalized symbol."""
+    from backtest.engines._market_hooks import _detect_market
+    from backtest.loaders.registry import FALLBACK_CHAINS
+
+    market = _detect_market(code.strip().upper())
     for pattern, source in _SOURCE_PATTERNS:
         if pattern.match(code):
+            # XXX/USD also matches known crypto bases. Keep the shared market
+            # classification authoritative over this broad forex-source rule.
+            if source == "mt5" and market == "crypto":
+                continue
             return source
-    return "tushare"
+    if market == "a_share":
+        return "tushare"  # Keep the documented fallback for unknown symbols.
+    chain = FALLBACK_CHAINS.get(market, [])
+    return chain[0] if chain else "tushare"
+
+
+
+def normalize_crypto_symbol(code: str) -> str:
+    """Normalize USDT spot aliases without changing the requested quote asset."""
+    cleaned = code.strip().upper()
+    match = re.fullmatch(r"([A-Z]{2,})[-/]?USDT", cleaned)
+    return f"{match.group(1)}-USDT" if match else code
 
 
 def get_loader(source: str):
@@ -61,6 +98,45 @@ def get_loader(source: str):
     from backtest.loaders.registry import get_loader_cls_with_fallback
 
     return get_loader_cls_with_fallback(source)
+
+
+#: ISO-4217-style fiat codes. A pair whose BOTH legs are fiat is an FX pair,
+#: never a crypto instrument — ``GBP/USD`` used to be classified as the crypto
+#: pair "GBP-USD" (its quote leg USD is a crypto-connector quote asset) by the
+#: symbol-search tool's pair classifier and by the grounding ledger's symbol
+#: scanner, which then disagreed with the search result ("GBPUSD=X") and made
+#: the identity gate flag a conflict. One canonicalization is shared here so
+#: search, fetch and grounding all agree.
+FIAT_CODES = frozenset(
+    {
+        "USD", "EUR", "GBP", "JPY", "CHF", "CNY", "CNH", "HKD", "AUD", "NZD",
+        "CAD", "KRW", "INR", "SGD", "SEK", "NOK", "DKK", "MXN", "BRL", "ZAR",
+        "TRY", "RUB", "PLN", "THB", "MYR", "IDR", "PHP", "VND", "ILS", "AED",
+        "SAR", "EGP", "CZK", "HUF", "RON", "CLP", "COP", "PEN", "TWD", "CUP",
+    }
+)
+
+#: Yahoo-served FX pair symbol forms, canonicalized to ``XXXYYY=X``.
+_FX_PAIR_RE = re.compile(r"^(?P<base>[A-Z]{3})(?:/)?(?P<quote>[A-Z]{3})$", re.IGNORECASE)
+
+
+def canonical_fx_pair(value: str) -> str | None:
+    """Return a Yahoo FX pair in canonical ``XXXYYY=X`` form, or ``None``.
+
+    Recognizes ``GBP/USD``, ``GBPUSD`` and ``GBPUSD=X`` (both legs must be
+    fiat codes — ``ETH/USD`` and ``XAU/USD`` are not FX pairs) and returns
+    the canonical spelling the market-data fetch layer serves directly.
+    """
+    clean = str(value or "").strip().upper()
+    if clean.endswith("=X"):
+        clean = clean[:-2]
+    matched = _FX_PAIR_RE.fullmatch(clean)
+    if not matched:
+        return None
+    base, quote = matched.group("base"), matched.group("quote")
+    if base not in FIAT_CODES or quote not in FIAT_CODES:
+        return None
+    return f"{base}{quote}=X"
 
 
 # Canadian venue-alias helper: TSX (.TO) <-> TSX Venture (.V).
@@ -132,8 +208,12 @@ def fetch_market_data(
     fallback_chain_provider: Callable[[str], list[str]] | None = None,
     max_fallback_attempts: int = 5,
     include_provenance: bool = False,
+    as_frames: bool = False,
 ) -> dict[str, Any]:
     """Fetch normalized OHLCV data through the repository loader layer.
+
+    ``as_frames`` retains the observed DataFrames for in-process analysis;
+    row limits apply only to the JSON form.
 
     When ``source="auto"`` (or any resolved source), if the chosen loader
     raises during :meth:`fetch` the call falls through to the next source in
@@ -149,11 +229,24 @@ def fetch_market_data(
     consumers must read this field instead of assuming a unit.
     """
     from backtest.engines._market_hooks import _detect_market
-    from backtest.loaders.base import NoAvailableSourceError
-    from backtest.loaders.registry import FALLBACK_CHAINS, _NO_NETWORK_FALLBACK_SOURCES
+    from backtest.loaders.base import NoAvailableSourceError, resample_bars, source_interval
+    from backtest.loaders.registry import (
+        FALLBACK_CHAINS,
+        _NO_NETWORK_FALLBACK_SOURCES,
+        get_source_order_override,
+        frame_caliber,
+        price_caliber,
+        refresh_source_order_overrides,
+    )
+
+    # Pick up MARKET_DATA_ORDER_* overrides that appeared after this module's
+    # import (e.g. ~/.vibe-trading/.env loaded lazily, or a Settings PUT in
+    # another code path). Snapshot-gated: no-op when nothing changed.
+    refresh_source_order_overrides()
 
     results: dict[str, Any] = {}
     provenance: dict[str, dict[str, Any]] = {}
+    diagnostics: dict[str, list[dict[str, str]]] = {}
     result_aliases = {
         code: code.split(":", 1)[1]
         if code.lower().startswith("local:")
@@ -190,55 +283,131 @@ def fetch_market_data(
 
     def _fetch_via_chain(
         src: str, market: str, src_codes: list[str]
-    ) -> tuple[dict[str, Any], str | None, type | None]:
-        """Run the ordered source chain for one group.
+    ) -> tuple[dict[str, Any], str | None, type | None, dict[str, tuple[str, type]]]:
+        """Run the ordered source chain for one group, per symbol.
 
-        Returns ``(data_map, used_source, provider_cls)`` — ``data_map`` keyed
-        by requested symbol -> OHLCV frame (possibly empty), the source name
-        that actually served it, and the serving loader class (both ``None``
-        when every attempt failed).
+        Returns ``(data_map, used_source, provider_cls, symbol_sources)`` —
+        ``data_map`` keyed by requested symbol -> OHLCV non-empty frame, ``used_source``/``provider_cls`` the first source that served
+        anything (``None`` when every attempt failed), and ``symbol_sources``
+        mapping each served symbol to the source that actually served it. A
+        partially successful attempt no longer stops the walk: symbols the
+        loader omitted are retried down the chain and merged in.
         """
         chain = _chain_for(src, market)
-        # Start the attempt list with the requested source, then the rest of
-        # the chain (preserving order, no duplicates).
+        # An env-configured order override (MARKET_DATA_ORDER_<MARKET>, set
+        # via the Settings page) rewrites the attempt order for auto-detected
+        # sources: the override list IS the attempt order, so a user who put
+        # tushare first actually starts there. Guards: explicit source
+        # requests stay src-first; the fallback_chain_provider test hook wins;
+        # local:/qveris/tickerall/fmp keep their no-network entry point
+        # (explicit fmp must not silently return yahoo on Stable 403 — issue #1270).
+        # Sources in _NO_NETWORK_FALLBACK_SOURCES never walk the chain.
+        if src in _NO_NETWORK_FALLBACK_SOURCES:
+            candidates = [src]
+            override = None
+        else:
+            override = (
+                get_source_order_override(market)
+                if source == "auto"
+                and fallback_chain_provider is None
+                else None
+            )
+            candidates = (
+                list(override)
+                if override is not None and src in override
+                else [src, *chain]
+            )
+        # Deduplicate (preserving order), then cap the attempt budget.
         attempts: list[str] = []
-        for candidate in [src, *chain]:
+        for candidate in candidates:
             if candidate not in attempts:
                 attempts.append(candidate)
         attempts = attempts[: max(1, max_fallback_attempts)]
 
         data_map: dict[str, Any] = {}
+        symbol_sources: dict[str, tuple[str, type]] = {}
         used_source: str | None = None
         provider_cls: type | None = None
+        remaining = list(dict.fromkeys(src_codes))
+        attempted_providers: set[str] = set()
+        def record(symbols: list[str], candidate: str, reason: str) -> None:
+            for symbol in symbols:
+                diagnostics.setdefault(symbol, []).append({"source": candidate, "reason": reason})
+
         for attempt_src in attempts:
+            if not remaining:
+                break
             try:
                 loader_cls = loader_resolver(attempt_src)
             except NoAvailableSourceError as exc:
+                record(remaining, attempt_src, "source_unavailable")
                 logger.debug("loader %r unavailable: %s", attempt_src, exc)
                 continue
             except Exception as exc:  # noqa: BLE001 — resolver may raise for non-network reasons
+                record(remaining, attempt_src, "source_unavailable")
                 logger.debug("loader %r resolver failed: %s", attempt_src, exc)
                 continue
+            serving_source = getattr(loader_cls, "name", None) or attempt_src
+            if serving_source in attempted_providers:
+                continue
+            attempted_providers.add(serving_source)
             try:
                 loader = loader_cls()
-                data_map = loader.fetch(src_codes, start_date, end_date, interval=interval)
-                used_source = attempt_src
-                provider_cls = loader_cls
-                if data_map:
-                    break
+                # Weekly and monthly bars are built from daily ones (#1479).
+                loader_symbols = {symbol: normalize_crypto_symbol(symbol) for symbol in remaining}
+                fetched = loader.fetch(
+                    list(dict.fromkeys(loader_symbols.values())), start_date, end_date, interval=source_interval(interval)
+                )
+                partial = {
+                    code: resample_bars(frame, interval) if hasattr(frame, "groupby") else frame
+                    for code, frame in {
+                        **(fetched or {}),
+                        **{original: fetched[normalized] for original, normalized in loader_symbols.items()
+                           if original != normalized and normalized in (fetched or {})},
+                    }.items()
+                    if frame is not None and not getattr(frame, "empty", False)
+                }
+                partial = {code: frame for code, frame in partial.items()
+                           if frame is not None and not getattr(frame, "empty", False)}
+                for original, normalized in loader_symbols.items():
+                    if original != normalized and normalized not in remaining:
+                        partial.pop(normalized, None)
             except Exception as exc:  # noqa: BLE001 — contained per-symbol fallback
+                record(remaining, serving_source, "fetch_failed")
                 logger.error(
                     "market-data loader %r failed for %s; trying next source in chain: %s",
-                    attempt_src, src_codes, exc,
+                    attempt_src, remaining, exc,
                 )
                 continue
+            if not partial:
+                record(remaining, serving_source, "no_data")
+                continue
+            record([symbol for symbol in remaining if symbol not in partial], serving_source, "no_data")
+            # The resolver can substitute an unavailable optional loader before
+            # fetch runs. Attribute every returned symbol to its actual provider.
+            serving_source = getattr(loader_cls, "name", None) or attempt_src
+            if used_source is None:
+                used_source = serving_source
+                provider_cls = loader_cls
+            for symbol, df in partial.items():
+                data_map[symbol] = df
+                symbol_sources[symbol] = (serving_source, loader_cls)
+            remaining = [symbol for symbol in remaining if symbol not in partial]
 
         if used_source and used_source != src:
             logger.info(
                 "market-data source %r unavailable for %s; fell back to %r",
                 src, src_codes, used_source,
             )
-        return data_map, used_source, provider_cls
+        served_elsewhere = sorted(
+            {serve_src for serve_src, _ in symbol_sources.values()} - {used_source}
+        )
+        if served_elsewhere:
+            logger.info(
+                "market-data per-symbol fallback: %s served the remaining symbols %r could not",
+                served_elsewhere, src,
+            )
+        return data_map, used_source, provider_cls, symbol_sources
 
     def _emit(
         symbol: str,
@@ -251,31 +420,49 @@ def fetch_market_data(
         extra_provenance: dict[str, Any] | None = None,
     ) -> None:
         """Normalize one symbol's frame into ``results`` (+ provenance)."""
-        records = df.reset_index().to_dict(orient="records")
+        records = [] if as_frames else df.reset_index().to_dict(orient="records")
         for row in records:
             for key, value in row.items():
                 row[key] = _json_safe(value)
-        results[symbol] = cap_rows(records, max_rows)
+        results[symbol] = df if as_frames else cap_rows(records, max_rows)
         if include_provenance:
             volume_units = getattr(provider_cls, "volume_units", None) or {}
+            frame_attrs = getattr(df, "attrs", None)
+            frame_attrs = frame_attrs if isinstance(frame_attrs, dict) else {}
+            currency_conversion = frame_attrs.get("currency_conversion")
+            if not isinstance(currency_conversion, str) or not currency_conversion:
+                currency_conversion = "none"
             entry: dict[str, Any] = {
                 "source": used_source or src,
                 "requested_source": source,
                 "detected_source": src,
                 "fallback_used": bool(used_source and used_source != src),
-                "currency_conversion": "none",
+                "currency_conversion": currency_conversion,
                 "volume_unit": volume_units.get(market),
+                # A loader that converted its series reports the caliber it
+                # actually served on the frame; the static (source, market)
+                # table is the fallback for unconverted data (#1541).
+                "adjustment": frame_caliber(df, used_source or src, market, symbol),
             }
+            quote_currency = frame_attrs.get("quote_currency")
+            if isinstance(quote_currency, str) and quote_currency:
+                entry["quote_currency"] = quote_currency
             if extra_provenance:
                 entry.update(extra_provenance)
             provenance[symbol] = entry
 
     for (src, market), src_codes in groups.items():
-        data_map, used_source, provider_cls = _fetch_via_chain(src, market, src_codes)
+        data_map, used_source, provider_cls, symbol_sources = _fetch_via_chain(
+            src, market, src_codes
+        )
         for symbol, df in data_map.items():
+            symbol_source, symbol_provider_cls = symbol_sources.get(
+                symbol, (used_source, provider_cls)
+            )
             _emit(
                 symbol, df,
-                src=src, used_source=used_source, provider_cls=provider_cls, market=market,
+                src=src, used_source=symbol_source, provider_cls=symbol_provider_cls,
+                market=market,
             )
 
     unresolved = [
@@ -316,6 +503,7 @@ def fetch_market_data(
                         "fallback_used": True,
                         "currency_conversion": "none",
                         "volume_unit": base.get("volume_unit"),
+                        "adjustment": base.get("adjustment", price_caliber(src, market, code)),
                         "venue_fallback": True,
                         "resolved_symbol": sibling,
                     }
@@ -326,7 +514,7 @@ def fetch_market_data(
                 continue
             # Sibling not already resolved — targeted re-fetch of just that
             # symbol through the same market's source chain.
-            sibling_data, used_source, provider_cls = _fetch_via_chain(
+            sibling_data, used_source, provider_cls, _ = _fetch_via_chain(
                 src, market, [sibling]
             )
             if sibling_data:
@@ -351,10 +539,41 @@ def fetch_market_data(
         results["_unresolved"] = unresolved
     if include_provenance and provenance:
         results["_provenance"] = provenance
+    if unresolved:
+        results["_diagnostics"] = {
+            code: {"attempts": diagnostics.get(code, []), "recovery": (
+                "Use search_symbol to confirm the symbol and venue; check supported history/interval. source_unavailable means "
+                "the source needs configuration or an optional dependency; fetch_failed means "
+                "the request failed; no_data means that source returned no bars for this range. "
+                "For recent intraday bars, narrow the date range or request daily bars."
+            )} for code in unresolved
+        }
 
     return results
 
 
 def fetch_market_data_json(**kwargs: Any) -> str:
-    """Fetch market data and return strict JSON."""
-    return json.dumps(fetch_market_data(**kwargs), ensure_ascii=False, indent=2, allow_nan=False)
+    """Fetch market data and return strict JSON.
+
+    When no requested symbol returned data the envelope says so with
+    ``status: error``: a bare ``{"_unresolved": [...]}`` classified as a
+    successful call, so the agent loop neither refused an identical retry nor
+    told the model to change the request. ``_unresolved`` and ``_provenance``
+    stay, so grounding still records each symbol as unavailable. The dict API
+    (``fetch_market_data``) is unchanged for in-process callers.
+    """
+    payload = fetch_market_data(**kwargs)
+    unresolved = payload.get("_unresolved") or []
+    if unresolved and not any(not str(key).startswith("_") for key in payload):
+        payload = {
+            "status": "error",
+            "error_code": "no_market_data",
+            "error": (
+                f"No data returned for any requested symbol: {', '.join(map(str, unresolved))} "
+                f"({kwargs.get('start_date')}..{kwargs.get('end_date')}, "
+                f"source={kwargs.get('source', 'auto')}). Check the symbol suffix and the date "
+                "range or try another source. Read _diagnostics for attempted sources and recovery steps."
+            ),
+            **payload,
+        }
+    return json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False)

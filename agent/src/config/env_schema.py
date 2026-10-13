@@ -20,9 +20,10 @@ Usage::
 from __future__ import annotations
 
 import os
+import types
 from enum import Enum
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Union, get_args, get_origin
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
@@ -73,6 +74,28 @@ def _parse_responses_api_bool(v: Any) -> Any:
 ResponsesApiBool = Annotated[bool, BeforeValidator(_parse_responses_api_bool)]
 
 
+def _numeric_type(annotation: Any) -> Any:
+    """Return ``int``/``float`` for that type or an ``Optional`` of it, else ``None``.
+
+    Handles both ``typing.Optional[int]`` and the ``int | None`` spelling,
+    which produce different ``get_origin`` results (``typing.Union`` vs.
+    ``types.UnionType``).
+
+    Args:
+        annotation: The field annotation resolved by Pydantic.
+
+    Returns:
+        Its numeric type, or ``None`` for annotations needing normal validation.
+    """
+    if annotation is int or annotation is float:
+        return annotation
+    if get_origin(annotation) in (Union, types.UnionType):
+        args = [a for a in get_args(annotation) if a is not type(None)]
+        if len(args) == 1 and args[0] in (int, float):
+            return args[0]
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Base class
 # ---------------------------------------------------------------------------
@@ -109,13 +132,13 @@ class _EnvBase(BaseModel):
                 env_val = os.environ[alias]
                 # Safe coercion for numeric fields: drop unparseable values
                 # so Pydantic falls back to the field default.
-                annotation = field_info.annotation
-                if annotation is int and isinstance(env_val, str):
+                numeric_type = _numeric_type(field_info.annotation)
+                if numeric_type is int and isinstance(env_val, str):
                     try:
                         env_val = int(env_val)
                     except ValueError:
                         continue
-                elif annotation is float and isinstance(env_val, str):
+                elif numeric_type is float and isinstance(env_val, str):
                     try:
                         env_val = float(env_val)
                     except ValueError:
@@ -133,12 +156,18 @@ class LLMConfig(_EnvBase):
     """LLM provider and generation parameters.
 
     Sources: ``src/providers/llm.py``, ``src/providers/chat.py``,
-    ``src/providers/openai_codex.py``, ``src/preflight.py``.
+    ``src/providers/openai_codex.py``, ``src/providers/claude_cli.py``,
+    ``src/preflight.py``.
     """
 
     langchain_provider: str = Field(alias="LANGCHAIN_PROVIDER", default="openai")
     langchain_model_name: str = Field(alias="LANGCHAIN_MODEL_NAME", default="")
     langchain_temperature: float = Field(alias="LANGCHAIN_TEMPERATURE", default=0.0)
+    # The native Anthropic credential. Read through bare ``os.getenv`` in
+    # ``llm.py``, which left it out of this schema — so ``provider doctor`` and
+    # preflight could not tell a missing key from a working one and the failure
+    # surfaced as an opaque 401 at the first call instead (#1223).
+    anthropic_api_key: str = Field(alias="ANTHROPIC_API_KEY", default="")
     anthropic_max_tokens: int | None = Field(alias="ANTHROPIC_MAX_TOKENS", default=None, gt=0)
     timeout_seconds: int = Field(alias="TIMEOUT_SECONDS", default=120)
     max_retries: int = Field(alias="MAX_RETRIES", default=2)
@@ -152,9 +181,21 @@ class LLMConfig(_EnvBase):
         alias="OPENAI_CODEX_BASE_URL",
         default="https://chatgpt.com/backend-api/codex/responses",
     )
+    claude_cli_path: str = Field(alias="CLAUDE_CLI_PATH", default="")
+    # A convenience filter, not a security boundary: live orders are still bound
+    # by the mandate gate whatever this list hides.
+    claude_cli_deny_tool_prefixes: str = Field(
+        alias="CLAUDE_CLI_DENY_TOOL_PREFIXES", default="trading_,etoro_"
+    )
+    claude_cli_bash_policy: str = Field(
+        alias="CLAUDE_CLI_BASH_POLICY", default="python-only"
+    )
     openai_model: str = Field(alias="OPENAI_MODEL", default="")
     vibe_trading_disable_http_proxy: EnvBool = Field(
         alias="VIBE_TRADING_DISABLE_HTTP_PROXY", default=False,
+    )
+    vibe_trading_anthropic_prompt_cache: EnvBool = Field(
+        alias="VIBE_TRADING_ANTHROPIC_PROMPT_CACHE", default=True,
     )
 
 
@@ -180,6 +221,11 @@ class DataConfig(_EnvBase):
     alphavantage_api_key: str = Field(alias="ALPHAVANTAGE_API_KEY", default="")
     tiingo_api_key: str = Field(alias="TIINGO_API_KEY", default="")
     fmp_api_key: str = Field(alias="FMP_API_KEY", default="")
+    gildata_token: str = Field(alias="GILDATA_TOKEN", default="")
+    gildata_base_url: str = Field(
+        alias="GILDATA_BASE_URL",
+        default="https://api.gildata.com/mcp-servers/aidata-assistant-srv-rawapi",
+    )
     fred_api_key: str = Field(alias="FRED_API_KEY", default="")
     vibe_trading_iwencai_key: str = Field(alias="VIBE_TRADING_IWENCAI_KEY", default="")
     vibe_trading_sec_ua: str = Field(alias="VIBE_TRADING_SEC_UA", default="")
@@ -196,6 +242,16 @@ class DataConfig(_EnvBase):
     vibe_trading_sec_ftd_files: int = Field(alias="VIBE_TRADING_SEC_FTD_FILES", default=1)
     vibe_trading_openalex_mailto: str = Field(alias="VIBE_TRADING_OPENALEX_MAILTO", default="")
     vibe_tw_stock_db: str = Field(alias="VIBE_TW_STOCK_DB", default="")
+    # Brazilian official data (B3 COTAHIST, CVM, BCB, Tesouro Direto), synced
+    # by ``vibe-trading br-data sync`` into one SQLite file. Empty = default
+    # ``~/.vibe-trading/br-data/br_data.db``.
+    vibe_br_data_db: str = Field(alias="VIBE_BR_DATA_DB", default="")
+    # First COTAHIST year a sync downloads (B3 publishes from 1986).
+    vibe_br_cotahist_start_year: int = Field(alias="VIBE_BR_COTAHIST_START_YEAR", default=2015)
+    # First year of CVM fund daily reports / company filings a sync downloads.
+    vibe_br_cvm_start_year: int = Field(alias="VIBE_BR_CVM_START_YEAR", default=2022)
+    # Local time (HH:MM, America/Sao_Paulo) of the daily sync in daemon mode.
+    vibe_br_sync_time: str = Field(alias="VIBE_BR_SYNC_TIME", default="21:30")
     vibe_trading_data_cache: EnvBool = Field(alias="VIBE_TRADING_DATA_CACHE", default=False)
     vibe_trading_data_cache_root: str = Field(alias="VIBE_TRADING_DATA_CACHE_ROOT", default="")
     aliyun_iqs_api_key: str = Field(alias="ALIYUN_IQS_API_KEY", default="")
@@ -211,6 +267,27 @@ class DataConfig(_EnvBase):
     longbridge_access_token: str = Field(alias="LONGBRIDGE_ACCESS_TOKEN", default="")
     etoro_api_key: str = Field(alias="ETORO_API_KEY", default="")
     etoro_user_key: str = Field(alias="ETORO_USER_KEY", default="")
+    # Per-market source-order overrides (Settings page "source priority").
+    # Value: comma-separated permutation of the market's default chain, e.g.
+    # MARKET_DATA_ORDER_A_SHARE=tushare,tencent,eastmoney,... Applied by
+    # backtest.loaders.registry.refresh_source_order_overrides() (which reads
+    # os.getenv directly); declared here for visibility/validation parity.
+    market_data_order_a_share: str = Field(alias="MARKET_DATA_ORDER_A_SHARE", default="")
+    market_data_order_us_equity: str = Field(alias="MARKET_DATA_ORDER_US_EQUITY", default="")
+    market_data_order_hk_equity: str = Field(alias="MARKET_DATA_ORDER_HK_EQUITY", default="")
+    market_data_order_india_equity: str = Field(alias="MARKET_DATA_ORDER_INDIA_EQUITY", default="")
+    market_data_order_kr_equity: str = Field(alias="MARKET_DATA_ORDER_KR_EQUITY", default="")
+    market_data_order_ca_equity: str = Field(alias="MARKET_DATA_ORDER_CA_EQUITY", default="")
+    market_data_order_ar_equity: str = Field(alias="MARKET_DATA_ORDER_AR_EQUITY", default="")
+    market_data_order_br_equity: str = Field(alias="MARKET_DATA_ORDER_BR_EQUITY", default="")
+    market_data_order_uk_equity: str = Field(alias="MARKET_DATA_ORDER_UK_EQUITY", default="")
+    market_data_order_vietnam_equity: str = Field(alias="MARKET_DATA_ORDER_VIETNAM_EQUITY", default="")
+    market_data_order_crypto: str = Field(alias="MARKET_DATA_ORDER_CRYPTO", default="")
+    market_data_order_futures: str = Field(alias="MARKET_DATA_ORDER_FUTURES", default="")
+    market_data_order_fund: str = Field(alias="MARKET_DATA_ORDER_FUND", default="")
+    market_data_order_macro: str = Field(alias="MARKET_DATA_ORDER_MACRO", default="")
+    market_data_order_forex: str = Field(alias="MARKET_DATA_ORDER_FOREX", default="")
+    market_data_order_index: str = Field(alias="MARKET_DATA_ORDER_INDEX", default="")
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +405,30 @@ class SwarmConfig(_EnvBase):
     swarm_timeout: int = Field(alias="SWARM_TIMEOUT", default=1800)
     swarm_heartbeat_interval_s: float = Field(alias="SWARM_HEARTBEAT_INTERVAL_S", default=3.0)
     swarm_stream_retry_delay_s: float = Field(alias="SWARM_STREAM_RETRY_DELAY_S", default=1.0)
+    swarm_stream_retry_max_delay_s: float = Field(
+        alias="SWARM_STREAM_RETRY_MAX_DELAY_S", default=30.0, ge=0
+    )
+    swarm_worker_retry_base_delay_s: float = Field(
+        alias="SWARM_WORKER_RETRY_BASE_DELAY_S", default=1.0, ge=0
+    )
+    swarm_worker_retry_max_delay_s: float = Field(
+        alias="SWARM_WORKER_RETRY_MAX_DELAY_S", default=30.0, ge=0
+    )
     swarm_grounding_max_symbols: int = Field(alias="SWARM_GROUNDING_MAX_SYMBOLS", default=8)
+
+    @model_validator(mode="after")
+    def _validate_retry_delays(self) -> SwarmConfig:
+        if self.swarm_worker_retry_max_delay_s < self.swarm_worker_retry_base_delay_s:
+            raise ValueError(
+                "SWARM_WORKER_RETRY_MAX_DELAY_S must be greater than or equal to "
+                "SWARM_WORKER_RETRY_BASE_DELAY_S"
+            )
+        if self.swarm_stream_retry_max_delay_s < self.swarm_stream_retry_delay_s:
+            raise ValueError(
+                "SWARM_STREAM_RETRY_MAX_DELAY_S must be greater than or equal to "
+                "SWARM_STREAM_RETRY_DELAY_S"
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -345,12 +445,27 @@ class AgentTuningConfig(_EnvBase):
     ``src/tools/web_search_tool.py``, ``api_server.py``.
     """
 
+    # Deprecated: counted chars/4 of messages without tool schemas, so no value
+    # tuned against it means anything under real-token accounting. Read only to
+    # warn (src/agent/context_budget.py); compaction ignores it.
     token_threshold: int = Field(alias="TOKEN_THRESHOLD", default=40000)
+    vibe_trading_context_window: int | None = Field(
+        alias="VIBE_TRADING_CONTEXT_WINDOW", default=None, gt=0,
+    )
+    # Cost ceiling on the prompt the loop lets a run grow to before compacting,
+    # whatever the model's window. The largest healthy research run measured
+    # on 2026-09-29 sent 154K real input tokens.
+    vibe_trading_context_max_tokens: int = Field(
+        alias="VIBE_TRADING_CONTEXT_MAX_TOKENS", default=200_000, gt=0,
+    )
     vt_heartbeat_interval_s: float = Field(alias="VT_HEARTBEAT_INTERVAL_S", default=3.0)
     vt_reasoning_delta_min_interval_s: float = Field(
         alias="VT_REASONING_DELTA_MIN_INTERVAL_S", default=1.0,
     )
     vt_stream_retry_delay_s: float = Field(alias="VT_STREAM_RETRY_DELAY_S", default=1.0)
+    vt_stream_retry_max_delay_s: float = Field(
+        alias="VT_STREAM_RETRY_MAX_DELAY_S", default=30.0, ge=0
+    )
     vibe_trading_tool_timeout_seconds: float = Field(
         alias="VIBE_TRADING_TOOL_TIMEOUT_SECONDS", default=1800.0,
     )
@@ -372,6 +487,9 @@ class AgentTuningConfig(_EnvBase):
     )
     vibe_trading_enable_scheduler: EnvBool = Field(
         alias="VIBE_TRADING_ENABLE_SCHEDULER", default=False,
+    )
+    vibe_contextual_identity_constraints: EnvBool = Field(
+        alias="VIBE_CONTEXTUAL_IDENTITY_CONSTRAINTS", default=True,
     )
     vibe_trading_scheduler_max_consecutive_failures: int = Field(
         alias="VIBE_TRADING_SCHEDULER_MAX_CONSECUTIVE_FAILURES", default=3,
@@ -397,6 +515,15 @@ class AgentTuningConfig(_EnvBase):
     vibe_live_authorize_timeout_s: int = Field(
         alias="VIBE_LIVE_AUTHORIZE_TIMEOUT_SECONDS", default=300,
     )
+
+    @model_validator(mode="after")
+    def _validate_stream_retry_delays(self) -> AgentTuningConfig:
+        if self.vt_stream_retry_max_delay_s < self.vt_stream_retry_delay_s:
+            raise ValueError(
+                "VT_STREAM_RETRY_MAX_DELAY_S must be greater than or equal to "
+                "VT_STREAM_RETRY_DELAY_S"
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------

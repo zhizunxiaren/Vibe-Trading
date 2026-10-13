@@ -83,6 +83,9 @@ def test_extract_model_ids_normalizes_openai_compatible_payloads() -> None:
             },
             "oauth_discovery_unsupported",
         ),
+        # gh_cli used to build "gh_cli_discovery_unsupported", which the response
+        # model rejects; it shares the OAuth code instead.
+        ({"provider": "copilot"}, "oauth_discovery_unsupported"),
     ],
 )
 def test_model_discovery_returns_stable_warning_codes_not_english_prose(
@@ -532,6 +535,31 @@ def test_update_data_source_settings_persists_tushare_token(
     assert "TUSHARE_TOKEN=ts-secret-token" in env_text
 
 
+def test_update_data_source_settings_persists_gildata_token(
+    client: TestClient, tmp_path: Path,
+) -> None:
+    response = client.put(
+        "/settings/data-sources",
+        json={"gildata_token": "gd-secret-token"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["gildata_token_configured"] is True
+    assert body["gildata_token_hint"] is None
+    assert "gd-secret-token" not in response.text
+    assert "gd-s...oken" not in response.text
+
+    env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "GILDATA_TOKEN=gd-secret-token" in env_text
+
+    cleared = client.put(
+        "/settings/data-sources", json={"clear_gildata_token": True},
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["gildata_token_configured"] is False
+
+
 def test_desktop_secure_mode_never_persists_injected_tushare_token(
     client: TestClient,
     tmp_path: Path,
@@ -632,3 +660,256 @@ def test_atomic_write_secret_supports_platforms_without_fchmod(
     helpers._atomic_write_secret(target, "KEY=value\n")
 
     assert target.read_text(encoding="utf-8") == "KEY=value\n"
+
+
+# ---------------------------------------------------------------------------
+# Per-market source-order overrides (MARKET_DATA_ORDER_*)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def _reset_source_order_env():
+    """Scrub order overrides from the process env and restore default chains.
+
+    The PUT handler hot-applies overrides into os.environ and the registry;
+    both must return to defaults so later tests see pristine chains.
+    """
+    from backtest.loaders import registry
+
+    yield
+    for key in [k for k in list(os.environ) if k.startswith("MARKET_DATA_ORDER_")]:
+        os.environ.pop(key, None)
+    registry.refresh_source_order_overrides()
+
+
+def test_get_data_source_settings_lists_default_source_orders(
+    client: TestClient,
+    _reset_source_order_env,
+) -> None:
+    response = client.get("/settings/data-sources")
+
+    assert response.status_code == 200
+    entries = response.json()["source_orders"]
+    orders = {entry["market"]: entry for entry in entries}
+    assert set(orders) == {
+        "a_share", "us_equity", "hk_equity", "india_equity", "kr_equity",
+        "ca_equity", "ar_equity", "br_equity", "vietnam_equity", "uk_equity", "crypto", "futures",
+        "fund", "macro", "forex", "index",
+    }
+    a_share = orders["a_share"]
+    assert a_share["env_var"] == "MARKET_DATA_ORDER_A_SHARE"
+    assert a_share["override"] is None
+    assert a_share["override_invalid"] is False
+    assert a_share["effective_order"] == a_share["default_order"]
+    assert a_share["default_order"][0] == "tencent"
+    uk_equity = orders["uk_equity"]
+    assert uk_equity["env_var"] == "MARKET_DATA_ORDER_UK_EQUITY"
+    assert uk_equity["default_order"][0] == "yahoo"
+
+
+def test_update_source_orders_persists_and_hot_applies(
+    client: TestClient,
+    tmp_path: Path,
+    _reset_source_order_env,
+) -> None:
+    from backtest.loaders import registry
+
+    response = client.put(
+        "/settings/data-sources",
+        json={
+            "source_orders": [
+                {
+                    "market": "a_share",
+                    "order": [
+                        "tushare", "tencent", "eastmoney",
+                        "baostock", "akshare", "gildata", "local",
+                    ],
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    entry = next(
+        e for e in response.json()["source_orders"] if e["market"] == "a_share"
+    )
+    # Response reports the new effective order...
+    assert entry["effective_order"][0] == "tushare"
+    assert entry["override"] is not None
+    assert entry["override"][0] == "tushare"
+    # ...persisted to the dotenv...
+    env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "MARKET_DATA_ORDER_A_SHARE=tushare,tencent,eastmoney" in env_text
+    # ...synced into the running process env...
+    assert os.environ.get("MARKET_DATA_ORDER_A_SHARE", "").startswith("tushare,")
+    # ...and hot-applied to the live registry chain.
+    assert registry.FALLBACK_CHAINS["a_share"][0] == "tushare"
+
+
+def test_update_source_orders_reset_clears_override(
+    client: TestClient,
+    tmp_path: Path,
+    _reset_source_order_env,
+) -> None:
+    from backtest.loaders import registry
+
+    put = client.put(
+        "/settings/data-sources",
+        json={
+            "source_orders": [
+                {
+                    "market": "a_share",
+                    "order": [
+                        "tushare", "tencent", "eastmoney",
+                        "baostock", "akshare", "gildata", "local",
+                    ],
+                },
+            ],
+        },
+    )
+    assert put.status_code == 200
+
+    reset = client.put(
+        "/settings/data-sources",
+        json={"source_orders": [{"market": "a_share", "order": None}]},
+    )
+
+    assert reset.status_code == 200
+    entry = next(
+        e for e in reset.json()["source_orders"] if e["market"] == "a_share"
+    )
+    assert entry["override"] is None
+    assert entry["effective_order"] == entry["default_order"]
+    env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "MARKET_DATA_ORDER_A_SHARE=\n" in env_text  # cleared, not deleted
+    assert registry.FALLBACK_CHAINS["a_share"] == entry["default_order"]
+
+
+def test_update_source_orders_rejects_non_permutation(
+    client: TestClient,
+    tmp_path: Path,
+    _reset_source_order_env,
+) -> None:
+    response = client.put(
+        "/settings/data-sources",
+        json={"source_orders": [{"market": "crypto", "order": ["okx", "binance"]}]},
+    )
+
+    assert response.status_code == 400
+    assert "permutation" in response.json()["detail"]
+    # Rejected before anything was persisted.
+    assert not (tmp_path / ".env").exists()
+
+
+def test_update_source_orders_rejects_unknown_market(
+    client: TestClient,
+    tmp_path: Path,
+    _reset_source_order_env,
+) -> None:
+    response = client.put(
+        "/settings/data-sources",
+        json={"source_orders": [{"market": "mars_equity", "order": ["okx"]}]},
+    )
+
+    assert response.status_code == 400
+    assert "Unknown market" in response.json()["detail"]
+    assert not (tmp_path / ".env").exists()
+
+
+def test_claude_cli_model_list_skips_base_url_checks_and_reports_effort_levels(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.providers import claude_cli_models
+
+    observed: dict[str, bool] = {}
+
+    def fake_list(*, refresh: bool = False):
+        observed["refresh"] = refresh
+        return [
+            claude_cli_models.ClaudeCliModel("claude-sonnet-4-6", ("low", "medium", "high", "max")),
+            claude_cli_models.ClaudeCliModel("claude-haiku-4-5-20251001", ()),
+        ]
+
+    monkeypatch.setattr(claude_cli_models, "list_claude_cli_models", fake_list)
+    response = client.post(
+        "/settings/llm/models", json={"provider": "claude-cli", "refresh": True}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["models"] == [
+        "claude-opus-5-5",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5-20251001",
+    ]
+    assert body["source"] == "provider"
+    assert body["effort_levels"] == {
+        "claude-sonnet-4-6": ["low", "medium", "high", "max"],
+        "claude-haiku-4-5-20251001": [],
+    }
+    assert observed == {"refresh": True}
+
+
+def test_claude_cli_model_list_falls_back_when_cli_is_unavailable(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.providers import claude_cli_models
+
+    def failing_list(*, refresh: bool = False):
+        raise RuntimeError("claude model list unavailable")
+
+    monkeypatch.setattr(claude_cli_models, "list_claude_cli_models", failing_list)
+    response = client.post("/settings/llm/models", json={"provider": "claude-cli"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["models"] == ["claude-opus-5-5"]
+    assert body["warning_code"] == "model_list_unavailable"
+    assert body["effort_levels"] is None
+
+
+def _llm_update(provider: str, model: str, effort: str) -> dict:
+    return {
+        "provider": provider,
+        "model_name": model,
+        "base_url": "",
+        "temperature": 0.0,
+        "timeout_seconds": 120,
+        "max_retries": 2,
+        "reasoning_effort": effort,
+    }
+
+
+@pytest.mark.parametrize(
+    ("effort", "status_code"), [("xhigh", 200), ("", 200), ("none", 400)]
+)
+def test_claude_cli_effort_is_validated_against_cli_levels(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    effort: str,
+    status_code: int,
+) -> None:
+    from src.providers import claude_cli
+
+    monkeypatch.setattr(claude_cli, "get_claude_cli_auth_status", lambda: (True, "claude.ai"))
+    response = client.put(
+        "/settings/llm", json=_llm_update("claude-cli", "claude-opus-5-5", effort)
+    )
+
+    assert response.status_code == status_code
+    if status_code == 200:
+        # "" leaves the level unset, so the model's own default applies.
+        assert response.json()["reasoning_effort"] == effort
+        if effort:
+            env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+            assert f"LANGCHAIN_REASONING_EFFORT={effort}" in env_text
+
+
+def test_other_providers_still_reject_xhigh(client: TestClient) -> None:
+    payload = _llm_update("openrouter", "deepseek/deepseek-v4-pro", "xhigh")
+    payload["base_url"] = "https://openrouter.ai/api/v1"
+
+    response = client.put("/settings/llm", json=payload)
+
+    assert response.status_code == 400

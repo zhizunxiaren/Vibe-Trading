@@ -60,7 +60,9 @@ class OKXConfig:
         host: REST host (default ``https://www.okx.com``).
         expected_uid: Optional account UID to pin in ``check_status``.
         timeout: Network timeout in seconds.
-        readonly: Always true for this layer; order methods are not exposed.
+        readonly: Not consulted by the order methods. Whether a profile may place or
+            cancel orders is gated first by its ``TradingProfile.readonly`` in the
+            trading service.
     """
 
     api_key: str = ""
@@ -250,6 +252,13 @@ def get_account_snapshot(config: OKXConfig | None = None) -> dict[str, Any]:
     cfg = config or load_config()
     account = _account_client(cfg)
     resp = _safe_call(account, "get_account_balance")
+    error = _business_error(resp)
+    if error is not None:
+        return {
+            "status": "error",
+            "error": f"okx get_account_balance failed: {error}",
+            "account": {},
+        }
     rows = _extract_data(resp)
     summary = rows[0] if rows else {}
     return {
@@ -269,6 +278,13 @@ def get_positions(config: OKXConfig | None = None) -> dict[str, Any]:
     cfg = config or load_config()
     account = _account_client(cfg)
     resp = _safe_call(account, "get_positions")
+    error = _business_error(resp)
+    if error is not None:
+        return {
+            "status": "error",
+            "error": f"okx get_positions failed: {error}",
+            "positions": [],
+        }
     rows = [_position_to_dict(item) for item in _extract_data(resp)]
     return {
         "status": "ok",
@@ -653,6 +669,18 @@ def _first(obj: Any, names: tuple[str, ...], default: Any = None) -> Any:
         if value is not None:
             return value
     return default
+
+
+def _business_error(resp: Any) -> str | None:
+    """Return the OKX business error string, or None when the call succeeded.
+
+    The mandate gate fails closed only on an explicit error, so a non-zero
+    business code must never be flattened into an empty data list on the
+    position/balance reads (#1207 Phase 0).
+    """
+    if isinstance(resp, Mapping) and str(resp.get("code")) != "0":
+        return f"code={resp.get('code')} msg={resp.get('msg')}"
+    return None
 
 
 def _extract_data(resp: Any) -> list[Any]:

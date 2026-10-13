@@ -8,8 +8,10 @@ with cancellation and event callback support.
 from __future__ import annotations
 
 import logging
+import random
 import shutil
 import threading
+import time
 from concurrent.futures import (
     Future,
     ThreadPoolExecutor,
@@ -32,6 +34,7 @@ from src.swarm.models import (
     SwarmTask,
     TaskStatus,
     WorkerResult,
+    WorkerStatus,
     public_model_metadata,
     public_provider_metadata,
     public_reasoning_effort,
@@ -51,6 +54,47 @@ from src.swarm.worker import agent_artifact_dir, clear_agent_artifacts, run_work
 logger = logging.getLogger(__name__)
 
 
+def _worker_retry_delay_ceiling_s(retry_number: int) -> float:
+    """Return the capped exponential ceiling for a one-based retry number."""
+    if retry_number < 1:
+        raise ValueError("retry_number must be at least 1")
+
+    config = get_env_config().swarm
+    base_delay = config.swarm_worker_retry_base_delay_s
+    max_delay = config.swarm_worker_retry_max_delay_s
+    exponent = min(retry_number - 1, 62)
+    return min(base_delay * (2**exponent), max_delay)
+
+
+def _worker_retry_delay_s(retry_number: int) -> float:
+    """Return an equal-jitter exponential delay for a worker-level retry.
+
+    Equal jitter keeps half of the exponential delay while spreading
+    concurrent swarm workers across the remaining half of the window.
+    """
+    delay_ceiling = _worker_retry_delay_ceiling_s(retry_number)
+    return random.uniform(delay_ceiling / 2, delay_ceiling)
+
+
+def _worker_retry_budget_s(max_retries: int) -> float:
+    """Return the maximum cumulative backoff included in a task deadline."""
+    return sum(
+        _worker_retry_delay_ceiling_s(retry_number)
+        for retry_number in range(1, max_retries + 1)
+    )
+
+
+def _wait_for_worker_retry(
+    delay_s: float,
+    cancel_event: threading.Event | None,
+) -> bool:
+    """Wait before a retry and return whether cancellation interrupted it."""
+    if cancel_event is not None:
+        return cancel_event.wait(delay_s)
+    time.sleep(delay_s)
+    return False
+
+
 def _rehome_artifact_paths(
     artifact_paths: list[str],
     source_run_dir: Path,
@@ -59,7 +103,7 @@ def _rehome_artifact_paths(
     """Copy a kept task's run-relative artifacts into *target_run_dir*.
 
     Workers persist artifacts as POSIX paths relative to the run directory
-    (``artifacts/<agent>/<file>``; see ``worker._collect_artifacts``). A
+    (``artifacts/<agent>/<task>/<file>``; see ``worker._collect_artifacts``). A
     resumed run must not reference the old run's directory — the old run
     stays as a record and may be deleted later.
 
@@ -953,7 +997,10 @@ class SwarmRuntime:
                     cancel_event=cancel_event,
                 )
                 futures[future] = tid
-                per_task_budget = agent_spec.timeout_seconds * (agent_spec.max_retries + 1)
+                per_task_budget = (
+                    agent_spec.timeout_seconds * (agent_spec.max_retries + 1)
+                    + _worker_retry_budget_s(agent_spec.max_retries)
+                )
                 layer_budget = max(layer_budget, per_task_budget)
 
             # Collect results with a hard layer-level deadline — defends against
@@ -1042,8 +1089,13 @@ class SwarmRuntime:
         cumulative_output_tokens = 0
         result: WorkerResult | None = None
 
+        # agent_artifact_dir is keyed by (agent_id, task_id), so this task's
+        # first attempt always starts from a directory no other task has
+        # ever written to. Nothing to clear before it; only a retry of this
+        # same task needs clearing, below.
         for attempt in range(max_retries + 1):
             if attempt > 0:
+                retry_delay_s = _worker_retry_delay_s(attempt)
                 self._emit_event(
                     run_id,
                     self._make_event(
@@ -1054,22 +1106,36 @@ class SwarmRuntime:
                             "attempt": attempt + 1,
                             "max_retries": max_retries,
                             "previous_error": result.error if result else None,
+                            "retry_delay_s": retry_delay_s,
                         },
                     ),
                 )
                 logger.info(
-                    "Retrying task %s (attempt %d/%d)",
+                    "Retrying task %s in %.2fs (attempt %d/%d)",
                     task.id,
+                    retry_delay_s,
                     attempt + 1,
                     max_retries + 1,
                 )
+                if _wait_for_worker_retry(retry_delay_s, cancel_event):
+                    return result.model_copy(
+                        update={
+                            "status": WorkerStatus.cancelled,
+                            "summary": f"Cancelled before retrying task {task.id}",
+                            "error": None,
+                            "input_tokens": cumulative_input_tokens,
+                            "output_tokens": cumulative_output_tokens,
+                        }
+                    )
                 # A retry re-invokes run_worker against the same artifact
                 # directory. Without clearing it first, a failed attempt's
                 # report.md (or any other tool-written file) would still be
                 # there when the retried attempt reads the directory back,
                 # silently substituting stale content for the new attempt's
                 # real result.
-                clear_agent_artifacts(agent_artifact_dir(run_dir, agent_spec.id))
+                clear_agent_artifacts(
+                    agent_artifact_dir(run_dir, agent_spec.id, task.id)
+                )
 
             result = run_worker(
                 agent_spec=agent_spec,

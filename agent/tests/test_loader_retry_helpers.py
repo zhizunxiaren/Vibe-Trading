@@ -320,6 +320,10 @@ def test_loader_cache_happy_path_writes_then_reuses(
     monkeypatch.setenv(LOADER_CACHE_ENV, "1")
     calls = {"count": 0}
     frame = _cache_frame()
+    frame.attrs.update(
+        quote_currency="GBP",
+        currency_conversion="GBp→GBP (÷100)",
+    )
 
     def fetch():
         calls["count"] += 1
@@ -339,6 +343,7 @@ def test_loader_cache_happy_path_writes_then_reuses(
     assert calls["count"] == 1
     pd.testing.assert_frame_equal(first, frame)
     pd.testing.assert_frame_equal(second, frame)
+    assert second.attrs == frame.attrs
     assert loader_cache_path(**kwargs).is_file()
     assert str(loader_cache_path(**kwargs)).startswith(str(loader_cache_root))
 
@@ -469,6 +474,10 @@ def test_loader_cache_real_duckdb_round_trip(tmp_path, monkeypatch, loader_cache
     pytest.importorskip("duckdb")
     monkeypatch.setenv(LOADER_CACHE_ENV, "1")
     frame = _cache_frame()
+    frame.attrs.update(
+        quote_currency="GBP",
+        currency_conversion="GBp→GBP (÷100)",
+    )
     kwargs = {
         "source": "yfinance",
         "symbol": "AAPL.US",
@@ -488,6 +497,36 @@ def test_loader_cache_real_duckdb_round_trip(tmp_path, monkeypatch, loader_cache
     # The cache preserves columns name and per-level index dtype, so a real
     # duckdb round-trip is byte-identical to the source frame.
     pd.testing.assert_frame_equal(restored, frame)
+    assert restored.attrs == frame.attrs
+
+
+def test_loader_cache_round_trip_keeps_adjustment_override(tmp_path, monkeypatch, loader_cache_root):
+    """A frame-level ``adjustment`` override must survive the cache.
+
+    FMP/Tiingo stamp ``adjustment="raw"`` when a response carries no usable
+    adjusted column; if the cache dropped that attr, a warm hit would come
+    back unmarked and the provenance table would stamp the static
+    ``split_dividend`` caliber onto prices that are actually raw.
+    """
+    pytest.importorskip("duckdb")
+    monkeypatch.setenv(LOADER_CACHE_ENV, "1")
+    frame = _cache_frame()
+    frame.attrs.update(adjustment="raw")
+    kwargs = {
+        "source": "fmp",
+        "symbol": "AAPL.US",
+        "timeframe": "1D",
+        "start_date": "2025-01-01",
+        "end_date": "2025-01-03",
+        "fields": None,
+    }
+
+    loader_cache_put(**kwargs, frame=frame)
+    restored = loader_cache_get(**kwargs)
+
+    assert restored is not None
+    assert restored.attrs == frame.attrs
+    assert restored.attrs["adjustment"] == "raw"
 
 
 def test_yfinance_loader_serves_second_fetch_from_cache(tmp_path, monkeypatch, fake_duckdb, loader_cache_root):

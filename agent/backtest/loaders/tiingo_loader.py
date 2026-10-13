@@ -6,17 +6,22 @@ Tiingo serves end-of-day US-equity bars from a documented public endpoint:
       ?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&token={KEY}
 
 The response is a JSON array of per-day objects, each carrying ``date`` plus
-``open``/``high``/``low``/``close``/``volume`` (and adjusted variants we ignore).
-A token is required; it is read from the ``TIINGO_API_KEY`` environment variable
-and is never hard-coded. Like every other ban-prone HTTP loader in this package,
-all requests route through :mod:`backtest.loaders._http` for per-host throttling
-and session reuse — Tiingo rate-limits by client and rejects unspaced bursts.
+``open``/``high``/``low``/``close``/``volume`` and split/dividend-adjusted
+variants ``adjOpen``/``adjHigh``/``adjLow``/``adjClose``/``adjVolume``. This
+loader prefers the adjusted OHLC (qfq caliber, matching yahoo/yfinance/
+eastmoney/tencent) so backtests see total-return prices. Volume stays raw per
+qfq convention. A token is required; it is read from the ``TIINGO_API_KEY``
+environment variable and is never hard-coded. Like every other ban-prone HTTP
+loader in this package, all requests route through :mod:`backtest.loaders._http`
+for per-host throttling and session reuse — Tiingo rate-limits by client and
+rejects unspaced bursts.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
+import math
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
@@ -79,45 +84,148 @@ def _to_tiingo_symbol(code: str) -> Optional[str]:
     return upper.lower()
 
 
+def _positive_prices(*values: Any) -> Optional[tuple[float, ...]]:
+    """Finite, strictly positive floats for every value, or ``None``.
+
+    A missing, non-numeric, non-finite or non-positive price makes the whole
+    set unusable: zero and infinity are not prices, and a bar built from one is
+    a fabricated return rather than a missing one.
+    """
+    try:
+        numbers = tuple(float(value) for value in values)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(number) and number > 0 for number in numbers):
+        return None
+    return numbers
+
+
+def _adjusted_basis(
+    row: dict,
+) -> Optional[tuple[float, float, float, float]]:
+    """The adjusted ``(open, high, low, close)`` one bar yields, or ``None``.
+
+    Tiingo's fully adjusted OHLC is preferred; when only ``adjClose`` is
+    present the raw OHLC is scaled by the ``adjClose/close`` factor so the four
+    stay consistent. ``None`` means the bar cannot be part of an adjusted
+    series — a price in the set being used that is missing, non-numeric,
+    non-finite or non-positive, or a factor outside the sane 0.01-100x window —
+    so it may neither supply the series' basis nor, once another bar supplies
+    it, be replaced with raw prices.
+    """
+    if all(
+        row.get(key) is not None for key in ("adjOpen", "adjHigh", "adjLow", "adjClose")
+    ):
+        prices = _positive_prices(
+            row["adjOpen"], row["adjHigh"], row["adjLow"], row["adjClose"]
+        )
+        if prices is None:
+            return None
+        o, h, lo, c = prices
+        return o, h, lo, c
+    prices = _positive_prices(
+        row.get("open"),
+        row.get("high"),
+        row.get("low"),
+        row.get("close"),
+        row.get("adjClose"),
+    )
+    if prices is None:
+        return None
+    o, h, lo, c, adj_close = prices
+    ratio = adj_close / c
+    if not 0.01 <= ratio <= 100:
+        return None
+    return o * ratio, h * ratio, lo * ratio, adj_close
+
+
 def _rows_to_frame(rows: List[dict]) -> Optional[pd.DataFrame]:
     """Convert Tiingo's per-day records into the normalized OHLCV frame.
 
+    Prefers Tiingo's adjusted OHLC (``adjOpen``/``adjHigh``/``adjLow``/
+    ``adjClose``) when present so the frame is dividend- and split-adjusted
+    (qfq). Falls back to an ``adjClose/close`` ratio when only ``adjClose`` is
+    present, and to raw ``open``/``high``/``low``/``close`` when no bar carries
+    a usable adjustment at all. A bar whose adjustment is missing or unusable
+    is dropped whenever other bars are adjusted, so one series never mixes two
+    price bases.
+
     Args:
         rows: JSON array decoded from the prices endpoint; each item carries a
-            ``date`` plus ``open``/``high``/``low``/``close``/``volume``.
+            ``date`` plus ``open``/``high``/``low``/``close``/``volume`` and
+            optionally ``adj*`` variants.
 
     Returns:
         A DataFrame indexed by a ``trade_date`` :class:`~pandas.DatetimeIndex`
-        with float ``open``/``high``/``low``/``close``/``volume`` columns, or
-        ``None`` when no usable bar is present.
+        with float ``open``/``high``/``low``/``close``/``volume`` columns
+        (adjusted when available), or ``None`` when no usable bar is present.
     """
+    dated = [
+        row for row in rows if isinstance(row, dict) and isinstance(row.get("date"), str)
+        and pd.notna(pd.to_datetime(row["date"], utc=True, errors="coerce"))
+    ]
+    if len(dated) != len(rows):
+        logger.warning("Tiingo: dropped %d bars with missing/invalid dates", len(rows) - len(dated))
+    has_adjusted_data = any(_adjusted_basis(row) is not None for row in dated)
     parsed: List[dict] = []
-    for row in rows:
+    dropped = 0
+    for row in dated:
         date = row.get("date")
-        if date is None:
+        basis = _adjusted_basis(row)
+        if basis is not None:
+            o, h, lo, c = basis
+        elif has_adjusted_data:
+            # Do not fill a missing/invalid adjusted bar with raw prices: that
+            # would mix bases within this series.
+            dropped += 1
             continue
+        else:
+            # No bar carries a usable adjustment (older/unadjusted endpoint
+            # responses, or a response that is unusable throughout): the whole
+            # series consistently remains raw rather than being discarded.
+            o, h, lo, c = (
+                row.get("open"),
+                row.get("high"),
+                row.get("low"),
+                row.get("close"),
+            )
         parsed.append(
             {
                 "trade_date": date,
-                "open": row.get("open"),
-                "high": row.get("high"),
-                "low": row.get("low"),
-                "close": row.get("close"),
+                "open": o,
+                "high": h,
+                "low": lo,
+                "close": c,
                 "volume": row.get("volume"),
             }
         )
+    if dropped:
+        # Say so rather than truncate in silence: older bars of a long-history
+        # symbol can fall outside the 0.01-100x factor window, and the backtest
+        # then runs a shorter window than it asked for.
+        logger.warning(
+            "Tiingo: dropped %d of %d bars that carry no usable adjustment "
+            "while the rest do; the series keeps one price basis instead of "
+            "mixing raw and adjusted prices",
+            dropped,
+            len(dated),
+        )
+
     if not parsed:
         return None
 
     frame = pd.DataFrame(parsed)
     # Tiingo stamps each bar with an ISO-8601 datetime (e.g.
     # "2024-01-02T00:00:00.000Z"); normalize to a tz-naive midnight index.
-    index = pd.DatetimeIndex(pd.to_datetime(frame["trade_date"], utc=True, errors="coerce"))
+    index = pd.DatetimeIndex(
+        pd.to_datetime(frame["trade_date"], utc=True, errors="coerce")
+    )
     if getattr(index, "tz", None) is not None:
         index = index.tz_convert(None)
     frame = frame.drop(columns=["trade_date"])
     frame.index = index.normalize()
     frame.index.name = "trade_date"
+    frame = frame.loc[frame.index.notna()]
 
     frame = frame.apply(pd.to_numeric, errors="coerce")
     # Coerce every OHLCV column to float64 so the schema is uniform: integer
@@ -127,6 +235,9 @@ def _rows_to_frame(rows: List[dict]) -> Optional[pd.DataFrame]:
     frame["volume"] = frame["volume"].fillna(0.0)
     frame = frame.loc[:, _OHLCV_COLUMNS].sort_index()
     frame = frame.dropna(subset=["open", "high", "low", "close"])
+    prices = frame[["open", "high", "low", "close"]]
+    frame = frame.loc[((prices > 0) & (prices < float("inf"))).all(axis=1)]
+    frame.attrs["adjustment"] = "split_dividend" if has_adjusted_data else "raw"
     return frame if not frame.empty else None
 
 
@@ -200,16 +311,24 @@ class DataLoader:
                     start_date=start_date,
                     end_date=end_date,
                     fields=None,
-                    fetch=lambda code=code: self._fetch_one(code, start_date, end_date, key),
+                    fetch=lambda code=code: self._fetch_one(
+                        code, start_date, end_date, key
+                    ),
                 )
                 if frame is not None and not frame.empty:
                     result[code] = frame
-            except Exception as exc:  # noqa: BLE001 - one symbol must not kill the batch
+            except (
+                Exception
+            ) as exc:  # noqa: BLE001 - one symbol must not kill the batch
                 logger.warning("tiingo failed for %s: %s", code, exc)
         return result
 
     def _fetch_one(
-        self, code: str, start_date: str, end_date: str, key: str,
+        self,
+        code: str,
+        start_date: str,
+        end_date: str,
+        key: str,
     ) -> Optional[pd.DataFrame]:
         """Fetch and normalize a single symbol's daily bars.
 

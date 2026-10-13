@@ -7,14 +7,66 @@ import type {
 } from "@/lib/options";
 
 const BASE = "";
+const configuredTimeout = Number(import.meta.env.VITE_API_TIMEOUT_MS);
+const REQUEST_TIMEOUT_MS = Number.isFinite(configuredTimeout) && configuredTimeout > 0
+  ? configuredTimeout : 120_000;
+const METADATA_TIMEOUT_MS = Math.min(REQUEST_TIMEOUT_MS, 15_000);
+
+/** Bound both the connection and body read; never automatically replay writes. */
+async function performRequest<T>(
+  path: string,
+  options: RequestInit,
+  read: (response: Response) => Promise<T>,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+): Promise<T> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const abort = () => controller.abort(options.signal?.reason);
+  if (options.signal?.aborted) abort();
+  else options.signal?.addEventListener("abort", abort, { once: true });
+  try {
+    const response = await fetch(`${BASE}${path}`, { ...options, signal: controller.signal });
+    if (!response.ok) throw await errorFromResponse(response);
+    return await read(response);
+  } catch (error) {
+    if (timedOut) {
+      const mutation = options.method && !["GET", "HEAD"].includes(options.method.toUpperCase());
+      throw new ApiError(i18n.t(mutation ? "connection.requestTimeoutMutation" : "connection.requestTimeout"), 0, "request_timeout");
+    }
+    if (options.signal?.aborted || error instanceof ApiError) throw error;
+    if (error instanceof TypeError) {
+      throw new ApiError(i18n.t("connection.requestFailed"), 0, "network_error");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    options.signal?.removeEventListener("abort", abort);
+  }
+}
+
+export async function downloadGeneratedReport(reportId: string, filename: string): Promise<void> {
+  const blob = await performRequest(`/api/reports/${encodeURIComponent(reportId)}`, { headers: authHeaders() }, (response) => response.blob());
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 export class ApiError extends Error {
   status: number;
+  code?: string;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, code?: string) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -38,6 +90,14 @@ export function isAuthRequiredError(error: unknown): boolean {
 export interface CorrelationResponse {
   labels: string[];
   matrix: number[][];
+}
+
+export interface CorrelationAnalysisResponse {
+  correlation: CorrelationResponse | null;
+  regime: CorrelationRegimeResponse | null;
+  errors: { correlation?: string; regime?: string };
+  coverage: { requested: string[]; missing: string[]; observations: number; first_date: string | null; last_date: string | null;
+    diagnostics: Record<string, { symbol: string; market: string; source: string | null; attempts: Array<{ source: string; reason: "source_unavailable" | "fetch_failed" | "no_data" }> }> };
 }
 
 export interface RegimeEpisode {
@@ -84,6 +144,13 @@ export interface PortfolioPosition {
   price_error?: string;
 }
 
+export interface PortfolioConnectorCompatibility {
+  level: "native" | "contract_tested" | "experimental";
+  contract_version: number;
+  asset_scope: string;
+  note: string;
+}
+
 /**
  * One portfolio source as of the last refresh.
  *
@@ -101,6 +168,7 @@ export interface PortfolioAccount {
   last_success_at?: string;
   total_usd?: number | null;
   total_cny?: number | null;
+  total_display?: number | null;
   priced_value_usd?: number;
   cash_usd?: number;
   unpriced_or_other_usd?: number;
@@ -109,12 +177,15 @@ export interface PortfolioAccount {
   unpriced_position_count?: number;
   error_code?: string;
   error?: string;
+  failure_kind?: "authorization" | "transient";
+  reconnect_required?: boolean;
   auth?: {
     method: string;
     renewal: "automatic" | "session" | "provider_managed";
     readonly: boolean;
     detail: string;
   };
+  portfolio_compatibility?: PortfolioConnectorCompatibility;
 }
 
 export interface PortfolioSnapshot {
@@ -122,15 +193,15 @@ export interface PortfolioSnapshot {
   created_at: string;
   /** False whenever any enabled source did not reach `status === "ok"`. */
   complete: boolean;
-  display_currency?: "USD" | "CNY";
-  totals: { usd: number; cny: number };
+  display_currency?: string;
+  totals: { usd: number; cny: number; display?: number };
   valuation?: {
     priced_usd: number;
     cash_usd: number;
     unpriced_or_other_usd: number;
     identified_coverage: number;
   };
-  fx: { usd_cny: number; usd_hkd: number; fetched_at: string; stale: boolean };
+  fx: { usd_cny: number; usd_hkd: number; rates?: Record<string, number>; fetched_at: string; stale: boolean };
   accounts: PortfolioAccount[];
   positions: PortfolioPosition[];
   combined_holdings?: Array<{
@@ -159,6 +230,15 @@ export interface PortfolioRefreshState {
   brokers?: Record<string, { status: "idle" | "pending" | "refreshing" | "ok" | "error"; error?: string | null }>;
 }
 
+export interface PortfolioReconnectState {
+  running: boolean;
+  source_id: string | null;
+  status: "idle" | "authorizing" | "authorized" | "error" | "timeout";
+  error: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
 export interface PortfolioSourceSettings {
   connection_id: string;
   label: string;
@@ -168,7 +248,7 @@ export interface PortfolioSourceSettings {
 }
 
 export interface PortfolioSettings {
-  display_currency: "USD" | "CNY";
+  display_currency: string;
   sources: PortfolioSourceSettings[];
 }
 
@@ -189,6 +269,7 @@ export interface PortfolioSourceCatalogItem {
   credential_fields: CredentialField[];
   credential_status: Record<string, boolean>;
   credentials_configured: boolean;
+  portfolio_compatibility: PortfolioConnectorCompatibility;
 }
 
 export interface CredentialField {
@@ -198,10 +279,25 @@ export interface CredentialField {
   required: boolean;
 }
 
+export interface ConnectorOnboarding {
+  schema_version: number;
+  auth_type: string;
+  credential_fields: CredentialField[];
+  dependency: string | null;
+  install_command: string | null;
+  test_operation: string;
+  setup_hint: string;
+  secret_storage: "os_keyring" | null;
+}
+
 export interface LocalConnection {
   id: string;
   profile_id: string;
   label: string;
+  /** Broker account the reads are scoped to; empty until the user selects one. */
+  account_ref: string;
+  /** True when this connection reads nothing until an account is selected. */
+  account_selection_required: boolean;
   connector: string;
   environment: "paper" | "live";
   transport: "local_tws" | "remote_mcp" | "broker_sdk" | "local_plugin";
@@ -211,6 +307,8 @@ export interface LocalConnection {
   credential_fields: CredentialField[];
   credential_status: Record<string, boolean>;
   credentials_configured: boolean;
+  onboarding?: ConnectorOnboarding;
+  portfolio_compatibility: PortfolioConnectorCompatibility;
 }
 
 export interface ReadonlyConnectionProfile {
@@ -224,10 +322,22 @@ export interface ReadonlyConnectionProfile {
   notes: string;
   local_plugin: boolean;
   credential_fields: CredentialField[];
+  onboarding?: ConnectorOnboarding;
   supports_reconnect: boolean;
+  account_selection_required: boolean;
+  portfolio_compatibility: PortfolioConnectorCompatibility;
   invalid_plugin?: boolean;
   directory?: string;
   error?: string;
+}
+
+/** One account a broker login can reach, as the backend maps it for a picker. */
+export interface BrokerAccountChoice {
+  account_ref: string;
+  label: string;
+  is_default: boolean;
+  agentic_allowed: boolean;
+  deactivated: boolean;
 }
 
 export interface ConnectionsResponse {
@@ -245,19 +355,33 @@ export interface PortfolioSettingsResponse {
 
 async function errorFromResponse(res: Response): Promise<ApiError> {
   let detail = `HTTP ${res.status}`;
+  let code: string | undefined;
   try {
     const body = await res.json();
     // Options endpoints report errors under an `error` key
     // ({status:"error", error} / {ok:false, error}) rather than detail/message.
-    detail = body.detail || body.message || body.error || detail;
-  } catch { /* ignore */ }
+    const raw = body.detail ?? body.message ?? body.error;
+    if (typeof raw === "string" && raw) {
+      detail = raw;
+    } else if (raw && typeof raw === "object") {
+      const structured = raw as { code?: unknown; message?: unknown; max_length?: unknown };
+      if (typeof structured.code === "string" && structured.code) code = structured.code;
+      if (typeof structured.message === "string" && structured.message) detail = structured.message;
+      else if (code) detail = code;
+      if (code === "message_too_long" && typeof structured.max_length === "number") {
+        detail = i18n.t("agent.messageTooLong", { limit: structured.max_length.toLocaleString() });
+      }
+    }
+  } catch {
+    if (res.status >= 500) detail = i18n.t("connection.requestFailed");
+  }
   if (res.status === 401 || res.status === 403) {
     detail = getAuthRequiredMessage();
   }
-  return new ApiError(detail, res.status);
+  return new ApiError(detail, res.status, code);
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+async function request<T>(path: string, options?: RequestInit, timeoutMs?: number): Promise<T> {
   const { headers, ...rest } = options ?? {};
   const mergedHeaders: Record<string, string> = { "Content-Type": "application/json", ...authHeaders() };
   if (headers) {
@@ -265,26 +389,24 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
       mergedHeaders[key] = value;
     });
   }
-  const res = await fetch(`${BASE}${path}`, {
+  return performRequest(path, {
     ...rest,
     headers: mergedHeaders,
-  });
-  if (!res.ok) {
-    throw await errorFromResponse(res);
-  }
-  const text = await res.text();
-  if (!text) return {} as T;
+  }, async (res) => {
+    const text = await res.text();
+    if (!text) return {} as T;
 
-  const contentType = res.headers.get("content-type") || "";
-  if (!contentType.includes("application/json")) {
-    const preview = text.slice(0, 80).replace(/\s+/g, " ");
-    throw new ApiError(
-      `Expected JSON from ${path}, got ${contentType || "unknown content type"}: ${preview}`,
-      res.status,
-    );
-  }
+    const contentType = res.headers.get("content-type") || "";
+    if (!contentType.includes("application/json")) {
+      const preview = text.slice(0, 80).replace(/\s+/g, " ");
+      throw new ApiError(
+        `Expected JSON from ${path}, got ${contentType || "unknown content type"}: ${preview}`,
+        res.status,
+      );
+    }
 
-  return JSON.parse(text) as T;
+    return JSON.parse(text) as T;
+  }, timeoutMs);
 }
 
 export interface UploadResult {
@@ -296,11 +418,7 @@ export interface UploadResult {
 async function uploadFile(file: File): Promise<UploadResult> {
   const form = new FormData();
   form.append("file", file);
-  const res = await fetch(`${BASE}/upload`, { method: "POST", headers: authHeaders(), body: form });
-  if (!res.ok) {
-    throw await errorFromResponse(res);
-  }
-  return res.json();
+  return performRequest("/upload", { method: "POST", headers: authHeaders(), body: form }, (res) => res.json());
 }
 
 function appendQueryParam(url: string, key: string, value: string): string {
@@ -310,6 +428,8 @@ function appendQueryParam(url: string, key: string, value: string): string {
 
 export const api = {
   uploadFile,
+  getCorrelationAnalysis: (codes: string, days: number, method: "pearson" | "spearman", includeRegime: boolean, signal?: AbortSignal) =>
+    request<CorrelationAnalysisResponse>(`/correlation/analysis?${new URLSearchParams({ codes, days: String(days), method, include_regime: String(includeRegime) })}`, { signal }),
   getCorrelation: (codes: string, days: number, method: "pearson" | "spearman") =>
     request<CorrelationResponse>(
       `/correlation?codes=${encodeURIComponent(codes)}&days=${encodeURIComponent(String(days))}&method=${encodeURIComponent(method)}`,
@@ -319,10 +439,14 @@ export const api = {
       `/correlation/regime?codes=${encodeURIComponent(codes)}&days=${encodeURIComponent(String(days))}`,
     ),
   getPortfolio: () => request<{ status: string; snapshot: PortfolioSnapshot | null }>("/api/portfolio"),
+  getPortfolioAnalysisContext: (snapshotId: string) =>
+    request<{ status: string; context: Record<string, unknown> }>(`/api/portfolio/analysis-context?snapshot_id=${encodeURIComponent(snapshotId)}`),
   refreshPortfolio: () => request<{ status: string; snapshot: PortfolioSnapshot }>("/api/portfolio/refresh", { method: "POST" }),
   getPortfolioRefreshStatus: () => request<{ status: string; refresh: PortfolioRefreshState }>("/api/portfolio/refresh-status"),
   reconnectPortfolioSource: (sourceId: string) =>
-    request<{ status: string; authorized: boolean }>(`/api/portfolio/sources/${encodeURIComponent(sourceId)}/reconnect`, { method: "POST" }),
+    request<{ status: string; reconnect: PortfolioReconnectState }>(`/api/portfolio/sources/${encodeURIComponent(sourceId)}/reconnect`, { method: "POST" }),
+  getPortfolioReconnectStatus: () =>
+    request<{ status: string; reconnect: PortfolioReconnectState }>("/api/portfolio/reconnect-status"),
   getPortfolioSettings: () => request<PortfolioSettingsResponse>("/api/portfolio/settings"),
   updatePortfolioSettings: (settings: PortfolioSettings) =>
     request<PortfolioSettingsResponse>("/api/portfolio/settings", {
@@ -345,6 +469,15 @@ export const api = {
       `/api/connections/${encodeURIComponent(connectionId)}/check`,
       { method: "POST" },
     ),
+  getConnectionAccounts: (connectionId: string) =>
+    request<{ status: string; connection_id: string; account_ref: string; accounts: BrokerAccountChoice[] }>(
+      `/api/connections/${encodeURIComponent(connectionId)}/accounts`,
+    ),
+  selectConnectionAccount: (connectionId: string, accountRef: string) =>
+    request<{ status: string; connection: LocalConnection }>(
+      `/api/connections/${encodeURIComponent(connectionId)}/account`,
+      { method: "PUT", body: JSON.stringify({ account_ref: accountRef }) },
+    ),
   deleteConnection: (connectionId: string) =>
     request<{ status: string; deleted: string }>(
       `/api/connections/${encodeURIComponent(connectionId)}`,
@@ -353,9 +486,7 @@ export const api = {
   getPortfolioHistory: (limit = 180) =>
     request<{ status: string; history: PortfolioHistoryPoint[] }>(`/api/portfolio/history?limit=${encodeURIComponent(String(limit))}`),
   downloadPortfolioCsv: async () => {
-    const response = await fetch(`${BASE}/api/portfolio/export.csv`, { headers: authHeaders() });
-    if (!response.ok) throw await errorFromResponse(response);
-    return response.blob();
+    return performRequest("/api/portfolio/export.csv", { headers: authHeaders() }, (response) => response.blob());
   },
   listRuns: (limit?: number) => request<RunListItem[]>(`/runs${limit ? `?limit=${encodeURIComponent(String(limit))}` : ""}`),
   getRun: (id: string, params: RunDetailParams = {}) => {
@@ -369,7 +500,7 @@ export const api = {
   getRunFactor: (id: string) => request<FactorReportPayload>(`/runs/${id}/factor`),
   getRunAttribution: (id: string) => request<AttributionResponse>(`/runs/${encodeURIComponent(id)}/attribution`),
   getRunPine: (id: string) => request<PineScriptResult>(`/runs/${id}/pine`),
-  listSessions: () => request<SessionItem[]>("/sessions"),
+  listSessions: () => request<SessionItem[]>("/sessions", undefined, METADATA_TIMEOUT_MS),
   createSession: (title?: string) => request<SessionItem>("/sessions", { method: "POST", body: JSON.stringify({ title: title || "" }) }),
   deleteSession: (sid: string) => request<{ status: string }>(`/sessions/${sid}`, { method: "DELETE" }),
   renameSession: (sid: string, title: string) => request<{ status: string }>(`/sessions/${sid}`, { method: "PATCH", body: JSON.stringify({ title }) }),
@@ -381,6 +512,11 @@ export const api = {
   listScheduledRuns: (signal?: AbortSignal) => request<ScheduledRun[]>("/scheduled-runs", { signal }),
   createScheduledRun: (body: CreateScheduledRunRequest) =>
     request<ScheduledRun>("/scheduled-runs", { method: "POST", body: JSON.stringify(body) }),
+  updateScheduledRun: (id: string, body: UpdateScheduledRunRequest) =>
+    request<ScheduledRun>(`/scheduled-runs/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
   deleteScheduledRun: (id: string) =>
     request<void>(`/scheduled-runs/${encodeURIComponent(id)}`, { method: "DELETE" }),
   commitScheduledResearchProposal: (proposalId: string) =>
@@ -465,7 +601,22 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  // Web-based IM channel configuration; non-2xx (400/422) throws ApiError.
+  getChannelsConfig: () => request<ChannelsConfigResponse>("/channels/config"),
+  putChannelConfig: (name: string, body: ChannelPutBody) =>
+    request<ChannelPutResult>(`/channels/config/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  testChannel: (name: string, body?: ChannelTestBody) =>
+    request<ChannelTestResult>(`/channels/${encodeURIComponent(name)}/test`, {
+      method: "POST",
+      body: JSON.stringify(body ?? {}),
+    }),
   // Alpha Zoo API
+  getAlphaReadiness: () => request<AlphaReadiness>("/alpha/readiness", {}, METADATA_TIMEOUT_MS),
+  getAlphaBenchJob: (jobId: string) => request<AlphaJobSnapshot<AlphaBenchResult>>(`/alpha/bench/${encodeURIComponent(jobId)}`, {}, METADATA_TIMEOUT_MS),
+  getAlphaCompareJob: (jobId: string) => request<AlphaJobSnapshot<AlphaCompareResult>>(`/alpha/compare/${encodeURIComponent(jobId)}`, {}, METADATA_TIMEOUT_MS),
   listAlphas: (params: AlphaListParams = {}) => {
     const q = new URLSearchParams();
     if (params.zoo) q.set("zoo", params.zoo);
@@ -493,10 +644,11 @@ export const api = {
     withAuthTicket(`${BASE}/alpha/compare/${encodeURIComponent(jobId)}/stream`),
 
   // Options Lab
-  analyzeOptionsPayoff: (body: OptionsPayoffRequest) =>
+  analyzeOptionsPayoff: (body: OptionsPayoffRequest, signal?: AbortSignal) =>
     request<OptionsPayoffResponse>("/options/payoff", {
       method: "POST",
       body: JSON.stringify(body),
+      signal,
     }),
   getOptionsChain: (ticker: string, expiration?: number) => {
     const q = new URLSearchParams();
@@ -507,6 +659,10 @@ export const api = {
 
   // Connector runtime channel — privileged surface actions (NOT agent tools).
   // commit is the ONLY action that writes a mandate; halt trips the kill switch.
+  getLiveAccounts: (broker: string) =>
+    request<{ status: string; broker: string; account_selection_required: boolean; accounts: BrokerAccountChoice[] }>(
+      `/live/accounts?broker=${encodeURIComponent(broker)}`,
+    ),
   commitMandate: (body: CommitMandateRequest) =>
     request<CommitMandateResponse>("/mandate/commit", {
       method: "POST",
@@ -585,6 +741,8 @@ export interface ScheduledRun {
   // app, which is what every monitor created before this did.
   delivery_channel: string | null;
   delivery_target: string | null;
+  delivery_format: "html" | "pdf" | null;
+  protect_pdf: boolean;
   delivery_target_ref: string | null;
   delivery_target_label: string | null;
   delivery_status: string;
@@ -607,7 +765,23 @@ export interface CreateScheduledRunRequest {
   config?: Record<string, unknown>;
   delivery_channel?: string | null;
   delivery_target?: string | null;
+  delivery_format?: "html" | "pdf" | null;
+  protect_pdf?: boolean;
   delivery_target_ref?: string | null;
+}
+
+export interface UpdateScheduledRunRequest {
+  title?: string | null;
+  prompt?: string;
+  schedule?: string;
+  timezone?: string | null;
+  end_at?: number | null;
+  config?: Record<string, unknown> | null;
+  delivery_channel?: string | null;
+  delivery_target?: string | null;
+  delivery_target_ref?: string | null;
+  delivery_format?: "html" | "pdf" | null;
+  protect_pdf?: boolean;
 }
 
 export interface ScheduledResearchProposalJob {
@@ -625,6 +799,8 @@ export interface ScheduledResearchProposalJob {
     channel: string | null;
     target_ref: string | null;
     target_label: string | null;
+    format?: "html" | "pdf" | null;
+    protect_pdf?: boolean;
     status: string;
   };
 }
@@ -670,6 +846,8 @@ export interface LLMProviderOption {
   api_key_required: boolean;
   auth_type?: string;
   login_command?: string | null;
+  /** Reasoning effort levels the provider accepts, besides "" (provider default). */
+  reasoning_efforts?: string[];
 }
 
 export interface LLMSettings {
@@ -705,6 +883,7 @@ export interface ListLLMModelsRequest {
   provider: string;
   base_url?: string;
   api_key?: string;
+  refresh?: boolean;
 }
 
 export interface LLMModelsResponse {
@@ -716,20 +895,49 @@ export interface LLMModelsResponse {
     | "api_key_required"
     | "model_list_unavailable"
     | null;
+  /** Model id -> reasoning effort levels it accepts; empty means none. */
+  effort_levels?: Record<string, string[]> | null;
+}
+
+export interface SourceOrderEntry {
+  market: string;
+  env_var: string;
+  default_order: string[];
+  effective_order: string[];
+  override?: string[] | null;
+  override_invalid: boolean;
+}
+
+export interface SourceOrderUpdate {
+  market: string;
+  /** New order (permutation of default_order). null/omitted = reset to default. */
+  order?: string[] | null;
 }
 
 export interface DataSourceSettings {
   tushare_token_configured: boolean;
   tushare_token_hint?: string | null;
+  gildata_token_configured: boolean;
+  gildata_token_hint?: string | null;
   baostock_supported: boolean;
   baostock_installed: boolean;
   baostock_message: string;
   env_path: string;
+  source_orders?: SourceOrderEntry[];
 }
 
 export interface UpdateDataSourceSettingsRequest {
   tushare_token?: string;
   clear_tushare_token?: boolean;
+  gildata_token?: string;
+  clear_gildata_token?: boolean;
+  source_orders?: SourceOrderUpdate[];
+}
+
+export interface DeliveryTargetSuggestion {
+  target: string;
+  kind?: string;
+  label?: string;
 }
 
 export interface ChannelAdapterStatus {
@@ -742,6 +950,11 @@ export interface ChannelAdapterStatus {
   running: boolean;
   error?: string;
   install_hint?: string;
+  delivery_target_label?: string;
+  delivery_target_kind?: string;
+  delivery_target_placeholder?: string;
+  delivery_target_input_type?: string;
+  delivery_target_suggestions?: DeliveryTargetSuggestion[];
 }
 
 export interface ChannelRuntimeStatus {
@@ -764,6 +977,73 @@ export interface ChannelPairingCommandRequest {
 export interface ChannelPairingCommandResponse {
   channel: string;
   reply: string;
+}
+
+export interface ChannelFieldHint {
+  key: string;
+  type: "text" | "password" | "bool" | "list";
+  secret: boolean;
+  required: boolean;
+  help_key?: string | null;
+  /** Closed set of valid values; the panel renders a <select> when present. */
+  choices?: string[];
+}
+
+export interface ChannelSecretStatus {
+  set: boolean;
+  masked: string;
+}
+
+export interface ChannelConfigEntry {
+  display_name: string;
+  available: boolean;
+  loaded: boolean;
+  install_hint: string;
+  error: string;
+  supports_test: boolean;
+  sdk_available: boolean;
+  fields: ChannelFieldHint[];
+  values: Record<string, unknown>;
+  secrets: Record<string, ChannelSecretStatus>;
+  pdf_password_configured?: boolean;
+}
+
+export interface ChannelsConfigResponse {
+  /** Display-only path (home-relative `~/...` or a bare basename), never absolute. */
+  config_path: string;
+  writable: boolean;
+  runtime_running: boolean;
+  channels: Record<string, ChannelConfigEntry>;
+}
+
+// Merge-patches one channel section: an absent secret field is kept as-is,
+// `clear_<field>: true` removes a stored secret, and an enable transition
+// auto-verifies credentials unless `skip_verify` is set.
+export type ChannelPutBody = {
+  config: Record<string, unknown>;
+  skip_verify?: boolean;
+} & {
+  [clearFlag: `clear_${string}`]: boolean | undefined;
+};
+
+export interface ChannelPutResult {
+  channel: ChannelConfigEntry;
+  applied: "refreshed" | "hot_swapped" | "reset" | "deferred";
+  reset_reason?: string;
+}
+
+export type ChannelTestBody = {
+  config?: Record<string, unknown>;
+} & {
+  [clearFlag: `clear_${string}`]: boolean | undefined;
+};
+
+export interface ChannelTestResult {
+  ok: boolean;
+  code: "ok" | "invalid_credentials" | "network" | "unsupported";
+  detail?: string;
+  sdk_available: boolean;
+  tested_saved_config: boolean;
 }
 
 // --- Types matching backend API contracts ---
@@ -903,11 +1183,16 @@ export interface RebalanceNotesPayload {
     top_moves?: Array<{ code: string; from: number; to: number; delta: number }>;
   }>;
   summary?: {
-    rebalance_count: number;
+    target_change_count: number;
+    /** Legacy key on runs produced before the #1275 execution-evidence fix. */
+    rebalance_count?: number;
     turnover_total: number;
     turnover_mean: number;
     turnover_max: number;
     largest_rebalance_date?: string | null;
+    rebalance_executed_bars?: number;
+    rebalance_executed_fills?: number;
+    rebalance_realized_turnover?: number;
   };
 }
 
@@ -1050,6 +1335,11 @@ export type SectorAssetClass =
   | "india_equity"
   | "kr_equity"
   | "ca_equity"
+  | "ar_equity"
+  | "br_equity"
+  | "uk_equity"
+  | "vietnam_equity"
+  | "index"
   | "crypto"
   | "futures"
   | "forex";
@@ -1087,6 +1377,24 @@ export function fetchRunSectorMap(runId: string, refresh?: boolean): Promise<Sec
   return request<SectorMapResponse>(`/runs/${encodeURIComponent(runId)}/positions/sectors${qs}`);
 }
 
+export interface RunCardToolTrace {
+  tool: "backtest" | "load_data" | "generate_signals";
+  started_at: string;
+  ended_at: string;
+  status: "ok" | "error" | "cancelled";
+  args_hash: string;
+  result_hash: string;
+}
+
+export interface RunCardCitation {
+  metric: string;
+  artifact_id: string;
+  column: string;
+  /** One-based data row, excluding the CSV header. */
+  row: number;
+  sha256: string;
+}
+
 export interface RunCard {
   schema_version?: string;
   generated_at?: string;
@@ -1095,9 +1403,14 @@ export interface RunCard {
   reproducibility?: Record<string, unknown>;
   data_sources?: string[];
   metrics?: Record<string, unknown>;
+  // Carried alongside `metrics`, which is scalar-only: dict/list-shaped metrics
+  // (e.g. which sleeve a plan rejection dropped) reach the card here.
+  structured_metrics?: Record<string, unknown>;
   validation?: unknown;
   warnings?: string[];
   artifacts?: RunCardArtifact[];
+  tool_traces?: RunCardToolTrace[];
+  citations?: RunCardCitation[];
   [key: string]: unknown;
 }
 
@@ -1366,11 +1679,21 @@ export interface AlphaDetailResponse {
 }
 
 export interface AlphaBenchRequest {
+  request_id?: string;
   zoo: string;
   universe: string;
   period: string;
   top?: number;
+  alpha_id?: string;
 }
+
+export interface AlphaReadiness {
+  universes: Record<string, { ready: boolean; reason: "public_data" | "tushare_ready" | "tushare_token_missing" | "tushare_dependency_missing" | "single_asset" }>;
+  zoo_counts: Record<string, number>;
+}
+
+export interface AlphaProgress { n_done: number; n_total: number; current_alpha_id?: string; stage?: "loading_data" | "preparing_returns" | "computing" }
+export interface AlphaJobSnapshot<T> { job_id: string; status: "queued" | "running" | "done" | "error"; progress: AlphaProgress; result: T | null; error: string | null }
 
 export interface AlphaBenchTopRow {
   id: string;
@@ -1381,7 +1704,17 @@ export interface AlphaBenchTopRow {
   category: "alive" | "reversed" | "dead";
 }
 
+export interface AlphaDataMeta {
+  fetched_instruments?: number;
+  requested_instruments?: number;
+  missing_instruments?: string[];
+  survivorship_bias?: boolean;
+  degraded?: boolean;
+}
+
 export interface AlphaBenchResult {
+  n_alphas_tested?: number;
+  meta?: AlphaDataMeta;
   alive: number;
   reversed: number;
   dead: number;
@@ -1392,6 +1725,7 @@ export interface AlphaBenchResult {
 }
 
 export interface AlphaCompareRequest {
+  request_id?: string;
   alpha_ids: string[];
   universe: string;
   period: string;
@@ -1418,6 +1752,7 @@ export interface AlphaCompareSkip {
 }
 
 export interface AlphaCompareResult {
+  meta?: AlphaDataMeta;
   universe: string;
   period: string;
   sort: string;

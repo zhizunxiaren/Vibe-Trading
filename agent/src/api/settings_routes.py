@@ -5,7 +5,9 @@ Mounted by ``agent/api_server.py`` via ``register_settings_routes(app, ...)``.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import logging
 import json
 import os
 import sys as _sys
@@ -19,6 +21,8 @@ from pydantic import BaseModel, Field
 
 from src.config.accessor import get_env_value, reset_env_config
 
+logger = logging.getLogger(__name__)
+
 # Agent root (agent/) — resolved from this file's location (agent/src/api/).
 _AGENT_DIR = Path(__file__).resolve().parent.parent.parent
 
@@ -26,6 +30,11 @@ _AGENT_DIR = Path(__file__).resolve().parent.parent.parent
 # ---------------------------------------------------------------------------
 # Pydantic models (defined locally -- NO shared modules, per maintainer rule)
 # ---------------------------------------------------------------------------
+
+
+# "none" is an explicit value direct OpenAI needs to allow function tools on
+# gpt-5.6-* models; a provider with its own levels lists them in llm_providers.json.
+DEFAULT_REASONING_EFFORTS = ("none", "low", "medium", "high", "max")
 
 
 class LLMProviderOption(BaseModel):
@@ -41,6 +50,9 @@ class LLMProviderOption(BaseModel):
     api_key_required: bool = True
     auth_type: str = "api_key"
     login_command: Optional[str] = None
+    # Levels the settings form offers and the update route accepts; "" (unset)
+    # is always allowed on top of these.
+    reasoning_efforts: List[str] = Field(default_factory=lambda: list(DEFAULT_REASONING_EFFORTS))
 
 
 class LLMSettingsResponse(BaseModel):
@@ -82,6 +94,7 @@ class ListLLMModelsRequest(BaseModel):
     provider: str = Field(..., min_length=1)
     base_url: Optional[str] = None
     api_key: Optional[str] = None
+    refresh: bool = False
 
 
 ModelDiscoveryWarningCode = Literal[
@@ -98,6 +111,27 @@ class LLMModelsResponse(BaseModel):
     models: List[str]
     source: str
     warning_code: Optional[ModelDiscoveryWarningCode] = None
+    # Model id -> reasoning effort levels it accepts; an empty list means the
+    # model takes no effort setting. Only providers that report it fill this.
+    effort_levels: Optional[Dict[str, List[str]]] = None
+
+
+class SourceOrderEntry(BaseModel):
+    """One market's fallback-chain order (default + override state)."""
+
+    market: str
+    env_var: str
+    default_order: List[str]
+    effective_order: List[str]
+    override: Optional[List[str]] = None
+    override_invalid: bool = False
+
+
+class SourceOrderUpdate(BaseModel):
+    """Reorder one market's fallback chain (null/empty order = reset)."""
+
+    market: str
+    order: Optional[List[str]] = None
 
 
 class DataSourceSettingsResponse(BaseModel):
@@ -105,10 +139,13 @@ class DataSourceSettingsResponse(BaseModel):
 
     tushare_token_configured: bool
     tushare_token_hint: Optional[str] = None
+    gildata_token_configured: bool
+    gildata_token_hint: Optional[str] = None
     baostock_supported: bool
     baostock_installed: bool
     baostock_message: str
     env_path: str
+    source_orders: List[SourceOrderEntry] = Field(default_factory=list)
 
 
 class UpdateDataSourceSettingsRequest(BaseModel):
@@ -116,6 +153,9 @@ class UpdateDataSourceSettingsRequest(BaseModel):
 
     tushare_token: Optional[str] = None
     clear_tushare_token: bool = False
+    gildata_token: Optional[str] = None
+    clear_gildata_token: bool = False
+    source_orders: Optional[List[SourceOrderUpdate]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -145,16 +185,14 @@ def _load_llm_providers() -> List[LLMProviderOption]:
 
 LLM_PROVIDERS = _load_llm_providers()
 LLM_PROVIDER_BY_NAME = {provider.name: provider for provider in LLM_PROVIDERS}
-# "" leaves the setting unset (Off); "none" is an explicit value direct OpenAI
-# needs to allow function tools on gpt-5.6-* models.
-LLM_REASONING_EFFORTS = {"", "none", "low", "medium", "high", "max"}
 LLM_API_KEY_PLACEHOLDERS = {"", "sk-or-v1-your-key-here", "sk-xxx", "xxx", "gsk_xxx"}
 TUSHARE_TOKEN_PLACEHOLDERS = {"", "your-tushare-token"}
+GILDATA_TOKEN_PLACEHOLDERS = {"", "your-gildata-token"}
 
 
 def _desktop_secure_credential_names() -> set[str]:
     """Return secrets owned by the desktop host when secure storage is active."""
-    names = {"TUSHARE_TOKEN", "QVERIS_API_KEY"}
+    names = {"TUSHARE_TOKEN", "QVERIS_API_KEY", "GILDATA_TOKEN"}
     names.update(
         provider.api_key_env for provider in LLM_PROVIDERS if provider.api_key_env
     )
@@ -289,7 +327,7 @@ async def _list_provider_models(
             provider=provider.name,
             models=fallback,
             source="default",
-            warning_code=f"{provider.auth_type}_discovery_unsupported",
+            warning_code="oauth_discovery_unsupported",
         )
     if provider.api_key_required and not api_key:
         return LLMModelsResponse(
@@ -328,6 +366,33 @@ async def _list_provider_models(
     )
 
 
+async def _list_claude_cli_models(
+    provider: LLMProviderOption, *, refresh: bool
+) -> LLMModelsResponse:
+    """List the models the local Claude Code login can run, with their effort levels."""
+    from src.providers.claude_cli_models import list_claude_cli_models
+
+    try:
+        discovered = await asyncio.to_thread(list_claude_cli_models, refresh=refresh)
+    except RuntimeError as exc:
+        logger.warning("claude-cli model list unavailable: %s", exc)
+        return LLMModelsResponse(
+            provider=provider.name,
+            models=[provider.default_model],
+            source="default",
+            warning_code="model_list_unavailable",
+        )
+    models = [model.model_id for model in discovered]
+    if provider.default_model not in models:
+        models.insert(0, provider.default_model)
+    return LLMModelsResponse(
+        provider=provider.name,
+        models=models,
+        source="provider",
+        effort_levels={model.model_id: list(model.effort_levels) for model in discovered},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Response builders
 # ---------------------------------------------------------------------------
@@ -362,6 +427,15 @@ def _build_llm_settings_response(
             authenticated, auth_status = False, ""
         api_key_configured = authenticated
         api_key_hint = auth_status if authenticated else None
+    elif provider.auth_type == "claude_cli":
+        try:
+            from src.providers.claude_cli import get_claude_cli_auth_status
+
+            authenticated, auth_status = get_claude_cli_auth_status()
+        except Exception:
+            authenticated, auth_status = False, ""
+        api_key_configured = authenticated
+        api_key_hint = auth_status if authenticated else None
     return LLMSettingsResponse(
         provider=provider.name,
         model_name=env_values.get("LANGCHAIN_MODEL_NAME", provider.default_model),
@@ -380,6 +454,70 @@ def _build_llm_settings_response(
     )
 
 
+def _build_source_orders(env_values: Dict[str, str]) -> List[SourceOrderEntry]:
+    """Build per-market source-order entries for the settings payload.
+
+    ``effective_order`` reflects the running process (registry state after a
+    refresh); ``override`` reflects the persisted dotenv value, with
+    ``override_invalid`` flagging values that failed validation (kept in the
+    file for transparency, but not applied).
+    """
+    from backtest.loaders import registry
+
+    registry.refresh_source_order_overrides()
+    entries: List[SourceOrderEntry] = []
+    for market in sorted(registry._DEFAULT_CHAINS):
+        env_var = registry.source_order_env_var(market)
+        default_order = registry.get_default_source_order(market)
+        parsed = registry.parse_source_order(env_values.get(env_var, ""))
+        entries.append(
+            SourceOrderEntry(
+                market=market,
+                env_var=env_var,
+                default_order=default_order,
+                effective_order=list(registry.FALLBACK_CHAINS.get(market, default_order)),
+                override=parsed or None,
+                override_invalid=bool(parsed)
+                and not registry.is_valid_source_order(market, parsed),
+            )
+        )
+    return entries
+
+
+def _validate_source_order_update(entry: SourceOrderUpdate) -> tuple[str, str]:
+    """Validate one market reorder; return ``(env_var, dotenv value)``.
+
+    A null/empty order — or one equal to the default — maps to an empty
+    string, which clears any persisted override for that market.
+    """
+    from backtest.loaders import registry
+
+    market = entry.market.strip()
+    default_order = registry.get_default_source_order(market)
+    if not default_order:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown market: {market!r}",
+        )
+    order = (
+        [name.strip().lower() for name in entry.order if name.strip()]
+        if entry.order
+        else []
+    )
+    if order and not registry.is_valid_source_order(market, order):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Invalid source order for {market}: must be a permutation of "
+                f"the default chain {default_order}"
+            ),
+        )
+    return (
+        registry.source_order_env_var(market),
+        "" if not order or order == default_order else ",".join(order),
+    )
+
+
 def _build_data_source_settings_response(
     values: Optional[Dict[str, str]] = None,
 ) -> DataSourceSettingsResponse:
@@ -388,6 +526,8 @@ def _build_data_source_settings_response(
     env_values = values if values is not None else _read_settings_env_values()
     token = env_values.get("TUSHARE_TOKEN", "")
     token_configured = host._is_configured_secret(token, TUSHARE_TOKEN_PLACEHOLDERS)
+    gildata = env_values.get("GILDATA_TOKEN", "")
+    gildata_configured = host._is_configured_secret(gildata, GILDATA_TOKEN_PLACEHOLDERS)
     # Late-access baostock helpers for monkeypatch compat.
     baostock_sup = getattr(host, "_baostock_supported", _baostock_supported)
     baostock_ins = getattr(host, "_baostock_installed", _baostock_installed)
@@ -402,10 +542,13 @@ def _build_data_source_settings_response(
     return DataSourceSettingsResponse(
         tushare_token_configured=token_configured,
         tushare_token_hint=None,
+        gildata_token_configured=gildata_configured,
+        gildata_token_hint=None,
         baostock_supported=supported,
         baostock_installed=installed,
         baostock_message=baostock_message,
         env_path=host._project_relative_path(host.ENV_PATH),
+        source_orders=_build_source_orders(env_values),
     )
 
 
@@ -418,8 +561,8 @@ def _sync_runtime_env(provider: LLMProviderOption, updates: Dict[str, str]) -> N
         else:
             os.environ.pop(key, None)
 
-    if provider.auth_type == "gh_cli":
-        # The Copilot SDK owns credential discovery and transport.
+    if provider.auth_type in {"gh_cli", "claude_cli"}:
+        # The Copilot SDK / Claude Code CLI own credential discovery and transport.
         os.environ.pop("OPENAI_API_KEY", None)
         os.environ.pop("OPENAI_API_BASE", None)
         os.environ.pop("OPENAI_BASE_URL", None)
@@ -517,7 +660,9 @@ def register_settings_routes(
     )
     async def get_llm_settings():
         """Return project-local LLM settings for the Web UI."""
-        return _build_llm_settings_response()
+        # gh_cli / claude_cli providers shell out for their login status; keep
+        # that off the event loop so open SSE streams are not stalled.
+        return await asyncio.to_thread(_build_llm_settings_response)
 
     @app.put(
         "/settings/llm",
@@ -547,11 +692,11 @@ def register_settings_routes(
             )
 
         reasoning_effort = (payload.reasoning_effort or "").strip().lower()
-        if reasoning_effort not in LLM_REASONING_EFFORTS:
+        if reasoning_effort and reasoning_effort not in provider.reasoning_efforts:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
-                    "Reasoning effort must be none, low, medium, high, or max, "
+                    f"Reasoning effort must be one of {', '.join(provider.reasoning_efforts)}, "
                     "or empty to leave it unset"
                 ),
             )
@@ -600,7 +745,7 @@ def register_settings_routes(
 
         saved_values = _persist_settings_updates(updates)
         _sync_runtime_env(provider, updates)
-        return _build_llm_settings_response(saved_values)
+        return await asyncio.to_thread(_build_llm_settings_response, saved_values)
 
     @app.post(
         "/settings/llm/models",
@@ -615,6 +760,9 @@ def register_settings_routes(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported LLM provider"
             )
+        if provider.auth_type == "claude_cli":
+            # No HTTP endpoint: the base URL checks below would reject it outright.
+            return await _list_claude_cli_models(provider, refresh=payload.refresh)
 
         current_values = _read_settings_env_values()
         requested_base_url = (payload.base_url or "").strip()
@@ -675,6 +823,26 @@ def register_settings_routes(
         elif "TUSHARE_TOKEN" in current_values:
             updates["TUSHARE_TOKEN"] = current_values["TUSHARE_TOKEN"]
 
+        if payload.clear_gildata_token:
+            updates["GILDATA_TOKEN"] = ""
+        elif payload.gildata_token is not None and payload.gildata_token.strip():
+            updates["GILDATA_TOKEN"] = payload.gildata_token.strip()
+        elif "GILDATA_TOKEN" in current_values:
+            updates["GILDATA_TOKEN"] = current_values["GILDATA_TOKEN"]
+
+        # Per-market source-order overrides: validate first (400 on a bad
+        # permutation *before* anything is persisted), then merge only the
+        # entries that actually change the dotenv (no-op saves don't grow
+        # the file with 12 identical lines).
+        order_updates: Dict[str, str] = {}
+        if payload.source_orders is not None:
+            for order_entry in payload.source_orders:
+                env_var, value = _validate_source_order_update(order_entry)
+                order_updates[env_var] = value
+            for env_var, value in order_updates.items():
+                if value != current_values.get(env_var, ""):
+                    updates[env_var] = value
+
         if updates:
             saved_values = _persist_settings_updates(updates)
             token = updates.get("TUSHARE_TOKEN", "").strip()
@@ -682,6 +850,21 @@ def register_settings_routes(
                 os.environ["TUSHARE_TOKEN"] = token
             else:
                 os.environ.pop("TUSHARE_TOKEN", None)
+            gildata_token = updates.get("GILDATA_TOKEN", "").strip()
+            if host_ref._is_configured_secret(gildata_token, GILDATA_TOKEN_PLACEHOLDERS):
+                os.environ["GILDATA_TOKEN"] = gildata_token
+            else:
+                os.environ.pop("GILDATA_TOKEN", None)
+            # Hot-apply source-order overrides in this process.
+            for env_var, value in order_updates.items():
+                if value:
+                    os.environ[env_var] = value
+                else:
+                    os.environ.pop(env_var, None)
+            if order_updates:
+                from backtest.loaders import registry
+
+                registry.refresh_source_order_overrides()
             reset_env_config()
 
         return _build_data_source_settings_response(

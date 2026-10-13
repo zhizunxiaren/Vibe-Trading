@@ -497,6 +497,21 @@ def test_spread_term_structure_rounding_is_controllable():
     ] == pytest.approx(50.123)
 
 
+def test_spread_term_structure_merges_int_and_float_tenor_keys():
+    issuers = {
+        "IssuerA": {5: 0.045, 10: 0.052},
+        "IssuerB": {5.0: 0.048, 10.0: 0.055},
+    }
+    curve = {5: 0.03, 10: 0.035}
+    out = spread_term_structure(issuers, curve)
+
+    assert list(out.columns) == ["5Y_spread_bp", "10Y_spread_bp"]
+    assert out.loc["IssuerA", "5Y_spread_bp"] == pytest.approx(150.0)
+    assert out.loc["IssuerB", "5Y_spread_bp"] == pytest.approx(180.0)
+    assert out.loc["IssuerA", "10Y_spread_bp"] == pytest.approx(170.0)
+    assert out.loc["IssuerB", "10Y_spread_bp"] == pytest.approx(200.0)
+
+
 def test_spread_term_structure_validates_its_inputs():
     with pytest.raises(ValueError, match="at least one entry"):
         spread_term_structure({}, {1: 0.02})
@@ -611,3 +626,36 @@ def test_vasicek_input_validation():
         vasicek_credit_var(1000.0, 0.01, 0.4, 0.1, confidence=1.5)
     with pytest.raises(ValueError, match="spread_duration non-negative"):
         credit_spread_dv01(spread_duration=-1.0)
+
+
+def test_altman_z_score_refuses_non_finite_inputs():
+    with pytest.raises(ValueError, match="working_capital must be a finite number"):
+        altman_z_score(**{**FIRM, "working_capital": float("nan")})
+    with pytest.raises(ValueError, match="total_assets must be a finite number"):
+        altman_z_score(**{**FIRM, "total_assets": float("inf")})
+
+
+def test_merton_and_kmv_refuse_non_finite_inputs():
+    with pytest.raises(ValueError, match="equity_value must be a finite number"):
+        merton_asset_solve(float("nan"), 0.3, 100.0, 0.03, 1.0)
+    with pytest.raises(ValueError, match="asset_value must be a finite number"):
+        distance_to_default(float("nan"), 0.3, 100.0, 1.0)
+    with pytest.raises(ValueError, match="short_term_debt must be a finite number"):
+        kmv_default_point(float("nan"), 50.0)
+    with pytest.raises(ValueError, match="asset_value must be a finite number"):
+        kmv_distance_to_default(float("nan"), 0.3, 60.0)
+
+
+def test_hazard_survival_cds_and_loss_refuse_non_finite_inputs():
+    with pytest.raises(ValueError, match="hazard_rate must be a finite number"):
+        hazard_rate_to_survival_probability(float("nan"), 5.0)
+    with pytest.raises(ValueError, match="survival_prob must be a finite number"):
+        survival_probability_to_hazard_rate(float("nan"), 5.0)
+    with pytest.raises(ValueError, match="spread_bps must be a finite number"):
+        cds_price(spread_bps=float("nan"))
+    with pytest.raises(ValueError, match="ead must be a finite number"):
+        expected_loss(float("nan"), 0.1, 0.5)
+    with pytest.raises(ValueError, match="pd must be a finite number"):
+        vasicek_credit_var(1000.0, float("nan"), 0.4, 0.2)
+    with pytest.raises(ValueError, match="face must be a finite number"):
+        credit_spread_dv01(5.0, price=100.0, face=float("inf"))

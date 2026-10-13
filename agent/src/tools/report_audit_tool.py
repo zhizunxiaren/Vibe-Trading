@@ -32,13 +32,16 @@ from src.agent.tools import BaseTool
 # Markdown data-point extraction (handles Chinese financial reports)
 # ---------------------------------------------------------------------------
 
-_KV_LABEL_RE = re.compile(
-    r"(?P<label>[一-龥A-Za-z][^|\n：:*]{1,30})[：:]\s*[~约]?\$?"
-    r"(?P<num>[\d,，.]+)\s*"
-    r"(?P<unit>亿[元美港]?元?|万亿|[xX倍]|%|[BMT])?"
+_KV_LABEL_RE = re.compile(r"(?P<label>[一-龥A-Za-z][^|\n：:*]{1,30})[：:]\s*")
+_UNIT_PATTERN = r"亿[元美港]?元?|万亿|倍|%|[BMTxX](?![A-Za-z])"
+_NUMUNIT_RE = re.compile(
+    r"[~约]?\$?\s*(?:"
+    r"(?P<open>[（(])\s*\$?\s*(?P<account_num>[+\-−]?[\d,，.]+)\s*"
+    rf"(?P<inside_unit>{_UNIT_PATTERN})?\s*(?P<close>[）)])\s*"
+    rf"(?P<outside_unit>{_UNIT_PATTERN})?"
+    r"|(?P<currency_sign>[+\-−])?\s*\$?\s*(?P<num>[+\-−]?[\d,，.]+)\s*"
+    rf"(?P<unit>{_UNIT_PATTERN})?)"
 )
-
-_NUMUNIT_RE = re.compile(r"[~约]?\$?([\d,，.]+)\s*(亿[元美港]?元?|万亿|[xX倍]|%|[BMT])?")
 _TABLE_SEP_RE = re.compile(r"^\|[\-\s|:]+\|$")
 
 _SKIP_LABELS = {
@@ -51,11 +54,62 @@ _QUARTER_RE = re.compile(r"(20\d{2}|Q[1-4]|\d{4}\s*Q[1-4])")
 
 def _clean_num(s: str) -> float | None:
     """Normalise a numeric string with commas (ASCII or wide) to float."""
-    s = s.replace(",", "").replace("，", "").strip()
+    s = s.replace(",", "").replace("，", "").replace("−", "-").strip()
     try:
         return float(s)
     except ValueError:
         return None
+
+
+def _report_value(text: str, *, prose: bool = False) -> tuple[float, str, int] | None:
+    """Read a financial value without rescuing malformed accounting notation.
+
+    Args:
+        text: Table cell or text immediately following a prose label.
+        prose: Require a unit or currency for a parenthesized prose value.
+
+    Returns:
+        Finite signed value, its unit and consumed end offset, or None.
+    """
+    match = _NUMUNIT_RE.match(text) if prose else _NUMUNIT_RE.search(text)
+    if match is None:
+        return None
+    # A failed accounting match must not restart at the unsigned inner digits.
+    prefix = text[: match.start()]
+    if prefix.count("(") > prefix.count(")") or prefix.count("（") > prefix.count("）"):
+        return None
+    suffix = text[match.end() :].lstrip()
+    if suffix.startswith((")", "）")):
+        return None
+    if match.group("open"):
+        if (match.group("open"), match.group("close")) not in {
+            ("(", ")"),
+            ("（", "）"),
+        }:
+            return None
+        inside, outside = match.group("inside_unit"), match.group("outside_unit")
+        if inside and outside:
+            return None
+        unit = inside or outside or ""
+        if prose and not unit and "$" not in match.group():
+            return None
+        value = _clean_num(match.group("account_num"))
+        if value is not None:
+            # Parens mean negative regardless of an inner sign: "(-25)" is
+            # the same debt as "(25)", never a credit.
+            value = -abs(value)
+    else:
+        value = _clean_num(match.group("num"))
+        sign = match.group("currency_sign")
+        if sign:
+            if match.group("num").startswith(("+", "-", "−")):
+                return None
+            if value is not None and sign in {"-", "−"}:
+                value = -value
+        unit = match.group("unit") or ""
+    if value is None or not math.isfinite(value):
+        return None
+    return value, unit, match.end()
 
 
 def _is_valid_label(label: str) -> bool:
@@ -97,7 +151,9 @@ def _parse_md_tables(lines: list[str]) -> list[tuple[str, str, float, str, int, 
     while i < len(lines):
         line = lines[i].strip()
         if "|" in line and not _TABLE_SEP_RE.match(line):
-            headers_raw = [h.strip().strip("*_").strip() for h in _split_md_table_row(line)]
+            headers_raw = [
+                h.strip().strip("*_").strip() for h in _split_md_table_row(line)
+            ]
             if i + 1 < len(lines) and _TABLE_SEP_RE.match(lines[i + 1].strip()):
                 i += 2  # skip the separator row
                 while i < len(lines):
@@ -117,12 +173,13 @@ def _parse_md_tables(lines: list[str]) -> list[tuple[str, str, float, str, int, 
                             if col_idx < len(headers_raw)
                             else f"col{col_idx}"
                         )
-                        m = _NUMUNIT_RE.search(cell)
-                        if m:
-                            val = _clean_num(m.group(1))
-                            unit = (m.group(2) or "").strip()
-                            if val and val != 0 and val < 1e15:
-                                results.append((row_label, col_header, val, unit, i + 1, dline))
+                        parsed = _report_value(cell)
+                        if parsed is not None:
+                            val, unit, _ = parsed
+                            if val != 0 and abs(val) < 1e15:
+                                results.append(
+                                    (row_label, col_header, val, unit, i + 1, dline)
+                                )
                     i += 1
                 continue
         i += 1
@@ -149,7 +206,7 @@ def extract_data_points(md_text: str) -> list[dict[str, Any]]:
         label = re.sub(r"[*_`]+", "", label).strip()
         if not _is_valid_label(label):
             return
-        if val is None or val == 0 or val > 1e15:
+        if val is None or not math.isfinite(val) or val == 0 or abs(val) > 1e15:
             return
         if _QUARTER_RE.fullmatch(label.strip()):
             return
@@ -157,14 +214,16 @@ def extract_data_points(md_text: str) -> list[dict[str, Any]]:
         if key in seen:
             return
         seen.add(key)
-        points.append({
-            "id": len(points) + 1,
-            "label": label,
-            "reported_value": val,
-            "unit": unit,
-            "raw_text": raw[:120],
-            "line_number": lineno,
-        })
+        points.append(
+            {
+                "id": len(points) + 1,
+                "label": label,
+                "reported_value": val,
+                "unit": unit,
+                "raw_text": raw[:120],
+                "line_number": lineno,
+            }
+        )
 
     lines = md_text.split("\n")
     in_code = False
@@ -176,7 +235,11 @@ def extract_data_points(md_text: str) -> list[dict[str, Any]]:
             continue
         if col_header.upper() in _YOY_HEADERS:
             continue
-        label = f"{row_label} · {col_header}" if (col_header and col_header != row_label) else row_label
+        label = (
+            f"{row_label} · {col_header}"
+            if (col_header and col_header != row_label)
+            else row_label
+        )
         _add(label, val, unit, lineno, raw)
 
     # 2. ``label: value unit`` lines.
@@ -189,14 +252,14 @@ def extract_data_points(md_text: str) -> list[dict[str, Any]]:
             continue
         if "|" in stripped:
             continue  # handled as a table above
-        for m in _KV_LABEL_RE.finditer(stripped):
-            _add(
-                m.group("label"),
-                _clean_num(m.group("num")),
-                (m.group("unit") or "").strip(),
-                lineno,
-                stripped,
-            )
+        cursor = 0
+        while (m := _KV_LABEL_RE.search(stripped, cursor)) is not None:
+            cursor = m.end()
+            parsed = _report_value(stripped[m.end() :], prose=True)
+            if parsed is not None:
+                val, unit, consumed = parsed
+                cursor += consumed
+                _add(m.group("label"), val, unit, lineno, stripped)
 
     return points
 
@@ -272,7 +335,9 @@ def render_verdict(results: list[dict[str, Any]], report_name: str = "") -> dict
 
     A point whose ``reported_value`` is missing, ``None``, or non-finite is
     unverifiable, so it fails with an explicit ``reason`` instead of being
-    treated as a reported zero. A genuine reported ``0`` stays valid.
+    treated as a reported zero. A genuine reported ``0`` stays valid. A
+    supplied but non-finite ``fetched_value`` fails the point the same way
+    (unverifiable evidence), while an absent one is skipped as "not verified".
 
     Args:
         results: List of verification objects — ``{id, label, reported_value,
@@ -281,7 +346,10 @@ def render_verdict(results: list[dict[str, Any]], report_name: str = "") -> dict
         report_name: Optional report name for display.
 
     Returns:
-        Verdict dict: ``verdict`` is ``PASS`` (zero failures) or ``FAIL``.
+        Verdict dict: ``verdict`` is ``PASS`` (zero failures, at least one
+        verified point) or ``FAIL``. A call in which nothing was verified
+        fails closed — a report certified with zero evidence is the failure
+        mode this gate exists to prevent.
     """
     fail_items: list[dict[str, Any]] = []
     warn_items: list[dict[str, Any]] = []
@@ -289,9 +357,33 @@ def render_verdict(results: list[dict[str, Any]], report_name: str = "") -> dict
     total = 0
 
     for item in results:
-        fetched = item.get("fetched_value")
+        raw_fetched = item.get("fetched_value")
+        if raw_fetched is None:
+            continue  # not verified — skip, do not count (pinned design)
+        # Coerce through _finite_number so a non-numeric fetched value (a
+        # string, NaN, …) is treated as unusable evidence, not a crash.
+        fetched = _finite_number(raw_fetched)
         if fetched is None:
-            continue  # not verified — skip, do not count
+            # Supplied but unusable is NOT "not verified" (which is silently
+            # skipped): fail the point. Otherwise a junk fetch could be used
+            # to drop a hard-to-verify number from the audit entirely.
+            total += 1
+            label = item.get("label", "?")
+            fail_items.append({
+                "id": item.get("id"), "label": label,
+                "reported": _finite_number(item.get("reported_value")),
+                "unit": item.get("unit", ""),
+                "fetched": None, "source": item.get("fetched_source", "?"),
+                "fetched2": None, "source2": item.get("fetched_source2", ""),
+                "diff1_pct": None, "diff2_pct": None,
+                "reason": (
+                    f"fetched value is not a finite number ({raw_fetched!r}) "
+                    "— cannot verify"
+                ),
+                "raw_text": item.get("raw_text", ""),
+                "line_number": item.get("line_number", 0),
+            })
+            continue
         total += 1
         label = item.get("label", "?")
         unit = item.get("unit", "")
@@ -306,7 +398,7 @@ def render_verdict(results: list[dict[str, Any]], report_name: str = "") -> dict
             fail_items.append({
                 "id": item.get("id"), "label": label,
                 "reported": None, "unit": unit,
-                "fetched": _finite_number(fetched), "source": source,
+                "fetched": fetched, "source": source,
                 "fetched2": _finite_number(item.get("fetched_value2")),
                 "source2": item.get("fetched_source2", ""),
                 "diff1_pct": None, "diff2_pct": None,
@@ -320,10 +412,11 @@ def render_verdict(results: list[dict[str, Any]], report_name: str = "") -> dict
             })
             continue
 
-        fetched = float(fetched)
         diff1 = _pct_diff(reported, fetched)
 
-        fetched2 = item.get("fetched_value2")
+        # A non-finite second source is ignored (single-source semantics)
+        # instead of crashing the verdict; a garbage source verifies nothing.
+        fetched2 = _finite_number(item.get("fetched_value2"))
         source2 = item.get("fetched_source2", "")
         pass1 = diff1 <= _TOLERANCE
 
@@ -344,7 +437,7 @@ def render_verdict(results: list[dict[str, Any]], report_name: str = "") -> dict
         else:
             # Two sources: PASS only if both agree within tolerance; FAIL if
             # both miss; otherwise WARN (a caliber / GAAP mismatch, not a fail).
-            f2 = float(fetched2)
+            f2 = fetched2  # already coerced finite above
             diff2 = _pct_diff(reported, f2)
             pass2 = diff2 <= _TOLERANCE
             if pass1 and pass2:
@@ -367,6 +460,18 @@ def render_verdict(results: list[dict[str, Any]], report_name: str = "") -> dict
                     "diff1_pct": _pct_diff_for_json(diff1),
                     "diff2_pct": _pct_diff_for_json(diff2),
                 })
+
+    if total == 0:
+        # Fail closed: zero verified points means the audit gathered no
+        # evidence at all. Certifying that as PASS would let an unaudited
+        # report — or an agent that fetched nothing — through the gate.
+        fail_items.append({
+            "id": None, "label": "audit", "reported": None, "unit": "",
+            "fetched": None, "source": "", "fetched2": None, "source2": "",
+            "diff1_pct": None, "diff2_pct": None,
+            "reason": "no data points were verified — every result lacked a fetched_value",
+            "raw_text": "", "line_number": 0,
+        })
 
     fail_count = len(fail_items)
     verdict = "PASS" if fail_count == 0 else "FAIL"

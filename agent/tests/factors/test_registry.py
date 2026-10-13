@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
 import textwrap
 from pathlib import Path
@@ -88,7 +89,16 @@ def mini_zoo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # monkey-patching sys.path to include tmp_path, then creating an `src`
     # alias that points to `factors/`-as-`src.factors`.
     src_alias = tmp_path / "src"
-    src_alias.symlink_to(tmp_path)
+    try:
+        src_alias.symlink_to(tmp_path)
+    except OSError:
+        # Symlinks need privileges on Windows (OSError 1314 even in an
+        # otherwise healthy environment), so fall back to a real copy —
+        # the same fallback the sandbox home in `core/runner.py` uses. The
+        # alias only has to present the same tree at `src/factors/...`, and
+        # a registry pointed at a custom zoo_root loads modules by file
+        # path, so the copy never has to track later fixture writes.
+        shutil.copytree(tmp_path / "factors", src_alias / "factors")
     monkeypatch.syspath_prepend(str(tmp_path))
     # Reset any cached modules from previous test
     for mod_name in list(sys.modules):
@@ -105,6 +115,32 @@ def _panel(n: int = 5) -> dict[str, pd.DataFrame]:
         "close": pd.DataFrame(np.arange(n * 2, dtype=float).reshape(n, 2), index=idx, columns=cols),
         "open": pd.DataFrame(np.arange(n * 2, dtype=float).reshape(n, 2) * 0.5, index=idx, columns=cols),
     }
+
+
+@pytest.fixture
+def _deny_symlink(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise(*args, **kwargs):
+        raise OSError(1314, "A required privilege is not held by the client")
+
+    monkeypatch.setattr(Path, "symlink_to", _raise)
+
+
+def test_mini_zoo_copy_fallback_when_symlink_privileges_missing(
+    _deny_symlink: None, mini_zoo: Path
+) -> None:
+    """The copy fallback keeps the suite alive on symlink-less hosts.
+
+    Windows without symlink privilege refuses the alias's symlink with
+    OSError 1314 even in an otherwise healthy environment; the fixture must
+    still deliver a working zoo tree. Mirrors the parallel pin on the
+    sandbox home's copy fallback in ``test_runner_env.py``.
+    """
+    src_alias = mini_zoo.parents[1] / "src"
+    assert src_alias.is_dir() and not src_alias.is_symlink()
+    reg = Registry(zoo_root=mini_zoo)
+    assert reg.health()["loaded"] == 4
+    out = reg.compute("fakezoo_001", _panel())
+    assert out.shape == (5, 2)
 
 
 # ---------------- AST extraction ----------------
@@ -254,3 +290,106 @@ def test_export_manifest_shape(mini_zoo: Path) -> None:
     assert "generated_at" in m
     assert m["zoos"][0]["zoo_id"] == "fakezoo"
     assert len(m["zoos"][0]["alphas"]) == 4
+
+
+def test_registry_masks_nan_on_declared_dependencies(mini_zoo: Path) -> None:
+    reg = Registry(zoo_root=mini_zoo)
+    panel = _panel()
+    # NaN in a required column should propagate to output
+    panel["close"].iloc[2, 0] = np.nan
+    out = reg.compute("fakezoo_001", panel)
+    assert np.isnan(out.iloc[2, 0])
+    # Also test with NaN in another required column
+    panel = _panel()
+    panel["open"].iloc[1, 1] = np.nan
+    out = reg.compute("fakezoo_001", panel)
+    assert np.isnan(out.iloc[1, 1])
+
+
+def test_registry_masks_nan_without_close_declared(mini_zoo: Path) -> None:
+    """The NaN mask must run even when the alpha does not declare ``close``.
+
+    The mask's shape reference was hardcoded to ``panel["close"]``, so an alpha
+    declaring only ``["open"]`` got no NaN enforcement on a panel without a
+    close column — a fabricated value (np.where on a NaN comparison) survived.
+    The reference is now the first declared dependency.
+    """
+    reg = Registry(zoo_root=mini_zoo)
+    meta = GOOD_META.replace('"close", "open"', '"open"')
+    body = textwrap.dedent(
+        """\
+        import numpy as np
+        import pandas as pd
+
+        def compute(panel):
+            o = panel["open"]
+            # NaN < 0 is False: a missing bar falls through to 0.0 (fabricated).
+            return pd.DataFrame(np.where(o < 0, 1.0, 0.0), index=o.index, columns=o.columns)
+        """
+    )
+    _write_alpha(mini_zoo / "fakezoo", "alpha_005", "fakezoo", meta=meta, body=body)
+    reg = Registry(zoo_root=mini_zoo)
+    panel = _panel()
+    del panel["close"]  # no close column at all
+    panel["open"].iloc[2, 0] = np.nan
+    out = reg.compute("fakezoo_005", panel)
+    assert np.isnan(out.iloc[2, 0])  # masked, not the fabricated 0.0
+    assert out.notna().sum().sum() > 0  # mask did not wipe the whole panel
+
+
+# ---------------- filesystem loader vs the bundled module cache ----------------
+
+
+def _wave_panel(n: int = 30) -> dict[str, pd.DataFrame]:
+    """A panel that rises and falls, so cntp5's output is not a constant."""
+    idx = pd.date_range("2024-01-01", periods=n, freq="D")
+    cols = ["X", "Y"]
+    wave = np.sin(np.arange(n, dtype=float)).reshape(n, 1)
+    close = pd.DataFrame(np.repeat(wave, 2, axis=1), index=idx, columns=cols)
+    return {"close": close, "open": close * 0.99}
+
+
+def test_custom_zoo_root_does_not_shadow_the_bundled_module(tmp_path: Path) -> None:
+    """A custom zoo_root must not replace a bundled alpha process-wide (#1465).
+
+    Both roots derive the same ``module_path``
+    (``src.factors.zoo.<zoo>.<short>``), and the filesystem loader registered its
+    module under that bare name in ``sys.modules``. The bundled registry's own
+    ``importlib.import_module`` then returned the custom module, so a default
+    ``Registry()`` silently computed the custom code.
+    """
+    zoo_root = tmp_path / "zoo"
+    (zoo_root / "qlib158").mkdir(parents=True)
+    _write_alpha(
+        zoo_root / "qlib158",
+        "cntp5",
+        "qlib158",
+        body="""
+        import pandas as pd
+
+        def compute(panel):
+            c = panel["close"]
+            return pd.DataFrame(1.0, index=c.index, columns=c.columns)
+        """,
+    )
+
+    module_path = "src.factors.zoo.qlib158.cntp5"
+    previous = sys.modules.get(module_path)
+    try:
+        panel = _wave_panel()
+        # Bundled registry: this imports the real module into sys.modules.
+        bundled = Registry().compute("qlib158_cntp5", panel)
+        # A custom root reusing the same zoo/alpha names must not touch it.
+        # Modules load lazily, so the custom root has to compute for the
+        # collision to happen at all.
+        custom = Registry(zoo_root=zoo_root).compute("qlib158_cntp5", panel)
+        assert (custom.to_numpy() == 1.0).all()  # the custom root did load its file
+        again = Registry().compute("qlib158_cntp5", panel)
+    finally:
+        if previous is None:
+            sys.modules.pop(module_path, None)
+        else:
+            sys.modules[module_path] = previous
+
+    assert not (bundled.to_numpy() == 1.0).all()  # baseline is the real alpha
+    pd.testing.assert_frame_equal(bundled, again)

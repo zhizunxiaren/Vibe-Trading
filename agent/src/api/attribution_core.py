@@ -51,6 +51,7 @@ _ATTRIBUTION_BARS_PER_YEAR_BY_INTERVAL = {
     "1d": 252,
     "d": 252,
     "daily": 252,
+    "1w": 52,
     "1wk": 52,
     "w": 52,
     "weekly": 52,
@@ -95,9 +96,11 @@ def _attribution_bars_per_year(interval: Any) -> int:
     """Infer the annualization factor from the run's bar interval label."""
     if not interval:
         return _ATTRIBUTION_DEFAULT_BARS_PER_YEAR
-    return _ATTRIBUTION_BARS_PER_YEAR_BY_INTERVAL.get(
-        str(interval).strip().lower(), _ATTRIBUTION_DEFAULT_BARS_PER_YEAR
-    )
+    label = str(interval).strip()
+    # The runner's monthly token; lower-cased it would read as one minute.
+    if label == "1M":
+        return 12
+    return _ATTRIBUTION_BARS_PER_YEAR_BY_INTERVAL.get(label.lower(), _ATTRIBUTION_DEFAULT_BARS_PER_YEAR)
 
 
 def _attribution_downsample(
@@ -511,10 +514,22 @@ def _attribution_run_brinson(
 
 
 def _attribution_load_position_weights(run_dir: Path, notes: List[str]) -> Optional[Dict[str, float]]:
-    """Read the last row of ``positions.csv`` as per-symbol weights.
+    """Read the book Brinson should attribute from ``positions.csv``.
 
-    Returns ``None`` (with a skip note) when the artifact is missing or cannot
-    be parsed into at least one weighted symbol column.
+    A run closes every position on its last bar (``end_of_backtest``), so the
+    final row is all zeros by construction and describes the liquidation, not
+    the portfolio. When that row is flat, the row before it is read instead,
+    and the note names its timestamp. Only one row is stepped back: a book that
+    was already flat before the close is reported as flat rather than replaced
+    by some older holding.
+
+    Args:
+        run_dir: Backtest run directory containing ``artifacts/positions.csv``.
+        notes: Report notes; skip and fallback reasons are appended here.
+
+    Returns:
+        Per-symbol weights, or ``None`` (with a skip note) when the artifact is
+        missing or has no weighted symbol column.
     """
     path = run_dir / "artifacts" / "positions.csv"
     try:
@@ -532,12 +547,27 @@ def _attribution_load_position_weights(run_dir: Path, notes: List[str]) -> Optio
     if not symbols:
         notes.append("brinson attribution skipped: positions.csv could not be parsed")
         return None
-    last_row = rows[-1]
-    weights: Dict[str, float] = {}
-    for symbol in symbols:
-        weight = _attribution_finite_float(last_row.get(symbol))
-        weights[symbol] = weight if weight is not None else 0.0
-    return weights
+
+    def _row_weights(row: Dict[str, Any]) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for symbol in symbols:
+            weight = _attribution_finite_float(row.get(symbol))
+            out[symbol] = weight if weight is not None else 0.0
+        return out
+
+    weights = _row_weights(rows[-1])
+    if any(weights.values()) or len(rows) < 2:
+        return weights
+    held = _row_weights(rows[-2])
+    if not any(held.values()):
+        # Flat before the close as well: the downstream zero-check reports it.
+        return weights
+    timestamp = str(rows[-2].get(fieldnames[0]) or "").strip()
+    notes.append(
+        "brinson attribution used the positions row before the end-of-backtest "
+        f"liquidation ({timestamp or 'second-to-last row'})"
+    )
+    return held
 
 
 def _attribution_brinson_section(

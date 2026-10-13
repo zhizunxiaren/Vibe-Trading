@@ -36,6 +36,7 @@ from src.live.runtime.runner import (
     TICK_EXPIRED,
     TICK_HALTED,
     TICK_INVOKED,
+    TICK_MARKET_CLOSED,
     TICK_NO_MANDATE,
     TICK_RECONCILE_ERROR,
     TICK_RECONCILE_UNSAFE,
@@ -157,8 +158,9 @@ def _build_runner(tracker: _OrderTracker, **overrides) -> LiveRunner:
         trip_halt_fn=tracker.trip_halt,
         session_id="live-test",
     )
+    broker = overrides.pop("broker", BROKER)
     kwargs.update(overrides)
-    return LiveRunner(BROKER, **kwargs)
+    return LiveRunner(broker, **kwargs)
 
 
 # --------------------------------------------------------------------------- #
@@ -528,10 +530,69 @@ def test_stop_loop_idempotent() -> None:
     tracker = _OrderTracker()
     sched = _FakeScheduler()
     runner = _build_runner(tracker, scheduler=sched)
-    runner.stop_loop()
+    asyncio.run(runner.stop_loop())
     assert sched.stopped is True
     # No scheduler => no-op, no raise.
-    _build_runner(tracker).stop_loop()
+    asyncio.run(_build_runner(tracker).stop_loop())
+
+
+def test_stop_loop_awaits_the_real_scheduler() -> None:
+    from src.live.runtime.scheduler import Scheduler
+
+    async def scenario() -> None:
+        async def fire(job) -> None:
+            pass
+
+        scheduler = Scheduler(fire)
+        runner = _build_runner(_OrderTracker(), scheduler=scheduler)
+        scheduler.start()
+        task = scheduler._task
+        await runner.stop_loop()
+        assert task.done()
+        assert scheduler._task is None
+        await runner.stop_loop()
+
+    asyncio.run(scenario())
+
+
+def test_default_job_stores_keep_each_brokers_cadence_separate(tmp_path, monkeypatch) -> None:
+    from src.live import paths
+    from src.live.runtime.triggers import Trigger
+
+    monkeypatch.setattr(paths, "get_runtime_root", lambda: tmp_path)
+    first, second = _FakeScheduler(), _FakeScheduler()
+    _build_runner(_OrderTracker(), broker="robinhood", scheduler=first,
+                  triggers=[Trigger.interval(30_000)]).run_loop()
+    _build_runner(_OrderTracker(), broker="alpaca", scheduler=second,
+                  triggers=[Trigger.interval(90_000)]).run_loop()
+    assert [job.schedule for job in first.jobs] == ["interval:30000"]
+    assert [job.schedule for job in second.jobs] == ["interval:90000"]
+    assert all(job.payload["broker"] == "alpaca" for job in second.jobs)
+    restarted = _FakeScheduler()
+    _build_runner(_OrderTracker(), broker="robinhood", scheduler=restarted,
+                  triggers=[Trigger.interval(120_000)]).run_loop()
+    assert [job.schedule for job in restarted.jobs] == ["interval:30000"]
+
+
+def test_default_job_store_migrates_only_its_own_legacy_jobs(tmp_path, monkeypatch) -> None:
+    from src.live import paths
+    from src.live.runtime.jobstore import JobStore
+    from src.live.runtime.scheduler import Job
+    from src.live.runtime.triggers import Trigger
+
+    monkeypatch.setattr(paths, "get_runtime_root", lambda: tmp_path)
+    legacy = JobStore()
+    legacy.save([
+        Job("robinhood-watch", 1, "interval:5000", {"broker": "robinhood"}),
+        Job("alpaca-watch", 2, "interval:6000", {"broker": "alpaca"}),
+        Job("unbound", 3, "interval:7000"),
+    ])
+    for broker, expected in [("robinhood", "robinhood-watch"), ("alpaca", "alpaca-watch")]:
+        scheduler = _FakeScheduler()
+        _build_runner(_OrderTracker(), broker=broker, scheduler=scheduler,
+                      triggers=[Trigger.interval(30_000)]).run_loop()
+        assert [job.id for job in scheduler.jobs] == [expected]
+    assert len(legacy.load()) == 3
 
 
 # --------------------------------------------------------------------------- #
@@ -543,7 +604,7 @@ def test_real_audit_write_on_halt(monkeypatch, tmp_path) -> None:
     # Isolate the runtime root so the real ledger lands under tmp.
     monkeypatch.setattr("src.config.paths.Path.home", lambda: tmp_path)
     from src.live.audit import audit_ledger_path, write_live_action
-    from src.live.halt import halt_flag_set, trip_halt
+    from src.live.halt import trip_halt
 
     tracker = _OrderTracker()
     runner = LiveRunner(
@@ -566,3 +627,58 @@ def test_real_audit_write_on_halt(monkeypatch, tmp_path) -> None:
     ledger = audit_ledger_path()
     assert ledger.exists()
     assert "halt_tripped" in ledger.read_text(encoding="utf-8")
+
+
+def test_market_trigger_skips_tick_when_market_closed() -> None:
+    # _FIXED_NOW is Monday 08:00 ET, before the 09:30 bell. A market-triggered
+    # tick must not trade into a closed session.
+    from src.live.runtime.triggers import Trigger
+
+    tracker = _OrderTracker()
+    runner = _build_runner(tracker, triggers=[Trigger.market("us_equity")])
+    result = asyncio.run(runner.run_once())
+
+    assert result["outcome"] == TICK_MARKET_CLOSED
+    # Stops before reconcile: no broker reads, no invoke, no audit spam.
+    assert tracker.calls == ["halt", "mandate"]
+    assert tracker.audits == []
+
+
+def test_market_trigger_ticks_when_market_open() -> None:
+    from src.live.runtime.triggers import Trigger
+
+    tracker = _OrderTracker()
+    # Tuesday 10:30 ET, mid-session.
+    open_now = datetime(2026, 6, 2, 14, 30, 0, tzinfo=timezone.utc)
+    runner = _build_runner(
+        tracker, triggers=[Trigger.market("us_equity")], clock=lambda: open_now
+    )
+    result = asyncio.run(runner.run_once())
+
+    assert result["outcome"] == TICK_INVOKED
+    assert "invoke" in tracker.calls
+
+
+def test_market_gate_open_when_any_market_trigger_is_open() -> None:
+    from src.live.runtime.triggers import Trigger
+
+    tracker = _OrderTracker()
+    # us_equity closed at _FIXED_NOW, crypto is 24/7: the union stays open.
+    runner = _build_runner(
+        tracker,
+        triggers=[Trigger.market("us_equity"), Trigger.market("crypto")],
+    )
+    result = asyncio.run(runner.run_once())
+
+    assert result["outcome"] == TICK_INVOKED
+
+
+def test_interval_only_runner_ignores_the_market_gate() -> None:
+    from src.live.runtime.triggers import Trigger
+
+    tracker = _OrderTracker()
+    runner = _build_runner(tracker, triggers=[Trigger.interval(30_000)])
+    result = asyncio.run(runner.run_once())
+
+    assert result["outcome"] == TICK_INVOKED
+    assert "invoke" in tracker.calls

@@ -76,6 +76,11 @@ Iron Condor opening signal:
 }
 ```
 
+Ready-made engines for covered call, cash-secured put, iron condor,
+vol-gated short strangle and protective put live in
+`example_signal_engine.py` next to this file. Backtest results and their
+caveats are in `docs/sessions/2026-10-09_options_strategy_candidates.md`.
+
 ## `config.json` Format
 
 ```json
@@ -90,7 +95,9 @@ Iron Condor opening signal:
     "options_config": {
         "risk_free_rate": 0.05,
         "iv_source": "historical",
-        "contract_multiplier": 1.0
+        "contract_multiplier": 1.0,
+        "same_day_fill": false,
+        "default_iv": 0.3
     }
 }
 ```
@@ -100,6 +107,8 @@ Key fields:
 - `options_config.risk_free_rate`: risk-free rate, default `0.05`
 - `options_config.iv_source`: volatility source, currently supports `"historical"` (30-day rolling historical volatility computed from underlying closes)
 - `options_config.contract_multiplier`: contract multiplier, default `1.0`
+- `options_config.same_day_fill`: `false` (default) fills a signal dated T on the next bar's close; `true` restores the legacy same-date fill (signal and fill share T's close and IV)
+- `options_config.default_iv`: volatility used for bars without a full rolling window (warm-up and NaN gaps), default `0.3`; must be finite and positive
 
 ## BS Model Principles
 

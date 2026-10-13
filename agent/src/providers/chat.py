@@ -21,6 +21,33 @@ from src.providers.llm import build_llm
 
 logger = logging.getLogger(__name__)
 
+_PROMPT_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral"}
+_DIRECT_ANTHROPIC_LLM_TYPE = "anthropic-chat"
+
+
+def prompt_cache_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return a message list whose leading system string carries a cache breakpoint.
+
+    The system prompt is the end of the static prefix (tools render before it),
+    so a breakpoint there gives that prefix a guaranteed cache read point even
+    when later messages are edited by context compression. Anything other than
+    a leading ``{"role": "system", "content": <non-empty str>}`` is returned
+    unchanged, and the caller's list is never mutated.
+    """
+    if not messages:
+        return messages
+    first = messages[0]
+    if not isinstance(first, dict) or first.get("role") != "system":
+        return messages
+    content = first.get("content")
+    if not isinstance(content, str) or not content:
+        return messages
+    cached = dict(first)
+    cached["content"] = [
+        {"type": "text", "text": content, "cache_control": dict(_PROMPT_CACHE_CONTROL)}
+    ]
+    return [cached, *messages[1:]]
+
 
 def _dedupe_finish_reason(raw: str) -> str:
     """Relays (OpenRouter) emit finish_reason per chunk; AIMessageChunk.__add__
@@ -113,6 +140,9 @@ class LLMResponse:
         response_model: Model identifier reported by the provider response,
             when available. This is authoritative runtime metadata and must
             not be inferred from the model's natural-language self-report.
+        provider_items: Opaque output items the provider needs back verbatim
+            on the next request of the same turn chain (the Codex backend's
+            encrypted reasoning items). Never shown, never summarised.
     """
 
     content: Optional[str] = None
@@ -122,11 +152,28 @@ class LLMResponse:
     usage_metadata: Optional[Dict[str, int]] = None
     content_filter_triggered: bool = False
     response_model: Optional[str] = None
+    provider_items: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def has_tool_calls(self) -> bool:
         """Return True if the response contains tool calls."""
         return len(self.tool_calls) > 0
+
+
+def _extract_retry_after_s(original: Exception) -> Optional[float]:
+    """Return the provider-suggested Retry-After delay in seconds, if any."""
+    response = getattr(original, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    raw = headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0.0 else None
 
 
 class ProviderStreamError(RuntimeError):
@@ -139,11 +186,17 @@ class ProviderStreamError(RuntimeError):
             provider: Effective provider name.
             model: Effective model name.
             original: Original exception from the stream path.
+
+        Attributes:
+            retry_after_s: Provider-suggested Retry-After delay in seconds,
+                extracted from the original exception's response headers when
+                present and parseable as a non-negative number; otherwise None.
         """
         self.provider = provider
         self.model = model
         self.original = original
         self.status_code: Optional[int] = getattr(original, "status_code", None)
+        self.retry_after_s: Optional[float] = _extract_retry_after_s(original)
         safe_message = _redact_provider_error(str(original))
         hint = ""
         lowered = safe_message.lower()
@@ -348,6 +401,26 @@ class ChatLLM:
             except Exception:
                 logger.debug("ChatLLM.aclose: failed to close %s", label, exc_info=True)
 
+    def _prompt_cache_request(
+        self, messages: List[Dict[str, Any]]
+    ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Return the messages and call kwargs to send, with cache markers when they apply.
+
+        Markers are added only for the direct Anthropic adapter, only when the
+        flag is on, and only when the request carries a leading system prompt:
+        one explicit breakpoint on that block plus the top-level automatic one.
+        One-shot calls without a system prompt (context compaction, image
+        vision, title generation) are sent unchanged.
+        """
+        if getattr(self._llm, "_llm_type", None) != _DIRECT_ANTHROPIC_LLM_TYPE:
+            return messages, {}
+        if get_env_config().llm.vibe_trading_anthropic_prompt_cache is not True:
+            return messages, {}
+        prepared = prompt_cache_messages(messages)
+        if prepared is messages:
+            return messages, {}
+        return prepared, {"cache_control": dict(_PROMPT_CACHE_CONTROL)}
+
     def _close_candidates(self) -> list[tuple[str, Any]]:
         """Return unique clients this wrapper is responsible for closing."""
         llm = self._llm
@@ -407,7 +480,8 @@ class ChatLLM:
         """
         llm = self._llm.bind_tools(tools) if tools else self._llm
         config = {"timeout": timeout} if timeout else {}
-        ai_message = llm.invoke(messages, config=config)
+        messages, call_kwargs = self._prompt_cache_request(messages)
+        ai_message = llm.invoke(messages, config=config, **call_kwargs)
         return self._parse_response(ai_message)
 
     def stream_chat(
@@ -445,12 +519,13 @@ class ChatLLM:
         try:
             llm = self._llm.bind_tools(tools) if tools else self._llm
             config = {"timeout": timeout} if timeout else {}
+            messages, call_kwargs = self._prompt_cache_request(messages)
             accumulated = None
             pending_text = ""
             possible_dsml_text = True
             cancelled = False
             last_chunk_ts = _time.monotonic()
-            for chunk in llm.stream(messages, config=config):
+            for chunk in llm.stream(messages, config=config, **call_kwargs):
                 now = _time.monotonic()
                 if idle_timeout_s and now - last_chunk_ts > idle_timeout_s:
                     # No delta for too long: the provider is stalled, not
@@ -488,7 +563,7 @@ class ChatLLM:
                     "Provider stream returned no chunks; falling back to "
                     "non-streaming invoke."
                 )
-                return self.chat(messages, tools=tools, timeout=timeout)
+                return self._parse_response(llm.invoke(messages, config=config, **call_kwargs))
             response = self._parse_response(accumulated)
             if pending_text and not (response.has_tool_calls and response.content == ""):
                 on_text_chunk(pending_text)
@@ -502,7 +577,7 @@ class ChatLLM:
                     "non-streaming invoke.",
                     type(exc).__name__,
                 )
-                return self.chat(messages, tools=tools, timeout=timeout)
+                return self._parse_response(llm.invoke(messages, config=config, **call_kwargs))
             _cfg = get_env_config()
             provider = _cfg.llm.langchain_provider.strip().lower() or "openai"
             model = self.model_name or _cfg.llm.langchain_model_name.strip() or "(unset)"
@@ -623,6 +698,7 @@ class ChatLLM:
             usage_metadata=usage,
             content_filter_triggered=content_filter_triggered,
             response_model=response_model,
+            provider_items=list(additional_kwargs.get("provider_items") or []),
         )
 
 
