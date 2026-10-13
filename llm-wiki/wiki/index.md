@@ -10,3 +10,8 @@ This index catalogs LLM-maintained project knowledge. Read this file first when 
 ## Operations
 
 - [Log](log.md) - chronological record of wiki ingests, maintenance, and notable updates.
+
+## Session Reports
+
+- [2026-07-27: Session analysis report convention](session-reports/2026-07-27-185953-session-analysis-report-convention.md) - establishes the requirement and storage convention for per-session Markdown analysis reports.
+- [2026-08-25: Fork sync & upstream merge](session-reports/2026-08-25-142315-fork-sync-merge.md) - synced local main to upstream, merged upstream into alphadev via upstream-priority strategy; push pending manual execution.

@@ -13,6 +13,7 @@ Uses progressive disclosure at two levels:
 
 from __future__ import annotations
 
+import re  # merge 修复: -X theirs 冲突块合并时丢失, 193/198 行 re.compile 依赖
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
