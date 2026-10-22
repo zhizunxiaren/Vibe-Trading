@@ -62,6 +62,8 @@ top-level TS declarations; 111 routes with 0 duplicate registrations; 870 tests
 passing. Remaining local failures (16 claude-cli, 10 channels, 1 registry) were
 diagnosed as environment-only — Windows cannot execute the extension-less fake
 CLI, and `nh3` / `slack_sdk` / optional loader deps are absent from the venv.
-Recorded the session report
+Pushed `alphadev` to `origin` (`b889d112..bb6c9637`) after pinning the GitHub
+account for GCM — two stored accounts made it prompt and block past the command
+timeout. Recorded the session report
 `session-reports/2026-10-22-115326-fork-sync-upstream-v0-1-18.md` and updated the
-wiki index. Push to `origin` remains a user decision.
+wiki index.
