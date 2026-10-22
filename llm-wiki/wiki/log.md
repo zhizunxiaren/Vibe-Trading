@@ -38,3 +38,30 @@ While verifying, found and fixed four duplicate-declaration defects that the
 `frontend/package-lock.json`. Recorded the session report
 `session-reports/2026-10-13-142132-main-to-alphadev-sync.md` and updated the
 wiki index. Push to `origin` remains a user decision.
+
+## [2026-10-22] maintenance | Sync upstream v0.1.18 into alphadev
+
+Merged `upstream/main` (`11cff3f3`, v0.1.18, force-pushed, 438 commits since
+merge base `026deaa97a`) into `alphadev` as `7d7f074a`, resolving 52 conflicted
+files / 101 hunks with a plain merge and no `-X` strategy; rollback branch
+`backup/alphadev-presync-66060c59`. `alphadev` is now 542 ahead / 0 behind
+upstream. Restored two test files that had unexplained working-tree deletions.
+
+The merge's important finding: `agent/api_server.py` reported **no conflict**
+but was semantically broken. Upstream had split the 1474-line monolith into a
+345-line assembler plus 32 `src/api/*_routes.py` modules; git combined it into
+1427 lines that kept the fork's inline routes while taking upstream's import
+line, which dropped `Depends` and made the module unimportable. The file now
+takes the upstream assembler verbatim, and the fork-local analytics/ranking
+endpoints (`0e3714de`) moved to a new `src/api/analytics_routes.py` with
+`register_analytics_routes(app, require_auth)`, re-exporting
+`_connect_ranking_db` for the existing test seam.
+
+Verification: 3886 Python files parse; no conflict markers; no duplicate
+top-level TS declarations; 111 routes with 0 duplicate registrations; 870 tests
+passing. Remaining local failures (16 claude-cli, 10 channels, 1 registry) were
+diagnosed as environment-only — Windows cannot execute the extension-less fake
+CLI, and `nh3` / `slack_sdk` / optional loader deps are absent from the venv.
+Recorded the session report
+`session-reports/2026-10-22-115326-fork-sync-upstream-v0-1-18.md` and updated the
+wiki index. Push to `origin` remains a user decision.
