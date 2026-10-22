@@ -21,6 +21,38 @@ agent run or its SSE stream. Factor submissions are the exception to the write
 retry rule: the Web UI reuses a request ID, and the server returns the existing
 job for an identical submission instead of starting another worker.
 
+## Runtime cost and evidence handling
+
+The agent exposes tool schemas on demand for registries of at least 16 tools.
+The system prompt retains the complete catalog; `load_tools` only reveals exact
+schemas and never executes a domain tool or changes its permissions. Schema
+state belongs to one question and contributes to measured context usage.
+`VIBE_TRADING_TOOL_LOADING=eager` restores full schemas for provider compatibility.
+The discovery policy is packaged in `src/agent/tool_loading.json`.
+
+A direct lookup uses its tool contract. A normal backtest reports results,
+validation warnings and limitations; additional attribution or optimization
+follows the user's request. Existing numerical grounding and live order gates
+remain in place. Web chat still generates a model-written summary title after
+the first completed exchange, without overwriting a manual rename.
+
+Large tool results are redacted and saved under the current run's `tool-results/`
+when its tools can read the files. The bounded receipt names the original file
+and readable parts; it does not imply that a sampled upstream response is complete.
+Read failures retain explicit truncation rather than advertising an unavailable
+file. Swarm uses the same model-window/context ceiling as the main agent and
+saves old observations under pressure only after a successful request has seen
+them. It stops if the next request still cannot fit. These files are run artifacts,
+not a persistent market-data cache.
+
+`llm_usage.json` includes provider-reported compaction, cancelled-response and
+failed-stream usage. Auxiliary calls carry a `purpose`; `call_index` distinguishes
+several calls in one iteration. Unavailable usage is emitted explicitly rather
+than reported as zero. A goal's token budget stops further model/tool work once
+reported usage reaches the limit; the last in-flight response can exceed it.
+`LANGCHAIN_MAX_TOKENS` remains an optional output cap and is forwarded by both
+DeepSeek adapters without changing the model or reasoning settings.
+
 ## Specialized analysis
 
 In Factor Research, select one factor to evaluate only that factor, or several
@@ -31,6 +63,9 @@ credentials and access; fundamental factors use US SEC data with point-in-time
 filing dates and require the S&P 500 universe. Results report observed coverage,
 missing symbols and current-constituent survivorship bias. A first large-universe
 download can take minutes; later evaluations reuse the existing panel cache.
+
+Factor benchmarks skip alphas with fewer than two IC observations and report
+the reason. They do not rank an unestimable sample standard deviation as zero.
 
 Analysis drafts and completed results survive navigation and reload in the same
 browser tab. Factor progress reports data loading separately from computation;
@@ -50,10 +85,36 @@ optional dependencies before retrying. Explicit-only sources retain their
 existing currency and fallback boundaries. Missing observations are never
 replaced with invented prices or financial fields.
 
+Standalone revalidation reuses the annualisation factor saved in the run card,
+including the runner's corrections for actual bar spacing. For older cards
+without that field, it reconstructs the factor from the saved configuration and
+equity timestamps; the original per-symbol price indexes are not available.
+
 For AI-assisted or automation-assisted contributions, also see
 [`AGENT_CONTRIBUTOR_GUIDE.md`](AGENT_CONTRIBUTOR_GUIDE.md). It summarizes safe
 local checks, higher-risk broker/MCP/credential surfaces, and the expected PR
 risk notes for agent-authored changes.
+
+## Keep internal documents local
+
+The repository-root `docs/` directory holds local working notes and must not
+be committed. Local agent instructions and memory files (`AGENTS.md`,
+`AGENTS.override.md`, `CLAUDE.md`, `CLAUDE.local.md`, `MEMORY.md`,
+`CODEX_MEMORY.md`, and `NOTES.md`) must also remain untracked at any depth.
+Publish project documentation in `wiki/docs/` or the relevant source directory.
+
+Before committing, run:
+
+```bash
+python tools/ci_private_files_gate.py
+```
+
+This check also runs through `bash tools/ci_grep_gates.sh` in CI on pushes and
+pull requests. It reads the Git index, so force-adding an ignored document is
+still rejected; ignored local files and public documentation are allowed.
+It prints filenames only, never document contents. If a file was accidentally
+staged, use `git rm --cached -- <path>` to stop tracking it while preserving the
+local copy. This does not erase copies in previous commits.
 
 ## Developer Certificate of Origin (DCO)
 
@@ -311,3 +372,39 @@ is broken: runner geography, holidays and upstream changes need checking.
 The 14-day window is a coarse freshness alarm, not a market-calendar guarantee.
 Reports are retained for 30 days. No authenticated source or broker order path
 is exercised.
+
+
+### Grounding checks
+
+`agent/src/agent/grounding/registry.py` declares each check's stable name,
+issue codes, severity and execution phase. The gate walks identity, answer,
+declaration, per-figure role and price-provenance checks in their original
+order. All production checks currently block; `warn` and `log` findings are
+recorded without changing the verdict. Severity is separate from the repair,
+recovery and redaction decisions in `release.py`.
+
+Add a predicate and registration, then a passing/failing answer pair in
+`tests/test_grounding_registry.py`. The pair catalog is checked against the
+runtime registry. Use sparse evidence fixtures. Validation artifacts retain
+`fired_checks` and `check_findings` (name, severity, findings) from actual
+predicate execution; shared issue codes do not imply that other roles fired.
+Run the grounding suites before changing a predicate or its ordering.
+
+
+### Agent loop boundaries
+
+`src/agent/loop.py` owns the iteration and run lifecycle. Keep changes in the
+module that owns the behavior: `tool_lifecycle.py` owns authorization, caches,
+read/write batching, tool timeouts and result recording; `loop_streaming.py`
+owns each response's buffers and progress callbacks; `loop_grounding.py` owns
+the existing final-draft repair/recovery/revision/release sequence. Grounding
+policy stays in `grounding/`, and compaction transforms, usage accounting and
+write-target tracking keep their existing dedicated modules.
+
+The tool lifecycle shares the loop's run-scoped state; it must not grow a
+second cache or ledger. A grounding decision returns correction state and
+whether the loop should retry. Stream state resets at each iteration and
+retains the existing one-retry behavior. When moving a helper, update tests
+to patch the module where it executes; re-exported names preserve imports,
+not monkeypatch propagation. Verify the existing loop, stream, cancellation,
+compaction and grounding suites after an extraction.

@@ -1,7 +1,7 @@
 """Forward attempt status to IM adapters without releasing unchecked answers."""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from src.channels.bus.events import InboundMessage, OutboundMessage
 
@@ -10,17 +10,20 @@ class AttemptProgress:
     """Poll buffered session events with an attempt-scoped replay cursor."""
 
     def __init__(self, bus: Any, event_bus: Any, msg: InboundMessage,
-                 session_id: str, attempt_id: str) -> None:
+                 session_id: str, attempt_id: str,
+                 is_visible: Callable[..., bool] | None = None) -> None:
         self.bus = bus
         self.events = event_bus
         self.msg = msg
         self.session_id = session_id
         self.attempt_id = attempt_id
+        self.is_visible = is_visible
         self.cursor: str | None = None
         self.streaming = bool(msg.metadata.get("_wants_stream"))
         self.stream_started = False
         self.reasoning_started = False
         self.last_status = ""
+        self.reasoning_chars: dict[int, int] = {}
 
     async def _send(self, content: str, **flags: Any) -> None:
         await self.bus.publish_outbound(OutboundMessage(
@@ -39,26 +42,41 @@ class AttemptProgress:
                 continue
             kind = event.event_type
             if kind == "reasoning_delta":
-                delta = data.get("delta", "")
-                if delta:
+                iteration = int(data.get("iter", 0))
+                chars = int(data.get("chars", 0))
+                seen = self.reasoning_chars.get(iteration, 0)
+                self.reasoning_chars[iteration] = max(seen, chars)
+                # AgentLoop emits a bounded cumulative tail, not a delta.
+                # A missing tail is deliberate grounding redaction: show only
+                # a status, never reconstruct text from any other payload.
+                tail = data.get("tail")
+                if isinstance(tail, str) and chars > seen and tail:
                     self.reasoning_started = True
-                    await self._send(str(delta), _reasoning_delta=True)
-                continue
+                    await self._send(tail[-min(chars - seen, len(tail)):], _reasoning_delta=True)
+                    continue
+                if tail is not None or chars <= seen:
+                    continue
             if kind in {"tool_call", "grounding_status", "attempt.completed", "attempt.failed"}:
                 await self._end_reasoning()
             tool = str(data.get("tool") or "tool")
             status = {
                 "attempt.created": "Working on your request…",
+                "reasoning_delta": "Reasoning…",
+                "llm_waiting": "Waiting for the model…",
                 "tool_call": f"Using {tool}…",
                 "tool_heartbeat": f"Still running {tool}…",
                 "grounding_status": "Checking the figures…",
             }.get(kind)
             # Arbitrary progress payloads, tool results and text_delta may
             # contain unvalidated figures. Only these status labels go out.
+            hint = kind in {"tool_call", "tool_heartbeat"}
             if not status or status == self.last_status:
                 continue
+            # A status the channel hides must not become last_status, or the
+            # next visible repeat of the previous status is not deduped.
+            if self.is_visible is not None and not self.is_visible(tool_hint=hint):
+                continue
             self.last_status = status
-            hint = kind in {"tool_call", "tool_heartbeat"}
             flags = {"_progress": True, "_tool_hint": hint}
             if self.streaming:
                 flags["_stream_delta"] = True

@@ -1,10 +1,11 @@
 {
   "app": {
-    "version": "v0.1.16"
+    "version": "v0.1.18"
   },
   "charts": {
     "noPriceData": "Belum ada data harga untuk simbol ini",
     "noCorrelationData": "Pilih setidaknya dua simbol untuk dibandingkan",
+    "correlationUndefined": "belum terdefinisi (tidak ada variasi harga pada jendela)",
     "noEquityData": "Belum ada kurva nilai akun — jalankan backtest terlebih dahulu"
   },
   "navigation": {
@@ -26,7 +27,9 @@
       "correlation": "Bandingkan hubungan pergerakan aset.",
       "scheduled": "Ulangi tugas riset sesuai jadwal.",
       "runtime": "Periksa koneksi broker dan status pelaksanaan perdagangan.",
-      "settings": "Atur model, sumber data, dan koneksi broker."
+      "settings": "Atur model, sumber data, dan koneksi broker.",
+      "pixelOffice": "Rencanakan dan tugaskan riset. Penugasan tidak memulai eksekusi; pangkat hanya label dan tidak memberikan izin transaksi.",
+      "paperTrading": "Uji transaksi harian dengan dana virtual. Tidak ada pesanan yang dikirim ke broker. Hasil tidak mencakup dividen tunai dan bukan imbal hasil total."
     },
     "instructions": {
       "reports": "Minta asisten melakukan backtest strategi terlebih dahulu, lalu buka hasilnya di sini. Unduh PDF dan dokumen yang dibuat di chat dari percakapan asal.",
@@ -36,7 +39,9 @@
       "correlation": "Masukkan setidaknya dua simbol aset, pilih periode, lalu klik Hitung.",
       "scheduled": "Isi instruksi riset, pilih frekuensi, dan simpan. Penjadwal lokal harus diaktifkan agar tugas berjalan; pengiriman juga memerlukan kanal yang telah diatur.",
       "runtime": "Atur koneksi broker di Pengaturan atau Portofolio terlebih dahulu. Tindakan perdagangan yang tersedia bergantung pada kemampuan broker dan otorisasi Anda.",
-      "settings": "Atur model untuk memulai. Tambahkan data atau koneksi broker sesuai kebutuhan; riset data pasar publik tidak memerlukan akun broker."
+      "settings": "Atur model untuk memulai. Tambahkan data atau koneksi broker sesuai kebutuhan; riset data pasar publik tidak memerlukan akun broker.",
+      "pixelOffice": "Rencanakan dan tugaskan riset. Penugasan tidak memulai eksekusi; pangkat hanya label dan tidak memberikan izin transaksi.",
+      "paperTrading": "Hanya candle harian yang selesai dapat diproses. Strategi membaca hari sebelumnya dan dieksekusi pada penutupan hari eksekusi. Tunggu 30 menit setelah penutupan reguler; tidak ada eksekusi otomatis yang dijadwalkan."
     }
   },
   "layout": {
@@ -66,13 +71,15 @@
     "sidebar": "Sidebar Vibe-Trading",
     "mainNavigation": "Navigasi utama",
     "about": "Tentang",
-    "sessionsLoadFailed": "Percakapan tidak dapat dimuat."
+    "sessionsLoadFailed": "Percakapan tidak dapat dimuat.",
+    "pixelOffice": "Kantor piksel",
+    "paperTrading": "Trading simulasi"
   },
   "runtime": {
     "monitorBadge": "Monitor Runtime",
     "title": "Status Runtime Live / Paper",
-    "subtitlePre": "Status read-only dari",
-    "subtitlePost": ". Halaman ini tidak mengotorisasi connector, menjalankan Runner, menghentikan Runner, mengirim order, membatalkan order, atau mengubah mandat.",
+    "subtitlePre": "Lihat status konektor, mandat perdagangan, dan aktivitas Runner.",
+    "subtitlePost": " Frekuensi keputusan model dan batas pengeluaran dapat diubah saat Runner berhenti.",
     "refresh": "Segarkan",
     "unavailableTitle": "Status runtime tidak tersedia",
     "unavailableHint": "Anggap runtime connector tidak tersedia sampai backend memberikan snapshot status terbaru.",
@@ -112,7 +119,7 @@
     "riskHalted": "risiko dihentikan",
     "riskHaltedDesc": "Penghentian darurat aktif untuk profil ini. Anggap runtime connector berhenti sampai status kembali normal.",
     "riskActive": "runtime aktif",
-    "riskActiveDesc": "Runner aktif dan terdapat mandat yang belum kedaluwarsa. Halaman ini tetap hanya menampilkan status read-only.",
+    "riskActiveDesc": "Runner aktif dan mandat perdagangannya masih berlaku.",
     "riskIdle": "siap tetapi idle",
     "riskIdleDesc": "Otorisasi dan mandat tersedia, tetapi Runner tidak aktif.",
     "riskDormant": "tidak aktif",
@@ -240,16 +247,16 @@
     "deliveryChannelPlaceholder": "telegram, feishu, … (kosongkan agar hasil tetap di aplikasi)",
     "deliveryTargetLabel": "Target channel",
     "deliveryTargetPlaceholder": "ID chat / grup / pengguna",
-    "deliveryFormatLabel": "Email report format",
-    "deliveryFormatDefault": "Channel default (plain text)",
-    "deliveryFormatHtml": "HTML email",
-    "deliveryFormatPdf": "PDF attachment",
+    "deliveryFormatLabel": "Format laporan email",
+    "deliveryFormatDefault": "Bawaan saluran (teks biasa)",
+    "deliveryFormatHtml": "Email HTML",
+    "deliveryFormatPdf": "Lampiran PDF",
     "proposalPdfProtection": "Perlindungan PDF dengan kata sandi",
     "proposalPdfProtectionOn": "Aktif",
     "proposalPdfProtectionOff": "Nonaktif",
-    "deliveryFormatDefaultHint": "Keeps the existing plain-text delivery behavior.",
-    "deliveryFormatHtmlHint": "Shows the full report as sanitized HTML in the email body.",
-    "deliveryFormatPdfHint": "Attaches the full report as PDF and keeps only a short notice in the body.",
+    "deliveryFormatDefaultHint": "Mempertahankan perilaku pengiriman teks biasa yang ada.",
+    "deliveryFormatHtmlHint": "Menampilkan laporan lengkap sebagai HTML yang sudah disanitasi di isi email.",
+    "deliveryFormatPdfHint": "Melampirkan laporan lengkap sebagai PDF dan hanya menyisakan pemberitahuan singkat di isi email.",
     "deliveryHint": "Nonaktif secara default. Ringkasan dikirim setelah run selesai, bukan saat dijadwalkan.",
     "deliveryTargetRequired": "Pilih target untuk channel tersebut, atau kosongkan channel.",
     "delivery_none": "Akan dikirim ke {{channel}} setelah run berikutnya",
@@ -396,7 +403,10 @@
       "shadowDeltaPrompt": "Jalankan shadow backtest untuk 90 hari terakhir dan uraikan di mana PnL saya berbeda dari shadow (pelanggaran aturan, exit terlalu cepat, sinyal terlewat)",
       "shadowReport": "Buat Shadow Report",
       "shadowReportDesc": "Laporan 8 bagian yang dapat dibagikan: kurva akun Anda, return yang disesuaikan terhadap risiko, dan sumber setiap keuntungan",
-      "shadowReportPrompt": "Render shadow report dan berikan URL-nya — mulai dengan delta Anda vs shadow"
+      "shadowReportPrompt": "Render shadow report dan berikan URL-nya — mulai dengan delta Anda vs shadow",
+      "adaptStrategy": "Adaptasi strategi terdaftar",
+      "adaptStrategyDesc": "Pertahankan sinyal, uji semesta baru",
+      "adaptStrategyPrompt": "Bantu saya mengadaptasi strategi terdaftar ke semesta dan rentang tanggal baru. Daftar strategi dan periksa bukti induknya terlebih dahulu; tanyakan ID, instrumen, tanggal, dan ukuran posisi yang belum ada. Pertahankan sinyal, buat kode turunan, jalankan backtest, dan laporkan hanya bukti terbaru milik strategi turunan."
     },
     "taskSubtitle": "Tanyakan tentang saham, strategi, atau portofolio Anda — saya akan mengambil data, menghitung angkanya, dan menampilkan setiap langkah.",
     "quickActions": "Aksi cepat",
@@ -1107,7 +1117,7 @@
     "authentication": "Autentikasi",
     "apiKey": "API key",
     "tushareTokenDesc": "Digunakan untuk data A-share China, futures, fund, dan makro. Jika tidak diatur, proyek akan menggunakan AKShare sebagai fallback jika tersedia.",
-    "gildataTokenDesc": "Feed Gildata (Hundsun Juyuan) opsional untuk A-share China. Jika diatur, feed ini bergabung di ujung chain fallback A-share dengan bar harian forward-adjusted."
+    "gildataTokenDesc": "Data Gildata opsional: harga harian saham A yang disesuaikan, harga mentah saham Hong Kong/indeks, NAB reksa dana di luar bursa, serta alat makroekonomi, pengumuman, dan riset Tiongkok."
   },
   "qveris": {
     "title": "Marketplace Tool QVeris",
@@ -1227,7 +1237,10 @@
     "resumeConnector": "Lanjutkan connector",
     "resumeConnectorTitle": "Nonaktifkan penghentian darurat dan aktifkan kembali aktivitas connector",
     "connectorResumed": "Connector dilanjutkan",
-    "failedToResumeConnector": "Gagal melanjutkan connector."
+    "failedToResumeConnector": "Gagal melanjutkan connector.",
+    "tokenUsage": {
+      "live": "token"
+    }
   },
   "runDetail": {
     "title": "Detail Run",
@@ -1360,6 +1373,19 @@
     "ddNotRecovered": "Belum pulih",
     "ddDays": "{{count}} hari",
     "dashboard": "Dashboard Riset",
+    "llmUsage": {
+      "tab": "Pemakaian token",
+      "provider": "Penyedia",
+      "model": "Model",
+      "inputTokens": "Token input",
+      "outputTokens": "Token output",
+      "totalTokens": "Total token",
+      "calls": "Jumlah panggilan",
+      "cacheRead": "Token baca cache",
+      "cacheCreation": "Token pembuatan cache",
+      "perIteration": "Rincian per iterasi",
+      "iteration": "Iterasi"
+    },
     "positions": {
       "tab": "Posisi",
       "weightDistribution": "Distribusi bobot",
@@ -1832,7 +1858,10 @@
     "output": "Output",
     "waitingForEvents": "Menunggu event dari Agent...",
     "teamStarting": "Tim sedang dimulai — update pertama akan muncul dalam beberapa detik…",
-    "detailsUnavailable": "detail tidak tersedia"
+    "detailsUnavailable": "detail tidak tersedia",
+    "tokens": "↑{{input}} ↓{{output}} token",
+    "estimated": "estimasi",
+    "tokenSourceUnlabeled": "sumber tanpa label"
   },
   "mandate": {
     "runtimeMandate": "Mandat runtime connector",
@@ -2131,7 +2160,7 @@
       "badge": "Read-only lokal · Multi-akun",
       "title": "Portofolio",
       "subtitle": "Satu valuasi untuk semua koneksi read-only yang aktif. Akun yang tidak dapat dibaca akan dilaporkan sebagai error dan tidak disertakan dalam total.",
-      "fxFresh": "USD/CNY {{rate}} · kurs live",
+      "fxFresh": "USD/CNY {{rate}} · kurs referensi",
       "fxCached": "USD/CNY {{rate}} · kurs cache",
       "manageAccounts": "Kelola akun",
       "exportCsv": "Ekspor CSV",
@@ -2296,6 +2325,30 @@
       "accountDeactivated": " · dinonaktifkan",
       "accountSave": "Gunakan akun ini",
       "accountSaved": "Akun tersimpan."
+    },
+    "imports": {
+      "title": "Impor extraETF Investments",
+      "hint": "Hanya kepemilikan, tanpa kas atau harga langsung. Waktu perubahan berkas bukan waktu pengamatan harga; tempat perdagangan ISIN belum teridentifikasi.",
+      "file": "CSV Investments",
+      "count": "Jumlah kepemilikan yang diharapkan (konfirmasi di extraETF)",
+      "age": "Usia maksimum berkas (hari)",
+      "overlap": "Pilih sumber yang tidak tumpang tindih. Tampilan extraETF mungkin sudah mencakup akun lain yang terhubung di sini.",
+      "import": "Impor berkas",
+      "importing": "Mengimpor…",
+      "success": "Berhasil diimpor. Tambahkan ekspor ini dari sumber yang tersedia di atas, lalu simpan dan segarkan.",
+      "source": "Impor berkas",
+      "mtime": "Berkas diubah: {{time}}",
+      "expires": "Berlaku hingga: {{time}}",
+      "tooLarge": "Batas impor adalah 4 MiB."
+    },
+    "rebalance": {
+      "title": "Usulan alokasi",
+      "hint": "Masukkan persentase target dengan total 100%. Perubahan hanya berupa nilai untuk ditinjau; order, jumlah unit, pajak, atau biaya tidak dihitung.",
+      "target": "Target {{id}} (%)",
+      "generate": "Hitung usulan",
+      "current": "Nilai saat ini",
+      "targetValue": "Nilai target",
+      "change": "Perubahan nilai"
     }
   },
   "analysis": {
@@ -2345,5 +2398,141 @@
     "selectedFactor": "Faktor dipilih: {{id}}. Hanya faktor ini yang dievaluasi.",
     "fundamentalsRequirement": "Faktor fundamental memerlukan laporan SEC yang aman secara PIT dan semesta saham AS (S&P 500).",
     "noEvaluableFactors": "Tidak ada faktor yang dapat dievaluasi. Perpanjang riwayat dan periksa bidang data yang diperlukan serta semesta saham."
+  },
+  "customProviders": {
+    "loadFailed": "Gagal memuat penyedia khusus",
+    "testPassed": "Pengujian penyedia berhasil",
+    "testFailed": "Pengujian penyedia gagal",
+    "saved": "Penyedia disimpan di penyimpanan kredensial lokal",
+    "saveFailed": "Gagal menyimpan penyedia",
+    "activationFailed": "Gagal mengaktifkan penyedia",
+    "title": "Penyedia khusus yang kompatibel dengan OpenAI",
+    "description": "Tambahkan penyedia dengan API penyelesaian chat yang kompatibel. Pengujian mengirim permintaan singkat ke model; setelah berhasil, kunci disimpan di penyimpanan kredensial sistem operasi.",
+    "keyPrivate": "Kunci tidak pernah ditampilkan",
+    "active": "Aktif",
+    "keyStored": "Kunci tersimpan",
+    "activate": "Aktifkan",
+    "empty": "Belum ada penyedia khusus. Tambahkan di bawah dan uji sebelum menyimpan.",
+    "add": "Tambah penyedia",
+    "id": "ID penyedia",
+    "idHint": "Huruf kecil, angka, titik, tanda hubung, atau garis bawah.",
+    "label": "Nama tampilan",
+    "labelPlaceholder": "Penyedia saya",
+    "baseUrl": "URL dasar API",
+    "urlHint": "Gunakan alamat akar API. Jangan sertakan kunci API dalam URL.",
+    "model": "Model",
+    "key": "Kunci API",
+    "keyPlaceholder": "Masukkan kunci untuk pengujian ini",
+    "testing": "Menguji…",
+    "test": "Uji koneksi",
+    "saving": "Menyimpan…",
+    "save": "Simpan penyedia yang diuji",
+    "saveHint": "Penyimpanan hanya tersedia setelah pengujian berhasil. Aktivasi dikonfirmasi secara terpisah.",
+    "confirm": "Aktifkan {{label}} untuk permintaan agen berikutnya?",
+    "activated": "{{label}} kini aktif",
+    "preview": "Pengujian berhasil: {{preview}}",
+    "error": "Pengujian penyedia gagal: {{error}}",
+    "waiting": "Penyedia membutuhkan waktu lebih lama dari biasanya ({{seconds}} dtk). Permintaan berlanjut hingga batas waktu server."
+  },
+  "pixelOffice": {
+    "title": "Kantor piksel",
+    "description": "Rencanakan dan tugaskan riset. Penugasan tidak memulai eksekusi; pangkat hanya label dan tidak memberikan izin transaksi.",
+    "refresh": "Muat ulang",
+    "loading": "Memuat kantor…",
+    "unavailable": "Kantor tidak tersedia. Coba muat ulang.",
+    "floor": "Area kantor",
+    "taskCount": "Tugas terbuka: {{count}}",
+    "board": "Papan tugas",
+    "empty": "Belum ada tugas.",
+    "assignee": "Penanggung jawab",
+    "unassigned": "Belum ditugaskan",
+    "result": "Hasil penyelesaian",
+    "complete": "Catat penyelesaian",
+    "create": "Buat tugas",
+    "taskTitle": "Judul tugas",
+    "instructions": "Instruksi",
+    "priority": "Prioritas",
+    "ranksTitle": "Pangkat organisasi",
+    "priorities": {
+      "low": "Rendah",
+      "normal": "Normal",
+      "high": "Tinggi"
+    },
+    "statuses": {
+      "queued": "Mengantre",
+      "assigned": "Ditugaskan",
+      "completed": "Selesai"
+    },
+    "ranks": {
+      "Operator": "Anggota",
+      "Senior": "Senior",
+      "Lead": "Pemimpin"
+    }
+  },
+  "runnerBudget": {
+    "unavailable": "Status biaya model tidak tersedia.",
+    "warning": "Panggilan model tetap berbiaya meski tidak ada transaksi.",
+    "summary": "Setiap {{minutes}} menit; maksimum {{turns}} keputusan dan {{tokens}} token per hari UTC.",
+    "dailySummary": "Setiap hari pukul {{time}} ({{timezone}}); menggantikan interval.",
+    "usage": "Hari ini: {{turns}} keputusan · {{tokens}} token · perkiraan {{cost}}.",
+    "estimateUnknown": "Harga dan penggunaan terukur diperlukan untuk perkiraan biaya harian.",
+    "estimate": "Perkiraan biaya model harian: sekitar ${{cost}}, berdasarkan penggunaan.",
+    "configure": "Jadwal dan batas biaya model",
+    "interval_seconds": "Interval keputusan (detik)",
+    "max_daily_turns": "Keputusan maksimum per hari UTC",
+    "max_daily_tokens": "Token maksimum per hari UTC",
+    "max_daily_cost_usd": "Batas perkiraan USD harian (opsional)",
+    "input_usd_per_million": "USD per juta token masukan (opsional)",
+    "output_usd_per_million": "USD per juta token keluaran (opsional)",
+    "daily_at": "Waktu harian (opsional)",
+    "timezone": "Zona waktu jadwal",
+    "save": "Simpan pengaturan",
+    "limitsNote": "Setiap keputusan memakai percakapan baru. Batas diperiksa setelah respons dan dapat terlampaui sebesar respons itu. Penggunaan yang hilang atau anggaran terlampaui memicu sakelar penghentian yang ada.",
+    "pricesNote": "Harga adalah perkiraan operator. Gunakan tarif masukan/penulisan cache tertinggi; diskon cache dan panggilan tambahan tidak termasuk.",
+    "stopToEdit": "Hentikan runner sebelum mengubah pengaturan."
+  },
+  "paper": {
+    "title": "Trading simulasi",
+    "description": "Uji transaksi harian dengan dana virtual. Tidak ada pesanan yang dikirim ke broker. Hasil tidak mencakup dividen tunai dan bukan imbal hasil total.",
+    "accounts": "Akun",
+    "newAccount": "Akun simulasi baru",
+    "eligible": "Mulai paling awal {{date}}; hari libur menunggu sesi berikutnya yang tersedia.",
+    "cash": "Kas",
+    "pending": "Menunggu penyelesaian pertama",
+    "label": "Nama akun",
+    "market": "Pasar",
+    "start": "Mulai",
+    "today": "Hari ini",
+    "nextSession": "Sesi perdagangan berikutnya",
+    "initialPositions": "Posisi awal (jumlah dan biaya rata-rata)",
+    "symbol": "Simbol (mis. AAPL.US)",
+    "quantity": "Jumlah",
+    "cost": "Biaya rata-rata",
+    "remove": "Hapus",
+    "addPosition": "Tambah posisi",
+    "create": "Buat akun",
+    "working": "Memproses…",
+    "advance": "Selesaikan langkah harian",
+    "executionNote": "Hanya candle harian yang selesai dapat diproses. Strategi membaca hari sebelumnya dan dieksekusi pada penutupan hari eksekusi. Tunggu 30 menit setelah penutupan reguler; tidak ada eksekusi otomatis yang dijadwalkan.",
+    "date": "Tanggal eksekusi",
+    "mode": "Mode masukan",
+    "orders": "Pesanan langsung",
+    "strategy": "Berkas strategi",
+    "strategyPath": "Jalur dalam folder strategies lingkungan runtime",
+    "side": "Sisi",
+    "buy": "Beli",
+    "sell": "Jual",
+    "addOrder": "Tambah pesanan",
+    "emptyOrders": "Tanpa pesanan, hanya valuasi. Pesanan pasar dieksekusi pada penutupan harian; bukan simulasi intrahari.",
+    "saved": "Buku akun tersimpan.",
+    "notSaved": "Buku akun tidak berubah. Tinjau hasil sebelum mencoba lagi.",
+    "result": "Hasil langkah",
+    "price": "Harga",
+    "fee": "Biaya",
+    "history": "Riwayat nilai akun",
+    "nav": "Nilai aset bersih",
+    "us": "Saham AS · USD",
+    "hk": "Saham Hong Kong · HKD",
+    "cn_a": "Saham A Tiongkok · CNY"
   }
 }

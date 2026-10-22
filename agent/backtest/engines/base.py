@@ -44,6 +44,7 @@ from backtest.metrics import (
     by_symbol_stats,
     calc_fill_turnover_series,
     calc_metrics,
+    period_returns,
 )
 from backtest.models import EquitySnapshot, FillRecord, Position, TradeRecord
 from backtest.rebalance_mask import (
@@ -114,7 +115,9 @@ def _run_card_data_sources(config: Dict[str, Any], loader: Any) -> List[str]:
 
 # ─── Market detection (lightweight, for signal alignment only) ───
 
-_CRYPTO_RE = _re.compile(r"^[A-Z]+-USDT$|^[A-Z]+/USDT$", _re.I)
+_CRYPTO_RE = _re.compile(
+    r"^(?=[A-Z0-9]*[A-Z])[A-Z0-9]+-USDT$|^(?=[A-Z0-9]*[A-Z])[A-Z0-9]+/USDT$", _re.I
+)
 # Forex / metals in their explicit Yahoo notations, plus the bare-6-char
 # whitelist for XAUUSD / XAGUSD / XPTUSD / XPDUSD and G10 currencies. Mirrors
 # ``backtest.engines._market_hooks._MARKET_PATTERNS`` so the ffill-limit
@@ -131,9 +134,12 @@ _FX_RE = _re.compile(
 
 def _detect_market_for_align(code: str) -> str:
     """Lightweight market detection for ffill_limit calculation."""
-    if _CRYPTO_RE.match(code):
+    from backtest.engines._market_hooks import _detect_market
+
+    market = _detect_market(code.strip().upper())
+    if market == "crypto":
         return "crypto"
-    if _FX_RE.match(code):
+    if market == "forex":
         return "forex"
     return "equity"
 
@@ -281,6 +287,14 @@ def _align(
 
     # Use int64 view for O(log n) searchsorted lookups
     dates_i8 = dates.values.view("i8")
+    # Daily panels usually share one calendar. Direct placement avoids two
+    # binary-search passes per symbol over an already identical grid. Reuse
+    # each irregular calendar's mapping for both prices and shifted signals.
+    row_indexes = {
+        c: slice(None) if ns_index[c].equals(dates)
+        else np.searchsorted(dates_i8, ns_index[c].asi8)
+        for c in codes
+    }
 
     # ffill with limit to avoid masking long suspensions (e.g. 3-week halt)
     # Cross-market needs larger limit (Chinese New Year can be 9-10 bars)
@@ -290,8 +304,7 @@ def _align(
     close_arr = np.full((n_dates, n_codes), np.nan)
     for j, c in enumerate(codes):
         series = data_map[c]["close"]
-        row_idx = np.searchsorted(dates_i8, indexes[j].asi8)
-        close_arr[row_idx, j] = series.values
+        close_arr[row_indexes[c], j] = series.values
 
     # Vectorized ffill with limit using pandas (C-optimized internals)
     _tmp = pd.DataFrame(close_arr)
@@ -330,8 +343,7 @@ def _align(
         shifted_vals[0] = 0.0
         shifted_vals[1:] = sig_vals[:-1]
         # Place into unified grid via searchsorted
-        row_idx = np.searchsorted(dates_i8, ns_index[c].asi8)
-        pos_arr[row_idx, j] = shifted_vals
+        pos_arr[row_indexes[c], j] = shifted_vals
 
     # Vectorized ffill with limit using pandas (C-optimized)
     _tmp = pd.DataFrame(pos_arr)
@@ -1162,6 +1174,8 @@ class BaseEngine(ABC):
             card_warnings.append(config["_run_card_caliber_warning"])
         if config.get("_run_card_annualisation_warning"):
             card_warnings.append(config["_run_card_annualisation_warning"])
+        if config.get("_run_card_unrecognized_config_warning"):
+            card_warnings.append(config["_run_card_unrecognized_config_warning"])
         if benchmark_warning:
             card_warnings.append(benchmark_warning)
         from backtest.run_card import write_run_card
@@ -2270,9 +2284,12 @@ class BaseEngine(ABC):
         for code, df in data_map.items():
             df.to_csv(out / f"ohlcv_{code}.csv")
 
-        # Equity curve
-        port_ret = equity_series.pct_change().fillna(0.0)
-        peak = equity_series.cummax()
+        # Equity curve. Same cash-seeded returns as calc_metrics, so the ret
+        # column compounds back to total_return and agrees with drawdown.
+        port_ret = period_returns(equity_series, self.initial_capital).fillna(0.0)
+        # Same high-water mark as calc_metrics: the account holds initial_capital
+        # before the first recorded bar, so a loss on that bar is a drawdown too.
+        peak = equity_series.cummax().clip(lower=float(self.initial_capital))
         dd = (equity_series - peak) / peak.replace(0, 1)
         eq_df = pd.DataFrame({
             "ret": port_ret,

@@ -1,10 +1,11 @@
 {
   "app": {
-    "version": "v0.1.16"
+    "version": "v0.1.18"
   },
   "charts": {
     "noPriceData": "Noch keine Kursdaten für dieses Symbol",
     "noCorrelationData": "Wählen Sie mindestens zwei Symbole zum Vergleichen",
+    "correlationUndefined": "undefiniert (keine Preisbewegung im Zeitraum)",
     "noEquityData": "Noch keine Kontowert-Kurve — führen Sie zuerst einen Backtest durch"
   },
   "navigation": {
@@ -26,7 +27,9 @@
       "correlation": "Vergleichen, wie sich Vermögenswerte gemeinsam bewegen.",
       "scheduled": "Eine Recherche nach Zeitplan wiederholen.",
       "runtime": "Brokerverbindungen und den Betriebsstatus des Handels prüfen.",
-      "settings": "Modelle, Datenquellen und Brokerverbindungen konfigurieren."
+      "settings": "Modelle, Datenquellen und Brokerverbindungen konfigurieren.",
+      "pixelOffice": "Plane und verteile Rechercheaufgaben. Eine Zuweisung startet keine Ausführung. Ränge sind Bezeichnungen und erteilen keine Handelsrechte.",
+      "paperTrading": "Tägliche Trades mit virtuellem Kapital testen. Es werden keine Brokeraufträge gesendet. Bardividenden sind nicht enthalten; die Ergebnisse zeigen keine Gesamtrendite."
     },
     "instructions": {
       "reports": "Bitte den Assistenten zuerst um einen Strategie-Backtest und öffne hier die Ergebnisse. Im Chat erstellte PDFs und andere Dokumente lädst du in der ursprünglichen Unterhaltung herunter.",
@@ -36,7 +39,9 @@
       "correlation": "Gib mindestens zwei Wertpapiercodes ein, wähle den Zeitraum und klicke auf Berechnen.",
       "scheduled": "Gib einen Rechercheauftrag ein, wähle die Häufigkeit und speichere. Für die Ausführung muss der lokale Planer aktiviert sein; zur Zustellung ist ein eingerichteter Kanal nötig.",
       "runtime": "Richte zuerst unter Einstellungen oder Portfolio eine Brokerverbindung ein. Verfügbare Handelsaktionen hängen von den Brokerfunktionen und deiner Autorisierung ab.",
-      "settings": "Richte zunächst ein Modell ein. Ergänze Datenquellen oder Brokerverbindungen nach Bedarf; für öffentliche Marktrecherche ist kein Brokerkonto nötig."
+      "settings": "Richte zunächst ein Modell ein. Ergänze Datenquellen oder Brokerverbindungen nach Bedarf; für öffentliche Marktrecherche ist kein Brokerkonto nötig.",
+      "pixelOffice": "Plane und verteile Rechercheaufgaben. Eine Zuweisung startet keine Ausführung. Ränge sind Bezeichnungen und erteilen keine Handelsrechte.",
+      "paperTrading": "Nur abgeschlossene Tageskerzen werden abgerechnet. Strategien sehen vorherige Tage und handeln zum Schlusskurs des Ausführungstags. Bitte 30 Minuten nach regulärem Börsenschluss warten; es wird keine automatische Ausführung geplant."
     }
   },
   "layout": {
@@ -66,13 +71,15 @@
     "mainNavigation": "Hauptnavigation",
     "about": "Über",
     "portfolio": "Kontopositionen",
-    "sessionsLoadFailed": "Gespräche können nicht geladen werden."
+    "sessionsLoadFailed": "Gespräche können nicht geladen werden.",
+    "pixelOffice": "Pixelbüro",
+    "paperTrading": "Simulierter Handel"
   },
   "runtime": {
     "monitorBadge": "Runtime-Monitor",
     "title": "Live-/Paper-Runtime-Status",
-    "subtitlePre": "Schreibgeschützter Status von",
-    "subtitlePost": ". Diese Seite autorisiert keine Konnektoren, startet oder stoppt keine Runner, übermittelt oder storniert keine Orders und ändert keine Mandate.",
+    "subtitlePre": "Prüfen Sie den Verbindungsstatus, Handelsmandate und die Aktivität des Runners.",
+    "subtitlePost": " Bei gestopptem Runner können Sie die Häufigkeit der Modellentscheidungen und Ausgabenlimits ändern.",
     "refresh": "Aktualisieren",
     "unavailableTitle": "Runtime-Status nicht verfügbar",
     "unavailableHint": "Behandeln Sie die Connector-Runtime als nicht verfügbar, bis das Backend einen aktuellen Status-Snapshot liefert.",
@@ -112,7 +119,7 @@
     "riskHalted": "Risiko gestoppt",
     "riskHaltedDesc": "Die Notabschaltung ist für dieses Profil ausgelöst. Behandeln Sie die Connector-Runtime als gestoppt, bis der Status sich klärt.",
     "riskActive": "Runtime aktiv",
-    "riskActiveDesc": "Der Runner läuft und ein nicht abgelaufenes Mandat ist vorhanden. Diese Seite bleibt rein schreibgeschützt.",
+    "riskActiveDesc": "Der Runner läuft und sein Handelsmandat ist noch gültig.",
     "riskIdle": "Bereit, aber inaktiv",
     "riskIdleDesc": "Autorisierung und Mandat sind vorhanden, aber der Runner läuft nicht.",
     "riskDormant": "Inaktiv",
@@ -240,16 +247,16 @@
     "deliveryChannelPlaceholder": "telegram, feishu … (leer lassen, dann bleibt alles in der App)",
     "deliveryTargetLabel": "Ziel im Kanal",
     "deliveryTargetPlaceholder": "Chat- / Gruppen- / Benutzer-ID",
-    "deliveryFormatLabel": "Email report format",
-    "deliveryFormatDefault": "Channel default (plain text)",
-    "deliveryFormatHtml": "HTML email",
-    "deliveryFormatPdf": "PDF attachment",
+    "deliveryFormatLabel": "E-Mail-Berichtsformat",
+    "deliveryFormatDefault": "Kanalstandard (reiner Text)",
+    "deliveryFormatHtml": "HTML-E-Mail",
+    "deliveryFormatPdf": "PDF-Anhang",
     "proposalPdfProtection": "PDF-Passwortschutz",
     "proposalPdfProtectionOn": "Ein",
     "proposalPdfProtectionOff": "Aus",
-    "deliveryFormatDefaultHint": "Keeps the existing plain-text delivery behavior.",
-    "deliveryFormatHtmlHint": "Shows the full report as sanitized HTML in the email body.",
-    "deliveryFormatPdfHint": "Attaches the full report as PDF and keeps only a short notice in the body.",
+    "deliveryFormatDefaultHint": "Behält die bisherige Zustellung als reinen Text bei.",
+    "deliveryFormatHtmlHint": "Zeigt den vollständigen Bericht als bereinigtes HTML im Nachrichtentext.",
+    "deliveryFormatPdfHint": "Hängt den vollständigen Bericht als PDF an und lässt im Nachrichtentext nur einen kurzen Hinweis.",
     "deliveryHint": "Standardmäßig aus. Das Briefing wird **nach dem Lauf** gesendet, nicht bei der Planung.",
     "deliveryTargetRequired": "Geben Sie ein Ziel für diesen Kanal an, oder leeren Sie das Kanalfeld.",
     "delivery_none": "Wird nach dem nächsten Lauf an {{channel}} gesendet",
@@ -396,7 +403,10 @@
       "shadowDeltaPrompt": "Führe einen Shadow-Backtest für die letzten 90 Tage durch und zerlege, wo mein PnL vom Shadow abweicht (Regelverletzungen, vorzeitige Exits, verpasste Signale)",
       "shadowReport": "Shadow-Bericht erstellen",
       "shadowReportDesc": "Ein teilbarer 8-teiliger Bericht: deine Kontokurve, risikobereinigte Rendite und woher jeder Gewinn kam",
-      "shadowReportPrompt": "Rendere den Shadow-Bericht und gib mir die URL — beginne mit dem Du-vs-Shadow-Delta"
+      "shadowReportPrompt": "Rendere den Shadow-Bericht und gib mir die URL — beginne mit dem Du-vs-Shadow-Delta",
+      "adaptStrategy": "Registrierte Strategie anpassen",
+      "adaptStrategyDesc": "Signal beibehalten, neues Universum testen",
+      "adaptStrategyPrompt": "Hilf mir, eine registrierte Strategie auf ein neues Universum und einen neuen Zeitraum anzupassen. Liste zuerst Strategien auf und prüfe die Evidenz der Ausgangsstrategie. Frage nach fehlender ID, Instrumenten, Daten und Positionsgrößen. Behalte das Signal bei, generiere den abgeleiteten Code, führe den Backtest aus und berichte nur dessen eigene aktualisierte Evidenz."
     },
     "taskSubtitle": "Frag nach einer Aktie, einer Strategie oder deinem Portfolio — ich hole die Daten, rechne alles durch und zeige jeden Schritt.",
     "quickActions": "Schnellaktionen",
@@ -1107,7 +1117,7 @@
     "authentication": "Authentifizierung",
     "apiKey": "API-Schlüssel",
     "tushareTokenDesc": "Verwendet für China-A-Aktien, Futures, Fonds und Makrodaten. Falls nicht gesetzt, greift das Projekt auf AKShare zurück, sofern verfügbar.",
-    "gildataTokenDesc": "Optionale Gildata-Quelle (Hundsun Juyuan) für chinesische A-Aktien. Wenn gesetzt, reiht sie sich mit vorwärts bereinigten Tagesbalken ans Ende der A-Aktien-Fallback-Kette ein."
+    "gildataTokenDesc": "Optionale Gildata-Daten: bereinigte Tageskurse chinesischer A-Aktien, unbereinigte Hongkong- und Indexkurse, Nettoinventarwerte nicht börsengehandelter Fonds sowie chinesische Makro-, Mitteilungs- und Research-Tools."
   },
   "qveris": {
     "title": "QVeris-Tool-Marktplatz",
@@ -1227,7 +1237,10 @@
     "resumeConnector": "Connector fortsetzen",
     "resumeConnectorTitle": "Kill-Switch löschen und Connector-Aktivität wieder aktivieren",
     "connectorResumed": "Connector fortgesetzt",
-    "failedToResumeConnector": "Connector konnte nicht fortgesetzt werden."
+    "failedToResumeConnector": "Connector konnte nicht fortgesetzt werden.",
+    "tokenUsage": {
+      "live": "Tokens"
+    }
   },
   "runDetail": {
     "title": "Durchlauf-Details",
@@ -1360,6 +1373,19 @@
     "ddNotRecovered": "Nicht erholt",
     "ddDays": "{{count}} T",
     "dashboard": "Research-Dashboard",
+    "llmUsage": {
+      "tab": "Token-Nutzung",
+      "provider": "Anbieter",
+      "model": "Modell",
+      "inputTokens": "Eingabe-Tokens",
+      "outputTokens": "Ausgabe-Tokens",
+      "totalTokens": "Tokens gesamt",
+      "calls": "Aufrufe",
+      "cacheRead": "Cache-Lese-Tokens",
+      "cacheCreation": "Tokens für Cache-Erstellung",
+      "perIteration": "Detail nach Iteration",
+      "iteration": "Iteration"
+    },
     "positions": {
       "tab": "Positionen",
       "weightDistribution": "Gewichtsverteilung",
@@ -1832,7 +1858,10 @@
     "output": "Ausgabe",
     "waitingForEvents": "Warten auf Agent-Ereignisse...",
     "teamStarting": "Das Team startet — erste Updates in wenigen Sekunden…",
-    "detailsUnavailable": "Details nicht verfügbar"
+    "detailsUnavailable": "Details nicht verfügbar",
+    "tokens": "↑{{input}} ↓{{output}} Tokens",
+    "estimated": "geschätzt",
+    "tokenSourceUnlabeled": "Quelle nicht gekennzeichnet"
   },
   "mandate": {
     "runtimeMandate": "Connector-Runtime-Mandat",
@@ -2131,7 +2160,7 @@
       "badge": "Lokal & schreibgeschützt · Mehrere Konten",
       "title": "Portfolio",
       "subtitle": "Eine Bewertung über alle aktivierten schreibgeschützten Verbindungen. Ein Konto, das nicht gelesen werden kann, wird als Fehler gemeldet und bleibt aus den Summen heraus.",
-      "fxFresh": "USD/CNY {{rate}} · aktueller Kurs",
+      "fxFresh": "USD/CNY {{rate}} · Referenzkurs",
       "fxCached": "USD/CNY {{rate}} · zwischengespeicherter Kurs",
       "manageAccounts": "Konten verwalten",
       "exportCsv": "CSV exportieren",
@@ -2296,6 +2325,30 @@
       "accountDeactivated": " · deaktiviert",
       "accountSave": "Dieses Konto verwenden",
       "accountSaved": "Konto gespeichert."
+    },
+    "imports": {
+      "title": "extraETF Investments importieren",
+      "hint": "Nur Bestände, ohne Bargeld oder Livekurse. Das Änderungsdatum der Datei ist kein Kurszeitpunkt; den ISINs ist kein Handelsplatz zugeordnet.",
+      "file": "Investments-CSV",
+      "count": "Erwartete Anzahl der Positionen (in extraETF prüfen)",
+      "age": "Maximales Dateialter (Tage)",
+      "overlap": "Wählen Sie überschneidungsfreie Quellen. Eine extraETF-Ansicht kann hier bereits verbundene Konten enthalten.",
+      "import": "Datei importieren",
+      "importing": "Import läuft…",
+      "success": "Importiert. Fügen Sie den Export aus den verfügbaren Quellen oben hinzu, speichern und aktualisieren Sie.",
+      "source": "Dateiimport",
+      "mtime": "Datei geändert: {{time}}",
+      "expires": "Gültig bis: {{time}}",
+      "tooLarge": "Die Importgrenze beträgt 4 MiB."
+    },
+    "rebalance": {
+      "title": "Allokationsvorschlag",
+      "hint": "Geben Sie Zielanteile mit insgesamt 100% ein. Änderungen sind nur zu prüfende Beträge; Orders, Stückzahlen, Steuern und Gebühren werden nicht berechnet.",
+      "target": "Ziel für {{id}} (%)",
+      "generate": "Vorschlag berechnen",
+      "current": "Aktueller Wert",
+      "targetValue": "Zielwert",
+      "change": "Wertänderung"
     }
   },
   "analysis": {
@@ -2345,5 +2398,141 @@
     "selectedFactor": "Gewählter Faktor: {{id}}. Nur dieser Faktor wird bewertet.",
     "fundamentalsRequirement": "Fundamentalfaktoren benötigen PIT-sichere SEC-Abschlüsse und ein US-Aktienuniversum (S&P 500).",
     "noEvaluableFactors": "Keine Faktoren konnten bewertet werden. Längeren Verlauf wählen und erforderliche Datenfelder sowie Aktienuniversum prüfen."
+  },
+  "customProviders": {
+    "loadFailed": "Benutzerdefinierte Anbieter konnten nicht geladen werden",
+    "testPassed": "Anbietertest erfolgreich",
+    "testFailed": "Anbietertest fehlgeschlagen",
+    "saved": "Anbieter im lokalen Zugangsdaten-Speicher gespeichert",
+    "saveFailed": "Anbieter konnte nicht gespeichert werden",
+    "activationFailed": "Anbieter konnte nicht aktiviert werden",
+    "title": "Benutzerdefinierte OpenAI-kompatible Anbieter",
+    "description": "Füge einen Anbieter mit kompatibler Chat-Completions-API hinzu. Der Test sendet eine kurze Modellanfrage. Nach Erfolg wird der Schlüssel im Zugangsdaten-Speicher des Betriebssystems abgelegt.",
+    "keyPrivate": "Schlüssel wird nie angezeigt",
+    "active": "Aktiv",
+    "keyStored": "Schlüssel gespeichert",
+    "activate": "Aktivieren",
+    "empty": "Noch keine benutzerdefinierten Anbieter. Füge unten einen hinzu und teste ihn vor dem Speichern.",
+    "add": "Anbieter hinzufügen",
+    "id": "Anbieter-ID",
+    "idHint": "Kleinbuchstaben, Zahlen, Punkte, Bindestriche oder Unterstriche.",
+    "label": "Anzeigename",
+    "labelPlaceholder": "Mein Anbieter",
+    "baseUrl": "API-Basis-URL",
+    "urlHint": "Verwende die API-Basisadresse. Die URL darf keinen API-Schlüssel enthalten.",
+    "model": "Modell",
+    "key": "API-Schlüssel",
+    "keyPlaceholder": "Schlüssel für diesen Test eingeben",
+    "testing": "Wird getestet…",
+    "test": "Verbindung testen",
+    "saving": "Wird gespeichert…",
+    "save": "Getesteten Anbieter speichern",
+    "saveHint": "Speichern ist erst nach erfolgreichem Test möglich. Die Aktivierung wird separat bestätigt.",
+    "confirm": "{{label}} für neue Agentenanfragen aktivieren?",
+    "activated": "{{label}} ist jetzt aktiv",
+    "preview": "Test erfolgreich: {{preview}}",
+    "error": "Anbietertest fehlgeschlagen: {{error}}",
+    "waiting": "Der Anbieter benötigt länger als üblich ({{seconds}} s). Die Anfrage wartet weiter bis zum Server-Timeout."
+  },
+  "pixelOffice": {
+    "title": "Pixelbüro",
+    "description": "Plane und verteile Rechercheaufgaben. Eine Zuweisung startet keine Ausführung. Ränge sind Bezeichnungen und erteilen keine Handelsrechte.",
+    "refresh": "Aktualisieren",
+    "loading": "Büro wird geladen…",
+    "unavailable": "Büro nicht verfügbar. Bitte aktualisieren.",
+    "floor": "Bürofläche",
+    "taskCount": "Offene Aufgaben: {{count}}",
+    "board": "Aufgabenübersicht",
+    "empty": "Noch keine Aufgaben.",
+    "assignee": "Zuständig",
+    "unassigned": "Nicht zugewiesen",
+    "result": "Ergebnis",
+    "complete": "Abschluss erfassen",
+    "create": "Aufgabe erstellen",
+    "taskTitle": "Aufgabentitel",
+    "instructions": "Anweisungen",
+    "priority": "Priorität",
+    "ranksTitle": "Organisatorische Ränge",
+    "priorities": {
+      "low": "Niedrig",
+      "normal": "Normal",
+      "high": "Hoch"
+    },
+    "statuses": {
+      "queued": "Wartend",
+      "assigned": "Zugewiesen",
+      "completed": "Abgeschlossen"
+    },
+    "ranks": {
+      "Operator": "Mitglied",
+      "Senior": "Erfahren",
+      "Lead": "Leitung"
+    }
+  },
+  "runnerBudget": {
+    "unavailable": "Modellkostenstatus nicht verfügbar.",
+    "warning": "Modellaufrufe kosten auch ohne Handelsausführung Geld.",
+    "summary": "Alle {{minutes}} Minuten; höchstens {{turns}} Entscheidungen und {{tokens}} Token pro UTC-Tag.",
+    "dailySummary": "Täglich um {{time}} ({{timezone}}); ersetzt das Intervall.",
+    "usage": "Heute: {{turns}} Entscheidungen · {{tokens}} Token · geschätzt {{cost}}.",
+    "estimateUnknown": "Eine Tagesschätzung benötigt Preise und gemessenen Verbrauch.",
+    "estimate": "Geschätzte tägliche Modellkosten: etwa ${{cost}}, anhand des Verbrauchs.",
+    "configure": "Modellzeitplan und Kostenlimits",
+    "interval_seconds": "Entscheidungsintervall (Sekunden)",
+    "max_daily_turns": "Maximale Entscheidungen pro UTC-Tag",
+    "max_daily_tokens": "Maximale Token pro UTC-Tag",
+    "max_daily_cost_usd": "Geschätztes USD-Tageslimit (optional)",
+    "input_usd_per_million": "USD pro Million Eingabetoken (optional)",
+    "output_usd_per_million": "USD pro Million Ausgabetoken (optional)",
+    "daily_at": "Tägliche Uhrzeit (optional)",
+    "timezone": "Zeitzone des Zeitplans",
+    "save": "Einstellungen speichern",
+    "limitsNote": "Jede Entscheidung beginnt eine neue Unterhaltung. Limits werden nach der Antwort geprüft und können um diese Antwort überschritten werden. Fehlender Verbrauch oder eine Überschreitung löst den vorhandenen Notstopp aus.",
+    "pricesNote": "Preise sind Betreiberschätzungen. Den höchsten Eingabe-/Cache-Schreibpreis verwenden; Cache-Rabatte und zusätzliche Modellaufrufe sind nicht enthalten.",
+    "stopToEdit": "Vor Änderungen den Runner stoppen."
+  },
+  "paper": {
+    "title": "Simulierter Handel",
+    "description": "Tägliche Trades mit virtuellem Kapital testen. Es werden keine Brokeraufträge gesendet. Bardividenden sind nicht enthalten; die Ergebnisse zeigen keine Gesamtrendite.",
+    "accounts": "Konten",
+    "newAccount": "Neues Simulationskonto",
+    "eligible": "Ab {{date}} möglich; an Feiertagen wird auf die nächste verfügbare Sitzung gewartet.",
+    "cash": "Bargeld",
+    "pending": "Erste Abrechnung ausstehend",
+    "label": "Kontoname",
+    "market": "Markt",
+    "start": "Beginn",
+    "today": "Heute",
+    "nextSession": "Nächster Handelstag",
+    "initialPositions": "Anfangspositionen (Menge und Durchschnittskosten)",
+    "symbol": "Symbol (z. B. AAPL.US)",
+    "quantity": "Menge",
+    "cost": "Durchschnittskosten",
+    "remove": "Entfernen",
+    "addPosition": "Position hinzufügen",
+    "create": "Konto erstellen",
+    "working": "Wird verarbeitet…",
+    "advance": "Tagesschritt abrechnen",
+    "executionNote": "Nur abgeschlossene Tageskerzen werden abgerechnet. Strategien sehen vorherige Tage und handeln zum Schlusskurs des Ausführungstags. Bitte 30 Minuten nach regulärem Börsenschluss warten; es wird keine automatische Ausführung geplant.",
+    "date": "Ausführungsdatum",
+    "mode": "Eingabemodus",
+    "orders": "Explizite Aufträge",
+    "strategy": "Strategiedatei",
+    "strategyPath": "Pfad im strategies-Ordner der Laufzeitumgebung",
+    "side": "Richtung",
+    "buy": "Kaufen",
+    "sell": "Verkaufen",
+    "addOrder": "Auftrag hinzufügen",
+    "emptyOrders": "Ohne Aufträge wird nur bewertet. Marktaufträge werden zum Tagesschluss ausgeführt; keine Intraday-Simulation.",
+    "saved": "Kontobuch gespeichert.",
+    "notSaved": "Kontobuch unverändert. Ergebnis vor erneutem Versuch prüfen.",
+    "result": "Schrittergebnis",
+    "price": "Preis",
+    "fee": "Gebühr",
+    "history": "Kontowertverlauf",
+    "nav": "Nettovermögenswert",
+    "us": "US-Aktien · USD",
+    "hk": "Hongkong-Aktien · HKD",
+    "cn_a": "Chinesische A-Aktien · CNY"
   }
 }

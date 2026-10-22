@@ -58,6 +58,8 @@ agent/uploads/
 /runs/
 /shadow_runs/
 /shadow_accounts/
+/shadow_reports/
+/strategies/
 /swarm/
 /live/
 /uploads/
@@ -70,6 +72,9 @@ agent/uploads/
 /scheduled_research/
 /memory/
 /memory_index/
+/memory_index.db
+/memory_index.db-shm
+/memory_index.db-wal
 /cache/
 /data/
 /reports/
@@ -177,3 +182,11 @@ bench_report.json
 # Grounding ledger persisted by ad-hoc verification scripts into tests/
 agent/tests/artifacts/
 .idea/*
+
+/custom-llm-providers.json
+
+/pixel-office.sqlite3
+/pixel-office.sqlite3-*
+
+# Local simulated account ledgers
+/paper-trading/

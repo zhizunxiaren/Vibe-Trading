@@ -89,7 +89,10 @@ export function isAuthRequiredError(error: unknown): boolean {
 
 export interface CorrelationResponse {
   labels: string[];
-  matrix: number[][];
+  // Undefined pairs (zero-variance leg — halted series, pegged stablecoin,
+  // fresh listing) come back as null: missing evidence, not 0.0. Mirrors the
+  // regime endpoint's (number | null)[] density convention.
+  matrix: (number | null)[][];
 }
 
 export interface CorrelationAnalysisResponse {
@@ -123,6 +126,10 @@ export interface CorrelationRegimeResponse {
 }
 
 export interface PortfolioPosition {
+  portfolio_id?: string;
+  portfolio_name?: string;
+  source_mtime?: string;
+  instrument_id_kind?: string;
   source_id?: string;
   profile_id?: string;
   source_label?: string;
@@ -160,6 +167,8 @@ export interface PortfolioConnectorCompatibility {
  * as history — never as a current valuation.
  */
 export interface PortfolioAccount {
+  source_kind?: "connection" | "extraetf";
+  import_metadata?: { source_mtime: string; expires_at: string; as_of_source: string } | null;
   source_id?: string;
   profile_id?: string;
   label?: string;
@@ -201,10 +210,11 @@ export interface PortfolioSnapshot {
     unpriced_or_other_usd: number;
     identified_coverage: number;
   };
-  fx: { usd_cny: number; usd_hkd: number; rates?: Record<string, number>; fetched_at: string; stale: boolean };
+  fx: { as_of?: string | null; source?: string; usd_cny: number; usd_hkd: number; rates?: Record<string, number>; fetched_at: string; stale: boolean };
   accounts: PortfolioAccount[];
   positions: PortfolioPosition[];
   combined_holdings?: Array<{
+    canonical_id?: string;
     symbol: string;
     market_value_usd: number;
     asset_type?: string;
@@ -216,11 +226,21 @@ export interface PortfolioSnapshot {
 }
 
 export interface PortfolioHistoryPoint {
+  total_eur?: string | null;
   id: string;
   created_at: string;
   complete: number;
   total_usd: string;
   total_cny: string;
+  /** Historical HKD value at this snapshot’s FX rate; absent means unavailable. */
+  total_hkd?: string | null;
+}
+
+export interface RebalanceProposal {
+  mode: "proposal_only";
+  snapshot_id: string;
+  currency: string;
+  rows: Array<{ canonical_id: string; current_value: number; target_value: number; change_value: number }>;
 }
 
 export interface PortfolioRefreshState {
@@ -240,6 +260,7 @@ export interface PortfolioReconnectState {
 }
 
 export interface PortfolioSourceSettings {
+  source_kind?: "connection" | "extraetf";
   connection_id: string;
   label: string;
   enabled: boolean;
@@ -253,13 +274,14 @@ export interface PortfolioSettings {
 }
 
 export interface PortfolioSourceCatalogItem {
+  source_kind?: "connection" | "extraetf";
   id: string;
   connection_id: string;
   profile_id: string;
   connector: string;
   label: string;
-  environment: "paper" | "live";
-  transport: "local_tws" | "remote_mcp" | "broker_sdk" | "local_plugin";
+  environment: "paper" | "live" | "import";
+  transport: "local_tws" | "remote_mcp" | "broker_sdk" | "local_plugin" | "file_import";
   capabilities: string[];
   readonly: boolean;
   notes: string;
@@ -269,7 +291,7 @@ export interface PortfolioSourceCatalogItem {
   credential_fields: CredentialField[];
   credential_status: Record<string, boolean>;
   credentials_configured: boolean;
-  portfolio_compatibility: PortfolioConnectorCompatibility;
+  portfolio_compatibility: PortfolioConnectorCompatibility | null;
 }
 
 export interface CredentialField {
@@ -291,6 +313,7 @@ export interface ConnectorOnboarding {
 }
 
 export interface LocalConnection {
+  portfolio_eligible?: boolean;
   id: string;
   profile_id: string;
   label: string;
@@ -312,6 +335,7 @@ export interface LocalConnection {
 }
 
 export interface ReadonlyConnectionProfile {
+  portfolio_eligible?: boolean;
   id: string;
   connector: string;
   label: string;
@@ -427,6 +451,9 @@ function appendQueryParam(url: string, key: string, value: string): string {
 }
 
 export const api = {
+  getPixelOffice: () => request<OfficeSnapshot>("/api/pixel-office"),
+  updatePixelOffice: (action: "create" | "assign" | "complete" | "rank", arguments_: Record<string, unknown>) =>
+    request<OfficeSnapshot>("/api/pixel-office/actions", { method: "POST", body: JSON.stringify({ action, arguments: arguments_ }) }),
   uploadFile,
   getCorrelationAnalysis: (codes: string, days: number, method: "pearson" | "spearman", includeRegime: boolean, signal?: AbortSignal) =>
     request<CorrelationAnalysisResponse>(`/correlation/analysis?${new URLSearchParams({ codes, days: String(days), method, include_regime: String(includeRegime) })}`, { signal }),
@@ -483,6 +510,10 @@ export const api = {
       `/api/connections/${encodeURIComponent(connectionId)}`,
       { method: "DELETE" },
     ),
+  importExtraEtf: (payload: { csv_text: string; label: string; source_mtime: string; expected_positions: number; max_age_days: number }) =>
+    request<{ status: string; import: { id: string } }>("/api/portfolio/imports/extraetf", { method: "POST", body: JSON.stringify(payload) }),
+  proposePortfolioRebalance: (snapshotId: string, targetWeights: Record<string, number>) =>
+    request<{ status: string; proposal: RebalanceProposal }>("/api/portfolio/rebalance", { method: "POST", body: JSON.stringify({ snapshot_id: snapshotId, target_weights: targetWeights }) }),
   getPortfolioHistory: (limit = 180) =>
     request<{ status: string; history: PortfolioHistoryPoint[] }>(`/api/portfolio/history?limit=${encodeURIComponent(String(limit))}`),
   downloadPortfolioCsv: async () => {
@@ -496,6 +527,7 @@ export const api = {
     const qs = q.toString();
     return request<RunData>(`/runs/${id}${qs ? `?${qs}` : ""}`);
   },
+  getRunPreview: (id: string) => request<RunPreview>(`/runs/${id}/preview`),
   getRunCode: (id: string) => request<Record<string, string>>(`/runs/${id}/code`),
   getRunFactor: (id: string) => request<FactorReportPayload>(`/runs/${id}/factor`),
   getRunAttribution: (id: string) => request<AttributionResponse>(`/runs/${encodeURIComponent(id)}/attribution`),
@@ -587,6 +619,25 @@ export const api = {
       method: "POST",
       body: JSON.stringify(settings),
     }),
+  listCustomProviders: () =>
+    request<{ status: string; providers: CustomProviderProfile[] }>("/settings/custom-providers"),
+  testCustomProvider: (settings: { base_url: string; model: string; api_key: string }) =>
+    request<CustomProviderTestResponse>("/settings/custom-providers/test", {
+      method: "POST",
+      body: JSON.stringify(settings),
+    }),
+  saveCustomProvider: (settings: CustomProviderSaveRequest) =>
+    request<{ status: string; provider: CustomProviderProfile }>("/settings/custom-providers", {
+      method: "POST",
+      body: JSON.stringify(settings),
+    }),
+  activateCustomProvider: (profileId: string) =>
+    request<{ status: string; active_id: string; model: string; base_url: string }>(
+      `/settings/custom-providers/${encodeURIComponent(profileId)}/activate`, {
+        method: "POST",
+        body: JSON.stringify({ confirm: true }),
+      },
+    ),
   getDataSourceSettings: () => request<DataSourceSettings>("/settings/data-sources"),
   updateDataSourceSettings: (settings: UpdateDataSourceSettingsRequest) =>
     request<DataSourceSettings>("/settings/data-sources", {
@@ -696,6 +747,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ broker }),
     }),
+  saveRunnerSettings: (broker: string, settings: LiveDecisionSettings) =>
+    request<LiveDecisionBudget>(`/live/runner/settings?broker=${encodeURIComponent(broker)}`, {
+      method: "PUT",
+      body: JSON.stringify(settings),
+    }),
   stopLiveRunner: (broker: string) =>
     request<LiveRunnerResponse>("/live/runner/stop", {
       method: "POST",
@@ -724,7 +780,7 @@ export interface ScheduledRun {
   id: string;
   prompt: string;
   title: string;
-  source_type: "prompt" | "playbook";
+  source_type: "prompt" | "playbook" | "system";
   playbook_slug: string | null;
   end_at: number | null;
   schedule: string;
@@ -884,6 +940,32 @@ export interface ListLLMModelsRequest {
   base_url?: string;
   api_key?: string;
   refresh?: boolean;
+}
+
+export interface CustomProviderProfile {
+  id: string;
+  label: string;
+  base_url: string;
+  model: string;
+  api_key_configured: boolean;
+  active: boolean;
+  last_tested_at?: string | null;
+}
+
+export interface CustomProviderTestResponse {
+  status: "ok";
+  test_id: string;
+  response_preview: string;
+  latency_ms: number;
+}
+
+export interface CustomProviderSaveRequest {
+  id: string;
+  label: string;
+  base_url: string;
+  model: string;
+  api_key: string;
+  test_id: string;
 }
 
 export interface LLMModelsResponse {
@@ -1093,6 +1175,14 @@ export interface EquityPoint {
   drawdown: string | number;
 }
 
+/** What a chat run card needs from `GET /runs/{id}/preview`. */
+export interface RunPreview {
+  metrics: BacktestMetrics | null;
+  equity_curve: EquityPoint[];
+  /** False for plain chat replies, which own a run directory but no report. */
+  report_worthy: boolean;
+}
+
 /** Monte Carlo fan-chart payload: percentile envelope + sampled paths over trade order. */
 export interface MonteCarloEquityPaths {
   steps: number[];
@@ -1291,6 +1381,41 @@ export interface AttributionResponse {
   notes: string[];
 }
 
+/**
+ * One provider-reported LLM usage event inside `llm_usage.per_iteration`.
+ * Field names mirror the on-disk artifact written by `agent/src/agent/llm_usage.py`.
+ * The two `cache_*` keys appear only once the provider reports a cache event for
+ * that call, so they are optional — never fabricated.
+ */
+export interface LlmUsageCall {
+  iter: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cache_read_tokens?: number;
+  cache_creation_tokens?: number;
+}
+
+/**
+ * Run-scoped LLM usage summary returned by `GET /runs/{id}` (`RunResponse.llm_usage`,
+ * optional on the backend and `null`/absent when the run recorded no usage events).
+ */
+export interface LlmUsage {
+  provider: string;
+  model: string;
+  totals: {
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+    calls: number;
+    /** Present only after a provider cache event, like the per-iteration keys. */
+    cache_read_tokens?: number;
+    cache_creation_tokens?: number;
+  };
+  per_iteration: LlmUsageCall[];
+  updated_at: string;
+}
+
 export interface RunData {
   status: string;
   run_id: string;
@@ -1303,6 +1428,8 @@ export interface RunData {
   metrics?: BacktestMetrics;
   artifacts?: ArtifactInfo[];
   run_card?: RunCard;
+  /** Provider-reported AgentLoop usage summary; null/absent when the run recorded no usage events. */
+  llm_usage?: LlmUsage | null;
   risk_xray?: RiskXRayPayload;
   rebalance_notes?: RebalanceNotesPayload;
   validation?: ValidationData;
@@ -1951,6 +2078,25 @@ export interface LiveBrokerStatus {
   mandate?: LiveMandateStatus | null;
   runner: LiveRunnerLiveness;
   halted: boolean;
+  decision_budget?: LiveDecisionBudget | null;
+}
+
+export interface LiveDecisionSettings {
+  interval_seconds: number;
+  daily_at: string | null;
+  timezone: string;
+  max_daily_turns: number;
+  max_daily_tokens: number;
+  max_daily_cost_usd: number | null;
+  input_usd_per_million: number | null;
+  output_usd_per_million: number | null;
+}
+
+export interface LiveDecisionBudget {
+  settings?: LiveDecisionSettings;
+  usage?: { day: string; turns: number; tokens: number; estimated_cost_usd: number | null; unaccounted_turns: number };
+  projected_daily_cost_usd?: number | null;
+  error?: string;
 }
 
 /** Response of `GET /live/status` (SPEC §7.5 runner status panel + C2). */
@@ -1988,3 +2134,35 @@ export interface ToolTrailItem {
   call_id?: string;
   timestamp?: number;
 }
+
+export interface OfficeSnapshot {
+  mode: "manual_planning";
+  agents: { id: string; name: string; role: string; color: string; rank: "Operator" | "Senior" | "Lead"; load: number }[];
+  tasks: { id: string; title: string; description: string; priority: "low" | "normal" | "high"; assigned_to: string | null; status: "queued" | "assigned" | "completed"; result: string }[];
+}
+
+export interface PaperPosition { symbol: string; qty: number; avg_cost: number }
+export interface PaperOrder { symbol: string; side: "buy" | "sell"; qty: number; limit?: number }
+export interface PaperResult {
+  code?: string; message?: string;
+  end_state?: { cash: number; positions: PaperPosition[] };
+  fills?: { trade_date: string; symbol: string; side: string; qty: number; price: number; fee: number }[];
+  rejected_orders?: { trade_date: string; symbol: string; reason_code: string }[];
+  nav_series?: { date: string; nav: number; cash: number }[];
+  warnings?: string[];
+  data_provenance?: { source: string; bars_as_of: string | null };
+}
+export interface PaperAccount {
+  id: string; label: string; market: "cn_a" | "hk" | "us"; currency: string;
+  start_on: string; last_date: string | null; revision: number;
+  account_state: { cash: number; positions: PaperPosition[] };
+  last_result: PaperResult | null;
+}
+export const paperApi = {
+  list: () => request<PaperAccount[]>("/api/paper-accounts"),
+  create: (body: { label: string; market: string; start: string; account_state: { cash: number; positions: PaperPosition[] } }) =>
+    request<PaperAccount>("/api/paper-accounts", { method: "POST", body: JSON.stringify(body) }),
+  advance: (id: string, body: { expected_revision: number; to_date: string; orders?: PaperOrder[]; strategy_path?: string }) =>
+    request<{ account: PaperAccount; result: PaperResult; committed: boolean }>(`/api/paper-accounts/${encodeURIComponent(id)}/advance`, { method: "POST", body: JSON.stringify(body) }),
+  history: (id: string) => request<PaperResult[]>(`/api/paper-accounts/${encodeURIComponent(id)}/history`),
+};
